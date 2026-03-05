@@ -1,0 +1,309 @@
+diff --git a/include/event.h b/include/event.h
+index 1111111..2222222 100644
+--- a/include/event.h
++++ b/include/event.h
+@@ -1,6 +1,6 @@
+ #ifndef UAV_EVENT_H
+ #define UAV_EVENT_H
+ 
+-#include "../core/msg/msg_types.h"
++#include "msg_types.h"
+ 
+ #endif
+
+diff --git a/include/reactor.h b/include/reactor.h
+index 1111111..2222222 100644
+--- a/include/reactor.h
++++ b/include/reactor.h
+@@ -1,6 +1,15 @@
+-#ifndef UAV_REACTOR_H
+-#define UAV_REACTOR_H
++#ifndef UAV_INCLUDE_REACTOR_H
++#define UAV_INCLUDE_REACTOR_H
+ 
+-#include "../core/reactor/reactor.h"
++#include <stddef.h>
++#include "event_bus.h"
++#include "io.h"
++
++typedef struct {
++    IOAdapter io;
++} Reactor;
++
++void reactor_init(Reactor *reactor, const char **script, size_t script_len);
++void reactor_poll(Reactor *reactor, EventBus *bus, int timeout_ms);
+ 
+ #endif
+
+diff --git a/include/msg_types.h b/include/msg_types.h
+new file mode 100644
+index 0000000..2222222
+--- /dev/null
++++ b/include/msg_types.h
+@@ -0,0 +1,58 @@
++#ifndef UAV_MSG_TYPES_H
++#define UAV_MSG_TYPES_H
++
++#include <stdint.h>
++
++#define UAV_TEXT_MAX 128
++
++typedef enum {
++    CMD_INVALID = 0,
++    CMD_START_BATTERY_PICK,
++    CMD_EMERGENCY_STOP,
++    CMD_RESET_FAULT,
++    CMD_SHUTDOWN
++} CommandType;
++
++typedef enum {
++    TASK_NONE = 0,
++    TASK_BATTERY_PICK
++} TaskType;
++
++typedef enum {
++    EVT_NONE = 0,
++    EVT_IO_CMD_RAW,
++    EVT_TIMER_TICK,
++    EVT_CMD_REQUEST,
++    EVT_CMD_ACK,
++    EVT_CMD_NACK,
++    EVT_TASK_REQUEST,
++    EVT_TASK_DONE,
++    EVT_TASK_FAIL,
++    EVT_EMERGENCY_STOP,
++    EVT_RESET_FAULT,
++    EVT_SHUTDOWN
++} EventType;
++
++typedef struct {
++    EventType type;
++    uint64_t ts_ms;
++    union {
++        struct {
++            char text[UAV_TEXT_MAX];
++        } io;
++        struct {
++            CommandType cmd;
++        } command;
++        struct {
++            CommandType cmd;
++            char reason[UAV_TEXT_MAX];
++        } feedback;
++        struct {
++            TaskType task;
++        } task;
++        struct {
++            char reason[UAV_TEXT_MAX];
++        } failure;
++    } data;
++} Event;
++
++#endif
+
+diff --git a/core/msg/msg_types.h b/core/msg/msg_types.h
+deleted file mode 100644
+index 1111111..0000000
+--- a/core/msg/msg_types.h
++++ /dev/null
+@@ -1,58 +0,0 @@
+-#ifndef UAV_MSG_TYPES_H
+-#define UAV_MSG_TYPES_H
+-
+-#include <stdint.h>
+-
+-#define UAV_TEXT_MAX 128
+-
+-typedef enum {
+-    CMD_INVALID = 0,
+-    CMD_START_BATTERY_PICK,
+-    CMD_EMERGENCY_STOP,
+-    CMD_RESET_FAULT,
+-    CMD_SHUTDOWN
+-} CommandType;
+-
+-typedef enum {
+-    TASK_NONE = 0,
+-    TASK_BATTERY_PICK
+-} TaskType;
+-
+-typedef enum {
+-    EVT_NONE = 0,
+-    EVT_IO_CMD_RAW,
+-    EVT_TIMER_TICK,
+-    EVT_CMD_REQUEST,
+-    EVT_CMD_ACK,
+-    EVT_CMD_NACK,
+-    EVT_TASK_REQUEST,
+-    EVT_TASK_DONE,
+-    EVT_TASK_FAIL,
+-    EVT_EMERGENCY_STOP,
+-    EVT_RESET_FAULT,
+-    EVT_SHUTDOWN
+-} EventType;
+-
+-typedef struct {
+-    EventType type;
+-    uint64_t ts_ms;
+-    union {
+-        struct {
+-            char text[UAV_TEXT_MAX];
+-        } io;
+-        struct {
+-            CommandType cmd;
+-        } command;
+-        struct {
+-            CommandType cmd;
+-            char reason[UAV_TEXT_MAX];
+-        } feedback;
+-        struct {
+-            TaskType task;
+-        } task;
+-        struct {
+-            char reason[UAV_TEXT_MAX];
+-        } failure;
+-    } data;
+-} Event;
+-
+-#endif
+
+diff --git a/core/reactor/reactor.h b/core/reactor/reactor.h
+deleted file mode 100644
+index 1111111..0000000
+--- a/core/reactor/reactor.h
++++ /dev/null
+@@ -1,14 +0,0 @@
+-#ifndef UAV_REACTOR_H
+-#define UAV_REACTOR_H
+-
+-#include <stddef.h>
+-#include "event_bus.h"
+-#include "io.h"
+-
+-typedef struct {
+-    IOAdapter io;
+-} Reactor;
+-
+-void reactor_init(Reactor *reactor, const char **script, size_t script_len);
+-void reactor_poll(Reactor *reactor, EventBus *bus, int timeout_ms);
+-
+-#endif
+
+diff --git a/core/log/log.c b/core/log/log.c
+index 1111111..2222222 100644
+--- a/core/log/log.c
++++ b/core/log/log.c
+@@ -1,5 +1,6 @@
+ #include <stdio.h>
+ #include <stdarg.h>
++#include <string.h>
+ #include <time.h>
+ #include "log.h"
+@@ -9,7 +10,12 @@ static void log_v(const char *level, const char *tag, const char *fmt, va_list ap) {
+ #if defined(_WIN32)
+     localtime_s(&tm_now, &now);
+ #else
+-    localtime_r(&now, &tm_now);
++    struct tm *tm_ptr = localtime(&now);
++    if (tm_ptr != NULL) {
++        tm_now = *tm_ptr;
++    } else {
++        memset(&tm_now, 0, sizeof(tm_now));
++    }
+ #endif
+     char ts[32];
+     strftime(ts, sizeof(ts), "%Y-%m-%d %H:%M:%S", &tm_now);
+
+diff --git a/core/reactor/reactor.c b/core/reactor/reactor.c
+index 1111111..2222222 100644
+--- a/core/reactor/reactor.c
++++ b/core/reactor/reactor.c
+@@ -6,8 +6,10 @@
+ 
+ static uint64_t now_ms(void) {
+     struct timespec ts;
+-    clock_gettime(CLOCK_REALTIME, &ts);
+-    return (uint64_t)ts.tv_sec * 1000ULL + (uint64_t)(ts.tv_nsec / 1000000ULL);
++    if (timespec_get(&ts, TIME_UTC) == TIME_UTC) {
++        return (uint64_t)ts.tv_sec * 1000ULL + (uint64_t)(ts.tv_nsec / 1000000ULL);
++    }
++    return (uint64_t)time(NULL) * 1000ULL;
+ }
+@@ -23,7 +25,10 @@ void reactor_poll(Reactor *reactor, EventBus *bus, int timeout_ms) {
+         memset(&ev, 0, sizeof(ev));
+         ev.type = EVT_IO_CMD_RAW;
+         ev.ts_ms = now_ms();
+-        strncpy(ev.data.io.text, line, UAV_TEXT_MAX - 1);
++        const char *nul = memchr(line, '\0', UAV_TEXT_MAX - 1);
++        size_t n = (nul != NULL) ? (size_t)(nul - line) : (UAV_TEXT_MAX - 1);
++        memcpy(ev.data.io.text, line, n);
++        ev.data.io.text[n] = '\0';
+         event_bus_publish(bus, &ev);
+     }
+
+diff --git a/core/scheduler/scheduler.c b/core/scheduler/scheduler.c
+index 1111111..2222222 100644
+--- a/core/scheduler/scheduler.c
++++ b/core/scheduler/scheduler.c
+@@ -21,7 +21,10 @@ static void publish_task_fail(EventBus *bus, TaskType task, const char *reason) {
+     (void)task;
+     Event ev = {0};
+     ev.type = EVT_TASK_FAIL;
+-    strncpy(ev.data.failure.reason, reason, UAV_TEXT_MAX - 1);
++    const char *nul = memchr(reason, '\0', UAV_TEXT_MAX - 1);
++    size_t n = (nul != NULL) ? (size_t)(nul - reason) : (UAV_TEXT_MAX - 1);
++    memcpy(ev.data.failure.reason, reason, n);
++    ev.data.failure.reason[n] = '\0';
+     event_bus_publish(bus, &ev);
+ }
+
+diff --git a/core/supervisor/supervisor.c b/core/supervisor/supervisor.c
+index 1111111..2222222 100644
+--- a/core/supervisor/supervisor.c
++++ b/core/supervisor/supervisor.c
+@@ -10,7 +10,10 @@ static void publish_feedback(EventBus *bus, uint64_t ts_ms, CommandType cmd, bool accepted, const char *reason) {
+     out.ts_ms = ts_ms;
+     out.data.feedback.cmd = cmd;
+     if (reason != NULL) {
+-        strncpy(out.data.feedback.reason, reason, UAV_TEXT_MAX - 1);
++        const char *nul = memchr(reason, '\0', UAV_TEXT_MAX - 1);
++        size_t n = (nul != NULL) ? (size_t)(nul - reason) : (UAV_TEXT_MAX - 1);
++        memcpy(out.data.feedback.reason, reason, n);
++        out.data.feedback.reason[n] = '\0';
+     }
+     event_bus_publish(bus, &out);
+ }
+
+diff --git a/drv/io/gpio_sysfs.c b/drv/io/gpio_sysfs.c
+index 1111111..2222222 100644
+--- a/drv/io/gpio_sysfs.c
++++ b/drv/io/gpio_sysfs.c
+@@ -17,8 +17,11 @@ bool io_read_command(IOAdapter *io, char *out, size_t out_len, int timeout_ms) {
+     }
+ 
+     if (io->script != NULL && io->next_idx < io->script_len) {
+-        strncpy(out, io->script[io->next_idx], out_len - 1);
+-        out[out_len - 1] = '\0';
++        const char *src = io->script[io->next_idx];
++        const char *nul = memchr(src, '\0', out_len - 1);
++        size_t n = (nul != NULL) ? (size_t)(nul - src) : (out_len - 1);
++        memcpy(out, src, n);
++        out[n] = '\0';
+         io->next_idx++;
+         return true;
+     }
+
+diff --git a/core/proto/proto_mesh_link.c b/core/proto/proto_mesh_link.c
+index 1111111..2222222 100644
+--- a/core/proto/proto_mesh_link.c
++++ b/core/proto/proto_mesh_link.c
+@@ -9,7 +9,10 @@ static void normalize(char *s) {
+ 
+ CommandType proto_parse_command(const char *raw) {
+     char buf[UAV_TEXT_MAX] = {0};
+-    strncpy(buf, raw, sizeof(buf) - 1);
++    const char *nul = memchr(raw, '\0', sizeof(buf) - 1);
++    size_t n = (nul != NULL) ? (size_t)(nul - raw) : (sizeof(buf) - 1);
++    memcpy(buf, raw, n);
++    buf[n] = '\0';
+     normalize(buf);

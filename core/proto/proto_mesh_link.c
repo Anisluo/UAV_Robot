@@ -10,7 +10,10 @@ static void normalize(char *s) {
 
 CommandType proto_parse_command(const char *raw) {
     char buf[UAV_TEXT_MAX] = {0};
-    strncpy(buf, raw, sizeof(buf) - 1);
+    const char *nul = memchr(raw, '\0', sizeof(buf) - 1);
+    size_t n = (nul != NULL) ? (size_t)(nul - raw) : (sizeof(buf) - 1);
+    memcpy(buf, raw, n);
+    buf[n] = '\0';
     normalize(buf);
 
     if (strcmp(buf, "START_BATTERY_PICK") == 0 || strcmp(buf, "START") == 0) {

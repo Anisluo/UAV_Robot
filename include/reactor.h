@@ -1,13 +1,12 @@
-#ifndef UAV_REACTOR_H
-#define UAV_REACTOR_H
+#ifndef UAV_INCLUDE_REACTOR_H
+#define UAV_INCLUDE_REACTOR_H
 
 #include <stddef.h>
 #include "event_bus.h"
+#include "io.h"
 
 typedef struct {
-    const char **script;
-    size_t script_len;
-    size_t next_idx;
+    IOAdapter io;
 } Reactor;
 
 void reactor_init(Reactor *reactor, const char **script, size_t script_len);

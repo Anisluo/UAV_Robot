@@ -3,10 +3,11 @@
 #include "event_bus.h"
 #include "reactor.h"
 #include "router.h"
-#include "command_dispatcher.h"
-#include "task_manager.h"
+#include "scheduler.h"
+#include "supervisor.h"
 #include "system.h"
 #include "log.h"
+#include "proto.h"
 
 static void print_help(void) {
     puts("uav_robotd commands from stdin:");
@@ -27,11 +28,11 @@ int main(int argc, char **argv) {
     EventBus bus;
     Reactor reactor;
     SystemState state;
-    TaskManager manager;
+    Scheduler scheduler;
 
     event_bus_init(&bus);
     system_state_init(&state);
-    task_manager_init(&manager, &bus, &state);
+    scheduler_init(&scheduler, &bus, &state);
     reactor_init(&reactor, self_test ? script : NULL, self_test ? (sizeof(script) / sizeof(script[0])) : 0);
 
     log_info("main", "uav_robotd started");
@@ -46,8 +47,14 @@ int main(int argc, char **argv) {
         Event ev;
         while (event_bus_try_pop(&bus, &ev)) {
             router_handle(&ev, &bus);
-            command_dispatcher_handle(&ev, &bus, &state);
-            task_manager_handle(&ev, &bus, &state, &manager);
+            supervisor_handle(&ev, &bus, &state);
+            scheduler_handle(&ev, &bus, &state, &scheduler);
+
+            if (ev.type == EVT_CMD_ACK) {
+                log_info("ack", "ACK %s: %s", proto_command_name(ev.data.feedback.cmd), ev.data.feedback.reason);
+            } else if (ev.type == EVT_CMD_NACK) {
+                log_warn("ack", "NACK %s: %s", proto_command_name(ev.data.feedback.cmd), ev.data.feedback.reason);
+            }
         }
 
         if (self_test && ++safety_loops > 200) {

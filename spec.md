@@ -1,344 +1,516 @@
+# UAV_ROBOT A Process Architecture Spec
 
-UAV_ROBOT Architecture Specification v1.0
-1. System Overview
-1.1 System Role
+## 1. Purpose
 
-uav_robot 为运行于 RK3588 的机器人控制节点，负责：
+The **A process (control / supervisor)** is the central runtime of the system. It is responsible for:
 
-执行外部控制指令
+* Device control (robot arm, chassis, gripper, platform lock, relays)
+* Event‑driven runtime (reactor / router / bus)
+* Communication channels (CAN / UART / mesh / IPC)
+* Logging system (system black‑box)
+* Managing child processes:
 
-管理机器人任务流程
+  * **B = visiond** (camera acquisition)
+  * **C = inferd** (NPU inference)
 
-控制多总线执行设备
+Design goals:
 
-提供状态反馈与安全控制
+* Deterministic control loop
+* Event‑driven architecture
+* Decoupled modules
+* Crash isolation (vision / inference separated)
+* Scalable communication channels
 
-系统采用 事件驱动（Reactor + Router）架构。
+---
 
-1.2 Controlled Devices
-Device	Interface	Binding
-六轴机械臂	CAN	can1
-平台固定装置	CAN	can2
-六轮小车	RS485	tty*
-平行夹爪	GPIO	gpiochipX
-D435 相机	USB	librealsense
-Mesh通信	Ethernet	UDP Port
-2. Architecture Layers
+# 2. Directory Structure
 
-系统采用三层结构：
+```
+app/
+  main.c
+  tasks/
 
-APP
-CORE
-DRV
+core/
+  msg/
+    msg_types.h
 
-调用方向必须单向：
+  reactor/
+    reactor.c
+    reactor.h
 
-APP → CORE → DRV
+  channel/
+    can_channel.c
+    mesh_channel.c
+    bc_channel.c
+    uart_channel.c
 
-禁止反向依赖。
+  proto/
+    proto_zdt_arm.c
+    proto_robomodule_drv.c
+    proto_gripper_uart.c
+    proto_platform_lock.c
+    proto_mesh_link.c
 
-3. DRV Layer (Device Adaptation)
-3.1 Purpose
+  bus/
+    bus.c
 
-屏蔽 Linux I/O 与设备协议差异。
+  router/
+    router.c
 
-DRV 不允许包含业务逻辑。
+  scheduler/
+    scheduler.c
 
-3.2 Internal Structure
+  dev/
+    arm.c
+    car.c
+    platform.c
+    relay.c
+    gripper.c
+
+  log/
+    log.c
+
+  supervisor/
+    supervisor.c
+
+
 drv/
- ├── io/
- ├── proto/
- └── dev/
-io（I/O适配）
+  dev/
+    can_socketcan.c
+    uart_posix.c
+    mesh_eth.c
 
-负责系统调用：
+  io/
+    gpio_sysfs.c
 
-socketcan
+include/
 
-termios(485)
+spec.md
+```
 
-libgpiod
+---
 
-UDP socket
+# 3. Architecture Layers
 
-librealsense
+System architecture is organized into layered modules.
 
-仅处理：
+```
+app
+ ↓
+router
+ ↓
+bus
+ ↓
+proto
+ ↓
+dev
+ ↓
+drv
+ ↓
+hardware
+```
 
-open/read/write/poll
-proto（协议层）
+Event entry is handled by:
 
-负责：
+```
+reactor → channel → proto → bus/router
+```
 
-帧解析
+---
 
-分包/重组
+# 4. Module Responsibilities
 
-CRC
+## 4.1 reactor
 
-ACK/SEQ
+Event loop based on **epoll + timers**.
 
-message 编解码
+Responsibilities:
 
-输出统一 Message。
+* manage file descriptor events
+* manage timers
+* trigger channel callbacks
 
-禁止访问 CORE。
+Example:
 
-dev（设备语义层）
+```
+reactor_add_fd(can_fd, can_channel_on_readable)
+reactor_add_fd(mesh_fd, mesh_channel_on_readable)
+```
 
-提供设备能力接口：
+---
 
+## 4.2 channel
+
+Channel is the **communication adapter layer**.
+
+It bridges external IO into the system runtime.
+
+Responsibilities:
+
+* read IO streams
+* handle reconnect / buffering
+* call protocol decoder
+* publish events or commands
+
+Example channels:
+
+```
+can_channel
+mesh_channel
+bc_channel
+uart_channel
+```
+
+Typical flow:
+
+```
+IO → channel → proto → Event/Command
+```
+
+---
+
+## 4.3 proto (device‑independent protocol codec)
+
+Protocol codec layer.
+
+Responsibilities:
+
+* encode protocol packets
+* decode protocol packets
+* CRC / framing
+
+Restrictions:
+
+* NO socket
+* NO read/write
+* NO reactor
+
+Example modules:
+
+```
+proto_zdt_arm
+proto_robomodule_drv
+proto_gripper_uart
+proto_platform_lock
+proto_mesh_link
+```
+
+---
+
+## 4.4 bus (event pub/sub)
+
+Internal event bus.
+
+Responsibilities:
+
+* event broadcasting
+* subscriber management
+
+Example:
+
+```
+bus_publish(EVENT_DETECT_RESULT)
+bus_publish(EVENT_ARM_FEEDBACK)
+```
+
+Subscribers may include:
+
+* tasks
+* logger
+* telemetry
+* router
+
+---
+
+## 4.5 router (command dispatch)
+
+Router processes **Command messages**.
+
+Responsibilities:
+
+* route command to target handler
+
+Example:
+
+```
+Command.target = CAR
+Command.action = SET_VELOCITY
+
+router_dispatch(Command)
+```
+
+Router invokes:
+
+```
+car_handler()
+```
+
+Router is **directed dispatch**, unlike bus broadcast.
+
+---
+
+## 4.6 dev (device abstraction layer)
+
+Device control API.
+
+Responsibilities:
+
+* expose device capability
+* hide protocol details
+
+Examples:
+
+```
 arm_move()
-platform_lock()
 car_set_velocity()
+platform_lock()
 gripper_open()
+relay_on()
+```
 
-dev 不包含任务逻辑。
+dev internally calls:
 
-4. CORE Layer (System Mechanism)
+```
+proto encode → drv send
+```
 
-CORE 为系统控制中心。
+Restrictions:
 
-4.1 Reactor
+* dev must NOT manage file descriptors
+* dev must NOT call reactor
 
-统一 I/O 入口。
+---
 
-监听：
+## 4.7 drv (hardware IO layer)
 
-can1
+Lowest software layer.
 
-can2
+Responsibilities:
 
-rs485
+* device IO
+* system calls
 
-udp control port
+Examples:
 
-timerfd
+```
+can_send()
+uart_write()
+socket_read()
+```
 
-基于 epoll 实现。
+drv must not know business semantics.
 
-产生底层事件：
+---
 
-EVT_IO_xxx
-EVT_TIMER
-4.2 Router
+## 4.8 log (logging system)
 
-职责：
+Central logging system in A process.
 
-Message → Event 转换
+Design:
 
-事件分发
+* async logging
+* log queue
+* log thread writes file
 
-定向投递(task/device)
+Log content:
 
-Router 不执行逻辑。
+* system lifecycle
+* device commands
+* errors
+* child process health
 
-4.3 CommandDispatcher ⭐
+---
 
-位置：
+## 4.9 supervisor
 
-core/command/
+Child process manager.
 
-系统唯一外部控制入口。
+Responsibilities:
 
-职责：
+* launch B (visiond)
+* launch C (inferd)
+* heartbeat monitoring
+* restart policy
 
-接收 EVT_CMD_REQUEST
+Startup sequence:
 
-权限检查
+```
+fork + exec visiond
+fork + exec inferd
+```
 
-状态检查
+Shutdown sequence:
 
-冲突检测
+```
+stop C
+stop B
+cleanup resources
+```
 
-转换为 TaskRequest
+---
 
-回复 ACK/NACK
+# 5. Call Chains
 
-禁止：
+## 5.1 Local Device Control
 
-直接控制设备
+```
+app/tasks
+   ↓
+core/dev
+   ↓
+core/proto
+   ↓
+drv
+   ↓
+hardware
+```
 
-推进任务FSM
-
-4.4 Task Manager
-
-负责：
-
-Task 生命周期
-
-FSM 推进
-
-超时管理
-
-取消/重试
-
-资源互锁
-
-Task 仅通过 Event 推进。
-
-4.5 Device Registry
-
-维护：
-
-ARM → can1
-PLATFORM → can2
-GRIPPER → gpio
-CAR → rs485
-
-系统启动必须完成设备检查。
-
-4.6 Event Bus
-
-系统唯一状态传播机制。
-
-禁止模块间直接调用修改状态。
-
-5. APP Layer (Behavior Logic)
-
-APP 仅描述行为流程。
-
-示例：
-
-TASK_BATTERY_PICK
-TASK_ARM_HOME
-TASK_PLATFORM_LOCK
-TASK_CAR_MOVE
-
-APP 不允许：
-
-操作 fd
-
-解析协议
-
-访问 GPIO/CAN
-
-5.1 Battery Pick FSM
-PRECHECK
-→ FIXTURE_LOCK
-→ DETECT
-→ APPROACH
-→ GRIPPER_OPEN
-→ ALIGN
-→ GRASP
-→ LIFT
-→ DONE
-
-异常统一进入 FAIL/SAFE_STOP。
-
-6. External Command Flow
-
-外部控制路径必须为：
-
-Network Port
- → drv/io
- → drv/proto
- → Router
- → CommandDispatcher
- → TaskManager
- → APP Task
- → Device
-
-禁止绕过 CommandDispatcher。
-
-7. Safety Rules
-Emergency Stop
-
-最高优先级。
-
-触发后：
-
-停止机械臂
-
-停止小车
-
-GPIO进入安全态
-
-所有Task取消
-
-Mutual Exclusion
-
-抓取任务期间：
-
-小车必须 STOP
-
-平台必须锁止
-
-Device Offline
-
-任一关键设备离线：
-
-System → FAULT
-8. Thread Model
-
-推荐线程：
-
-Thread	Role
-reactor	所有I/O
-task	FSM推进
-vision	D435处理
-optional mesh	网络高负载
-
-规则：
-
-Task线程禁止阻塞I/O
-
-状态更新仅通过 Event
-
-9. Observability
-
-系统必须支持：
-
-统一日志
-
-Task Trace
-
-Command记录
-
-Device回包记录
-
-支持任务回放。
-
-10. Build System
-
-使用 Makefile。
-
-必须支持：
-
-make all
-make clean
-make run
-make install
-make test
-
-输出：
-
-build/bin/uav_robotd
-build/bin/uav_cli
-11. Directory Layout
-uav_robot/
- ├── app/
- ├── core/
- │    ├── reactor/
- │    ├── router/
- │    ├── command/
- │    ├── task/
- │    └── bus/
- ├── drv/
- │    ├── io/
- │    ├── proto/
- │    └── dev/
- ├── include/
- ├── tools/
- └── Makefile
-12. Architectural Constraints (Mandatory)
-
-外部控制必须经过 CommandDispatcher
-
-APP 不访问 DRV
-
-DRV 不依赖 CORE
-
-所有状态变化通过 Event
-
-Task 为唯一行为执行单位
+Example:
+
+```
+car_set_velocity()
+  → proto_robomodule_drv_encode()
+  → can_send()
+```
+
+---
+
+## 5.2 Mesh Remote Command Flow
+
+```
+mesh socket
+   ↓
+reactor
+   ↓
+mesh_channel
+   ↓
+proto_mesh_link_decode
+   ↓
+Command
+   ↓
+router_dispatch
+   ↓
+device handler
+   ↓
+core/dev
+   ↓
+drv send
+```
+
+---
+
+## 5.3 Device Feedback Flow
+
+```
+CAN frame
+   ↓
+reactor
+   ↓
+can_channel
+   ↓
+proto_decode
+   ↓
+Event
+   ↓
+bus_publish
+   ↓
+subscribers
+```
+
+Subscribers may include:
+
+* tasks
+* logger
+* mesh telemetry
+
+---
+
+## 5.4 Inference Result Flow (C → A)
+
+```
+inferd
+   ↓ socket
+bc_channel
+   ↓
+decode DetectResult
+   ↓
+bus_publish
+   ↓
+task logic
+   ↓
+core/dev
+```
+
+A process retains final control authority.
+
+---
+
+## 5.5 Child Process Lifecycle
+
+Startup:
+
+```
+supervisor
+   ↓
+create IPC resources
+   ↓
+fork visiond
+   ↓
+fork inferd
+```
+
+Shutdown:
+
+```
+stop inferd
+stop visiond
+cleanup sockets/shm
+```
+
+---
+
+# 6. Dependency Rules
+
+Allowed dependencies:
+
+```
+app → dev
+
+dev → proto → drv
+
+channel → drv + proto + bus/router
+
+proto → no IO
+
+drv → no business logic
+```
+
+---
+
+# 7. Runtime Principles
+
+1. Reactor thread must never block
+2. Vision / inference must run in external processes
+3. Protocol layer must remain pure codec
+4. Device actions must be centralized in dev layer
+5. Events should propagate via bus
+
+---
+
+# 8. Summary
+
+The A process acts as:
+
+* control runtime
+* device manager
+* communication hub
+* event system
+* logging center
+* process supervisor
+
+The architecture ensures:
+
+* modular design
+* clear separation of responsibilities
+* safe robot control
+* scalability for future extensions
