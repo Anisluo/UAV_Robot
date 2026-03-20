@@ -1,3 +1,4 @@
+#include <stdbool.h>
 #include <string.h>
 #include <time.h>
 #include "event.h"
@@ -12,8 +13,12 @@ static uint64_t now_ms(void) {
     return (uint64_t)time(NULL) * 1000ULL;
 }
 
-void reactor_init(Reactor *reactor, const char **script, size_t script_len) {
-    io_init(&reactor->io, script, script_len);
+bool reactor_init(Reactor *reactor, const char **script, size_t script_len, unsigned short listen_port) {
+    return io_init(&reactor->io, script, script_len, listen_port);
+}
+
+void reactor_close(Reactor *reactor) {
+    io_close(&reactor->io);
 }
 
 void reactor_poll(Reactor *reactor, EventBus *bus, int timeout_ms) {

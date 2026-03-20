@@ -1,4 +1,6 @@
+#include <stdbool.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include "event_bus.h"
 #include "reactor.h"
@@ -15,12 +17,50 @@ static void print_help(void) {
     puts("  ESTOP");
     puts("  RESET");
     puts("  SHUTDOWN");
+    puts("Options:");
+    puts("  --listen-port <port>   listen for UDP text commands on the given port");
+    puts("  --self-test            run built-in test script");
+}
+
+static bool parse_port(const char *text, unsigned short *out_port) {
+    char *end = NULL;
+    unsigned long value;
+
+    if (text == NULL || out_port == NULL) {
+        return false;
+    }
+
+    value = strtoul(text, &end, 10);
+    if (end == text || *end != '\0' || value == 0 || value > 65535UL) {
+        return false;
+    }
+
+    *out_port = (unsigned short)value;
+    return true;
 }
 
 int main(int argc, char **argv) {
     bool self_test = false;
-    if (argc > 1 && strcmp(argv[1], "--self-test") == 0) {
-        self_test = true;
+    unsigned short listen_port = 0;
+
+    for (int i = 1; i < argc; ++i) {
+        if (strcmp(argv[i], "--self-test") == 0) {
+            self_test = true;
+            continue;
+        }
+        if (strcmp(argv[i], "--listen-port") == 0) {
+            if (i + 1 >= argc || !parse_port(argv[i + 1], &listen_port)) {
+                fprintf(stderr, "invalid listen port\n");
+                print_help();
+                return 1;
+            }
+            ++i;
+            continue;
+        }
+
+        fprintf(stderr, "unknown argument: %s\n", argv[i]);
+        print_help();
+        return 1;
     }
 
     const char *script[] = {"START", "ESTOP", "RESET", "START", "SHUTDOWN"};
@@ -33,11 +73,20 @@ int main(int argc, char **argv) {
     event_bus_init(&bus);
     system_state_init(&state);
     scheduler_init(&scheduler, &bus, &state);
-    reactor_init(&reactor, self_test ? script : NULL, self_test ? (sizeof(script) / sizeof(script[0])) : 0);
+    if (!reactor_init(&reactor,
+                      self_test ? script : NULL,
+                      self_test ? (sizeof(script) / sizeof(script[0])) : 0,
+                      listen_port)) {
+        fprintf(stderr, "failed to initialize command input\n");
+        return 1;
+    }
 
     log_info("main", "uav_robotd started");
     if (!self_test) {
         print_help();
+        if (listen_port != 0) {
+            log_info("main", "listening for UDP commands on port %u", (unsigned int)listen_port);
+        }
     }
 
     int safety_loops = 0;
@@ -63,6 +112,7 @@ int main(int argc, char **argv) {
         }
     }
 
+    reactor_close(&reactor);
     log_info("main", "uav_robotd stopped");
     return state.fault ? 1 : 0;
 }
