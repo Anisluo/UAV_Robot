@@ -28,13 +28,50 @@ UAV_Robot/
 
 ## 3. 构建与运行
 
-在项目根目录执行：
+首次拉取并进入项目目录：
+
+```bash
+git clone git@github.com:Anisluo/UAV_Robot.git
+cd UAV_Robot
+```
+
+编译整个项目：
 
 ```bash
 make
 ```
 
-如需清理：
+仅编译主控程序 `uav_robotd`：
+
+```bash
+make build/bin/uav_robotd
+```
+
+编译命令行工具 `uav_cli`：
+
+```bash
+make build/bin/uav_cli
+```
+
+运行主控程序：
+
+```bash
+./build/bin/uav_robotd
+```
+
+运行主控程序并监听指定 UDP 端口：
+
+```bash
+./build/bin/uav_robotd --listen-port 19090
+```
+
+运行自测：
+
+```bash
+./build/bin/uav_robotd --self-test
+```
+
+清理编译产物：
 
 ```bash
 make clean
@@ -54,9 +91,12 @@ git push
 
 当前远程仓库：
 
-```text
-origin: https://github.com/Anisluo/UAV_Robot.git
-```
+- HTTPS: `https://github.com/Anisluo/UAV_Robot.git`
+- SSH: `git@github.com:Anisluo/UAV_Robot.git`
+
+仓库页面：
+
+- [https://github.com/Anisluo/UAV_Robot](https://github.com/Anisluo/UAV_Robot)
 
 ## 5. 维护建议
 
