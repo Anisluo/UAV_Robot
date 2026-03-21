@@ -4,6 +4,8 @@
 #include <stdbool.h>
 #include "device_registry.h"
 
+#define BP_DETECT_TIMEOUT_TICKS 100  /* ~20s at 200ms poll; fail if no detection */
+
 typedef enum {
     BP_PRECHECK = 0,
     BP_FIXTURE_LOCK,
@@ -19,7 +21,12 @@ typedef enum {
 
 typedef struct {
     BatteryPickState state;
-    int ticks_in_state;
+    int  ticks_in_state;
+    /* Detected battery 3-D pose (camera frame, mm). Valid when detected=1. */
+    float target_x_mm;
+    float target_y_mm;
+    float target_z_mm;
+    int   detected;
 } BatteryPickTask;
 
 void app_battery_pick_start(BatteryPickTask *task);

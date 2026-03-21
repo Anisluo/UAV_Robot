@@ -15,7 +15,8 @@ SRCS := \
 	src/npu_infer.cpp \
 	src/postprocess.cpp \
 	src/ctrl_server.cpp \
-	src/health.cpp
+	src/health.cpp \
+	src/result_publisher.cpp
 
 OBJS := $(patsubst src/%.cpp,$(OBJ_DIR)/%.o,$(SRCS))
 

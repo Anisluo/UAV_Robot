@@ -3,10 +3,15 @@
 #include "app_battery_pick.h"
 #include "dev.h"
 #include "log.h"
+#include "npu_detect.h"
 
 void app_battery_pick_start(BatteryPickTask *task) {
-    task->state = BP_PRECHECK;
+    task->state        = BP_PRECHECK;
     task->ticks_in_state = 0;
+    task->detected     = 0;
+    task->target_x_mm  = 0.0f;
+    task->target_y_mm  = 0.0f;
+    task->target_z_mm  = 0.0f;
     log_info("app.battery_pick", "start FSM");
 }
 
@@ -42,15 +47,44 @@ bool app_battery_pick_step(BatteryPickTask *task, const DeviceRegistry *reg, cha
             next_state(task, BP_DETECT);
             return true;
 
-        case BP_DETECT:
-            next_state(task, BP_APPROACH);
-            return true;
-
-        case BP_APPROACH:
-            if (!arm_move("approach")) {
-                strcpy(err, "arm approach failed");
+        case BP_DETECT: {
+            /* Poll proc_npu for a detection with 3-D pose. */
+            float x = 0.0f, y = 0.0f, z = 0.0f;
+            if (npu_read_latest_battery(&x, &y, &z)) {
+                task->target_x_mm = x;
+                task->target_y_mm = y;
+                task->target_z_mm = z;
+                task->detected    = 1;
+                log_info("app.battery_pick",
+                         "battery detected at (%.1f, %.1f, %.1f) mm",
+                         x, y, z);
+                next_state(task, BP_APPROACH);
+            } else if (task->ticks_in_state >= BP_DETECT_TIMEOUT_TICKS) {
+                strcpy(err, "detect timeout: no battery found");
                 next_state(task, BP_FAIL);
                 return false;
+            }
+            /* Stay in BP_DETECT until detection arrives or timeout. */
+            return true;
+        }
+
+        case BP_APPROACH:
+            if (task->detected) {
+                /* Move arm to detected battery position */
+                if (!arm_move_to_xyz(task->target_x_mm,
+                                     task->target_y_mm,
+                                     task->target_z_mm)) {
+                    strcpy(err, "arm approach (xyz) failed");
+                    next_state(task, BP_FAIL);
+                    return false;
+                }
+            } else {
+                /* Fallback to preset approach pose */
+                if (!arm_move("approach")) {
+                    strcpy(err, "arm approach failed");
+                    next_state(task, BP_FAIL);
+                    return false;
+                }
             }
             next_state(task, BP_GRIPPER_OPEN);
             return true;

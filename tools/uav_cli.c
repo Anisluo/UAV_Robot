@@ -5,6 +5,7 @@ static void usage(const char *name) {
     printf("Usage: %s <start|estop|reset|shutdown>\n", name);
 }
 
+//main function and get value
 int main(int argc, char **argv) {
     if (argc != 2) {
         usage(argv[0]);

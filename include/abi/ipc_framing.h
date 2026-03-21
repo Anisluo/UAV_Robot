@@ -14,10 +14,18 @@ extern "C" {
 #define UAV_DATA_NOTIFY_PATH_C "/tmp/uav_proc_npu.data.sock"
 #define UAV_SHM_RING_NAME "/uav_rs_ring"
 
+/* proc_npu pushes UavCResult datagrams to these paths when receivers are present */
+#define UAV_NPU_RESULT_GW_PATH  "/tmp/uav_gw_npu_rx.sock"   /* proc_gateway receiver */
+#define UAV_NPU_RESULT_APP_PATH "/tmp/uav_app_npu_rx.sock"  /* app receiver */
+
+/* Default UDP port that uav_robotd listens on for text commands */
+#define UAV_APP_CMD_PORT 9001U
+
 typedef enum {
     UAV_IPC_MSG_NONE = 0,
     UAV_IPC_MSG_CTRL = 1,
-    UAV_IPC_MSG_FRAME_READY = 2
+    UAV_IPC_MSG_FRAME_READY = 2,
+    UAV_IPC_MSG_RESULT = 3        /* UavCResult payload */
 } UavIpcType;
 
 typedef struct {

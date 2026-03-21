@@ -4,6 +4,7 @@
 #include <stdbool.h>
 
 bool arm_move(const char *pose);
+bool arm_move_to_xyz(float x_mm, float y_mm, float z_mm);
 bool platform_lock(bool lock);
 bool car_set_velocity(int linear_mm_s, int angular_mdeg_s);
 bool gripper_open(bool open);

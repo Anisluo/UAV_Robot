@@ -128,12 +128,24 @@ bool ShmWriter::write_frame(const CaptureFrame &frame) {
 
     const uint32_t slot_count = ring_->slot_count;
     const uint32_t start = static_cast<uint32_t>(ring_->write_index % slot_count);
+
+    // First pass: find a FREE slot
+    uint32_t chosen = slot_count; // sentinel = not found
     for (uint32_t step = 0; step < slot_count; ++step) {
         const uint32_t idx = (start + step) % slot_count;
-        FrameSlot *slot = &ring_->slots[idx];
-        if (load_state(&slot->state) != UAV_SLOT_FREE) {
-            continue;
+        if (load_state(&ring_->slots[idx].state) == UAV_SLOT_FREE) {
+            chosen = idx;
+            break;
         }
+    }
+    // No free slot: overwrite the oldest READY slot (true ring-buffer behaviour)
+    if (chosen == slot_count) {
+        chosen = start;
+        drop_count_++;
+    }
+    {
+        const uint32_t idx = chosen;
+        FrameSlot *slot = &ring_->slots[idx];
         store_state(&slot->state, UAV_SLOT_WRITING);
 
         const uint32_t color_size = static_cast<uint32_t>(frame.color.size());
@@ -168,9 +180,6 @@ bool ShmWriter::write_frame(const CaptureFrame &frame) {
         (void)notify_frame_ready(idx, frame.frame_id, frame.timestamp_ns);
         return true;
     }
-
-    drop_count_++;
-    return false;
 }
 
 uint32_t ShmWriter::drop_count() const {

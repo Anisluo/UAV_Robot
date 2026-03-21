@@ -18,6 +18,12 @@ typedef enum {
 } UavProcId;
 
 typedef enum {
+    UAV_STRATEGY_DEFAULT    = 0,  /* default.rknn – square battery detection */
+    UAV_STRATEGY_BATTERY_V2 = 1,  /* battery_v2.rknn */
+    UAV_STRATEGY_CUSTOM     = 2   /* custom.rknn */
+} UavStrategyId;
+
+typedef enum {
     UAV_CTRL_NONE = 0,
     UAV_CTRL_B_START,
     UAV_CTRL_B_STOP,
@@ -30,7 +36,8 @@ typedef enum {
     UAV_CTRL_C_LOAD_MODEL,
     UAV_CTRL_C_UNLOAD_MODEL,
     UAV_CTRL_C_SET_THRESHOLD,
-    UAV_CTRL_C_SET_RATE
+    UAV_CTRL_C_SET_RATE,
+    UAV_CTRL_C_SET_STRATEGY   /* i32_arg0 = UavStrategyId */
 } UavCtrlCmd;
 
 typedef enum {

@@ -1,7 +1,9 @@
 #include <atomic>
 #include <chrono>
 #include <cstdio>
+#include <cstring>
 #include <mutex>
+#include <string>
 #include <thread>
 #include <vector>
 
@@ -11,7 +13,18 @@
 #include "npu_infer.h"
 #include "postprocess.h"
 #include "preprocess.h"
+#include "result_publisher.h"
 #include "shm_reader.h"
+
+// Map UavStrategyId to model filename
+static const char *strategy_model_name(int32_t id) {
+    switch (id) {
+        case UAV_STRATEGY_BATTERY_V2: return "battery_v2.rknn";
+        case UAV_STRATEGY_CUSTOM:     return "custom.rknn";
+        case UAV_STRATEGY_DEFAULT:
+        default:                      return "default.rknn";
+    }
+}
 
 namespace {
 uint64_t now_ns() {
@@ -42,6 +55,9 @@ int main() {
     std::atomic<bool> infer_enabled{true};
     std::atomic<float> threshold{0.5F};
     std::atomic<uint32_t> rate_fps{30U};
+    // pending_model: protected by model_mu, empty means no reload needed
+    std::mutex model_mu;
+    std::string pending_model;
 
     ShmReader reader;
     if (!reader.open_existing(UAV_SHM_RING_NAME)) {
@@ -52,6 +68,9 @@ int main() {
     CtrlServer ctrl;
     NpuInfer infer;
     (void)infer.load_model("default.rknn");
+
+    ResultPublisher publisher;
+    (void)publisher.open();
 
     ctrl.start(UAV_CTRL_PATH_C, [&](const UavCtrlPayload &cmd) {
         switch (cmd.cmd) {
@@ -77,6 +96,14 @@ int main() {
                     rate_fps.store(static_cast<uint32_t>(cmd.i32_arg0));
                 }
                 break;
+            case UAV_CTRL_C_SET_STRATEGY: {
+                const char *name = strategy_model_name(cmd.i32_arg0);
+                std::lock_guard<std::mutex> lk(model_mu);
+                pending_model = name;
+                std::printf("C_STATUS state=%d error=0\n",
+                            static_cast<int>(UAV_PROC_STATE_IDLE)); // reloading
+                break;
+            }
             default:
                 break;
         }
@@ -105,6 +132,18 @@ int main() {
     std::thread infer_thread([&]() {
         auto last_infer = std::chrono::steady_clock::now();
         while (running.load()) {
+            // Check for pending model reload (strategy change)
+            {
+                std::lock_guard<std::mutex> lk(model_mu);
+                if (!pending_model.empty()) {
+                    infer.unload_model();
+                    (void)infer.load_model(pending_model.c_str());
+                    std::printf("C_STATUS state=%d error=0\n",
+                                static_cast<int>(UAV_PROC_STATE_RUNNING));
+                    pending_model.clear();
+                }
+            }
+
             if (!infer_enabled.load() || !infer.loaded()) {
                 std::this_thread::sleep_for(std::chrono::milliseconds(10));
                 continue;
@@ -146,6 +185,9 @@ int main() {
             UavCResult result = postprocess.run(f, raw, threshold.load());
             print_result(result);
 
+            // Publish result to proc_gateway and app via Unix sockets
+            publisher.publish(result);
+
             const auto t1 = std::chrono::steady_clock::now();
             const float lat_ms = std::chrono::duration<float, std::milli>(t1 - t0).count();
             health.on_infer_done(lat_ms);
@@ -164,6 +206,7 @@ int main() {
     ingest.join();
     infer_thread.join();
     ctrl.stop();
+    publisher.close();
     reader.close();
     print_status(UAV_PROC_STATE_IDLE, 0);
     return 0;

@@ -79,7 +79,105 @@ make clean
 
 > 说明：不同子模块可能有各自依赖（如摄像头/NPU SDK），请按模块实际环境准备。
 
-## 4. 开发与提交流程
+## 4. GitHub 依赖下载受限时的处理流程
+
+如果目标板无法直接访问 GitHub，建议统一按以下流程处理外部依赖：
+
+1. 在目标板上扫描所有需要在线下载的依赖
+2. 在主机上根据扫描结果提前下载依赖
+3. 将依赖拷贝回目标板，并禁用构建过程中的在线下载
+
+### 4.1 第一步：在目标板扫描依赖
+
+在项目目录执行：
+
+```bash
+#!/bin/bash
+# scan_deps.sh - 在目标板上运行，扫描所有需要下载的依赖
+echo "=== 扫描所有 download.cmake.in 文件 ==="
+for f in $(find . -name "*download*.cmake.in" 2>/dev/null); do
+    echo ""
+    echo "--- $f ---"
+    grep -E "GIT_REPOSITORY|GIT_TAG|DOWNLOAD_COMMAND|--branch" "$f" | grep -v "^#"
+done
+```
+
+用途：
+
+- 找出所有 `download.cmake.in` 中声明的 Git 仓库地址、分支和 tag
+- 用于后续在可联网主机上手工下载依赖
+
+### 4.2 第二步：在主机下载依赖并传到目标板
+
+在可访问 GitHub 的主机上执行：
+
+```bash
+#!/bin/bash
+# fetch_deps.sh - 在主机上运行，根据扫描结果下载所有依赖
+RK3588_USER="ubuntu"
+RK3588_IP="192.168.10.2"
+BUILD_DIR="~/scripts_test/librealsense/build"  # 改成实际路径
+
+# ===== 在这里填写扫描到的依赖 =====
+declare -A REPOS=(
+    ["pybind11"]="https://github.com/pybind/pybind11.git|v2.13.6|third-party/pybind11"
+    ["pybind11-json"]="https://github.com/pybind/pybind11_json.git|0.2.15|third-party/pybind11-json"
+    ["json"]="https://github.com/nlohmann/json.git|v3.11.3|third-party/json"
+    ["catch2"]="https://github.com/catchorg/Catch2.git|v3.4.0|third-party/catch2"
+)
+# ==================================
+
+mkdir -p deps && cd deps
+
+for name in "${!REPOS[@]}"; do
+    IFS='|' read -r url tag dest <<< "${REPOS[$name]}"
+    echo "=== 克隆 $name $tag ==="
+    git clone --depth 1 --branch "$tag" "$url" "$name"
+
+    echo "=== 创建远程目录 $dest ==="
+    ssh "$RK3588_USER@$RK3588_IP" "mkdir -p $BUILD_DIR/$dest"
+
+    echo "=== 传输 $name ==="
+    scp -r "$name"/* "$RK3588_USER@$RK3588_IP:$BUILD_DIR/$dest/"
+done
+
+echo "=== 全部完成！==="
+```
+
+说明：
+
+- 只需要修改目标板 IP、用户名、构建目录和依赖列表
+- 如果主机也无法访问 GitHub，再考虑镜像源、压缩包中转或离线 U 盘传输
+
+### 4.3 第三步：在目标板禁用在线下载
+
+将依赖传到目标板后，再执行项目里的禁用下载脚本，例如：
+
+```bash
+bash disable_downloads.sh
+```
+
+如果项目没有现成脚本，建议按相同思路把 `download` 行为改为读取本地目录。
+
+### 4.4 推荐执行顺序
+
+建议固定按下面顺序处理：
+
+```bash
+# 目标板：先扫描依赖
+bash scan_deps.sh
+
+# 主机：根据扫描结果下载并传输依赖
+bash fetch_deps.sh
+
+# 目标板：禁用在线下载后重新编译
+bash disable_downloads.sh
+make -j6
+```
+
+这个流程适合作为以后在板卡环境里遇到 GitHub 下载受限问题时的统一处理准则。
+
+## 5. 开发与提交流程
 
 常用 Git 流程：
 
@@ -98,7 +196,7 @@ git push
 
 - [https://github.com/Anisluo/UAV_Robot](https://github.com/Anisluo/UAV_Robot)
 
-## 5. 维护建议
+## 6. 维护建议
 
 - 新增模块时同步更新本 README 的目录说明。
 - 关键协议、接口变更请同步更新 `spec.md` / `spec2.md`。

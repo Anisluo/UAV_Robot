@@ -4,6 +4,8 @@
 #include <cstdint>
 #include <vector>
 
+#include <librealsense2/rs.hpp>
+
 struct CaptureFrame {
     uint64_t frame_id;
     uint64_t timestamp_ns;
@@ -34,6 +36,9 @@ private:
     uint32_t height_;
     uint32_t fps_;
     int32_t exposure_us_;
+    bool running_;
+    rs2::pipeline pipe_;
+    rs2::config cfg_;
 };
 
 #endif
