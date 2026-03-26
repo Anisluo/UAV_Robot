@@ -1,0 +1,18 @@
+[Unit]
+Description=UAV Robot Gateway Process
+After=network-online.target uav-robotd.service uav-proc-realsense.service uav-proc-npu.service
+Wants=network-online.target uav-robotd.service uav-proc-realsense.service uav-proc-npu.service
+
+[Service]
+Type=simple
+WorkingDirectory=@PROJECT_ROOT@
+EnvironmentFile=-/etc/default/uav_robot
+ExecStartPre=/usr/bin/rm -f /tmp/uav_gw_npu_rx.sock
+ExecStart=/bin/bash -lc 'exec "@PROJECT_ROOT@/proc_gateway/build/bin/proc_gateway" ${UAV_PROC_GATEWAY_ARGS:-}'
+Restart=on-failure
+RestartSec=2
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

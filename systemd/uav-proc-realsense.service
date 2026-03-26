@@ -1,0 +1,17 @@
+[Unit]
+Description=UAV Robot RealSense Process
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=@PROJECT_ROOT@
+EnvironmentFile=-/etc/default/uav_robot
+ExecStart=/bin/bash -lc 'exec "@PROJECT_ROOT@/proc_realsense/build/bin/proc_realsense" ${UAV_PROC_REALSENSE_ARGS:-}'
+Restart=on-failure
+RestartSec=2
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

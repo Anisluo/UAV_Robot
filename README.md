@@ -71,6 +71,12 @@ make build/bin/uav_cli
 ./build/bin/uav_robotd --self-test
 ```
 
+编译 `proc_gateway`：
+
+```bash
+make -C proc_gateway
+```
+
 清理编译产物：
 
 ```bash
@@ -78,6 +84,52 @@ make clean
 ```
 
 > 说明：不同子模块可能有各自依赖（如摄像头/NPU SDK），请按模块实际环境准备。
+
+## 3.1 配置开机自启动
+
+项目内已提供 systemd 安装脚本，可把 `uav_robotd`、`proc_gateway`、`proc_realsense`、`proc_npu` 配置为开机自启动。
+
+在目标机本地安装：
+
+```bash
+cd UAV_Robot
+chmod +x tools/install_autostart.sh
+sudo ./tools/install_autostart.sh
+```
+
+如果只想安装部分服务，例如主控和网关：
+
+```bash
+sudo ./tools/install_autostart.sh --services uav_robotd,proc_gateway
+```
+
+首次安装会生成环境文件：
+
+```bash
+/etc/default/uav_robot
+```
+
+可在其中调整 `uav_robotd` 启动参数，以及底盘 CAN 参数，例如 `UAV_CAR_CAN_IFACE=can3`。
+
+如果要从开发机直接推送到远程 Ubuntu 主机：
+
+```bash
+cd UAV_Robot
+chmod +x tools/deploy_autostart_remote.sh
+./tools/deploy_autostart_remote.sh \
+  --host 192.168.1.101 \
+  --user ubuntu \
+  --password ubuntu \
+  --remote-path /home/ubuntu/UAV_Robot
+```
+
+安装完成后可用以下命令检查状态：
+
+```bash
+systemctl status uav-robotd.service
+systemctl status uav-proc-gateway.service
+journalctl -u uav-robotd.service -f
+```
 
 ## 4. GitHub 依赖下载受限时的处理流程
 

@@ -3,6 +3,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include "event_bus.h"
+#include "can_channel.h"
 #include "reactor.h"
 #include "router.h"
 #include "scheduler.h"
@@ -92,6 +93,7 @@ int main(int argc, char **argv) {
     int safety_loops = 0;
     while (!state.shutdown) {
         reactor_poll(&reactor, &bus, 200);
+        can_channel_poll(&bus);
 
         Event ev;
         while (event_bus_try_pop(&bus, &ev)) {
@@ -103,6 +105,14 @@ int main(int argc, char **argv) {
                 log_info("ack", "ACK %s: %s", proto_command_name(ev.data.feedback.cmd), ev.data.feedback.reason);
             } else if (ev.type == EVT_CMD_NACK) {
                 log_warn("ack", "NACK %s: %s", proto_command_name(ev.data.feedback.cmd), ev.data.feedback.reason);
+            } else if (ev.type == EVT_DEVICE_FEEDBACK) {
+                log_info("can",
+                         "%s addr=%u cmd=0x%02X status=0x%02X %s",
+                         ev.data.device.source,
+                         (unsigned int)ev.data.device.addr,
+                         (unsigned int)ev.data.device.cmd,
+                         (unsigned int)ev.data.device.status,
+                         ev.data.device.text);
             }
         }
 

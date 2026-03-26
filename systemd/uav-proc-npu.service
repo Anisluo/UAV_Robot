@@ -1,0 +1,17 @@
+[Unit]
+Description=UAV Robot NPU Process
+After=uav-proc-realsense.service
+Wants=uav-proc-realsense.service
+
+[Service]
+Type=simple
+WorkingDirectory=@PROJECT_ROOT@
+EnvironmentFile=-/etc/default/uav_robot
+ExecStart=/bin/bash -lc 'exec "@PROJECT_ROOT@/proc_npu/build/bin/proc_npu" ${UAV_PROC_NPU_ARGS:-}'
+Restart=on-failure
+RestartSec=2
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

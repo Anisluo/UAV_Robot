@@ -1,6 +1,6 @@
 CC ?= gcc
 CFLAGS ?= -std=c11 -Wall -Wextra -Werror -Iinclude -O2
-LDFLAGS ?=
+LDFLAGS ?= -lm
 
 BUILD_DIR := build
 BIN_DIR := $(BUILD_DIR)/bin
@@ -8,6 +8,7 @@ OBJ_DIR := $(BUILD_DIR)/obj
 
 ROBOTD_SRCS := \
 	app/main.c \
+	app/npu_detect.c \
 	core/bus/bus.c \
 	core/log/log.c \
 	core/reactor/reactor.c \

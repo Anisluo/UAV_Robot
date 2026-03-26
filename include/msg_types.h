@@ -30,7 +30,8 @@ typedef enum {
     EVT_TASK_FAIL,
     EVT_EMERGENCY_STOP,
     EVT_RESET_FAULT,
-    EVT_SHUTDOWN
+    EVT_SHUTDOWN,
+    EVT_DEVICE_FEEDBACK
 } EventType;
 
 typedef struct {
@@ -53,6 +54,13 @@ typedef struct {
         struct {
             char reason[UAV_TEXT_MAX];
         } failure;
+        struct {
+            char source[24];
+            uint8_t addr;
+            uint8_t cmd;
+            uint8_t status;
+            char text[UAV_TEXT_MAX];
+        } device;
     } data;
 } Event;
 
