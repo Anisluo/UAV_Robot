@@ -7,7 +7,7 @@ SYSTEMD_SRC_DIR="${PROJECT_ROOT}/systemd"
 SYSTEMD_DST_DIR="/etc/systemd/system"
 ENV_DST_FILE="/etc/default/uav_robot"
 
-DEFAULT_SERVICES="uav_robotd,proc_realsense,proc_npu,proc_gateway"
+DEFAULT_SERVICES="uav_robotd,proc_realsense,proc_npu,proc_gateway,proc_car,proc_gripper,proc_arm,proc_airport"
 SERVICES="${DEFAULT_SERVICES}"
 ORIGINAL_ARGS=("$@")
 
@@ -18,7 +18,8 @@ Usage:
 
 Options:
   --services   Comma-separated service list. Available values:
-               uav_robotd, proc_realsense, proc_npu, proc_gateway
+               uav_robotd, proc_realsense, proc_npu, proc_gateway,
+               proc_car, proc_gripper, proc_arm, proc_airport
   -h, --help   Show this help message.
 
 Examples:
@@ -64,6 +65,10 @@ declare -A BUILD_COMMANDS=(
     [proc_realsense]="make -C proc_realsense"
     [proc_npu]="make -C proc_npu"
     [proc_gateway]="make -C proc_gateway"
+    [proc_car]="make -C proc_car"
+    [proc_gripper]="make -C proc_gripper"
+    [proc_arm]="make -C proc_arm"
+    [proc_airport]="make -C proc_airport"
 )
 
 declare -A UNIT_NAMES=(
@@ -71,6 +76,10 @@ declare -A UNIT_NAMES=(
     [proc_realsense]="uav-proc-realsense.service"
     [proc_npu]="uav-proc-npu.service"
     [proc_gateway]="uav-proc-gateway.service"
+    [proc_car]="uav-proc-car.service"
+    [proc_gripper]="uav-proc-gripper.service"
+    [proc_arm]="uav-proc-arm.service"
+    [proc_airport]="uav-proc-airport.service"
 )
 
 IFS=',' read -r -a REQUESTED_SERVICES <<< "${SERVICES}"
@@ -79,7 +88,7 @@ normalize_service_name() {
     local name
     name=$(echo "$1" | tr -d '[:space:]')
     case "${name}" in
-        uav_robotd|proc_realsense|proc_npu|proc_gateway)
+        uav_robotd|proc_realsense|proc_npu|proc_gateway|proc_car|proc_gripper|proc_arm|proc_airport)
             printf '%s\n' "${name}"
             ;;
         *)

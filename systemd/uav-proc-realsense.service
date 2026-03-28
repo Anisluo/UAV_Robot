@@ -7,6 +7,7 @@ Wants=network-online.target
 Type=simple
 WorkingDirectory=@PROJECT_ROOT@
 EnvironmentFile=-/etc/default/uav_robot
+ExecStartPre=/bin/bash -lc 'rm -f /tmp/uav_rs_frame_notify.sock'
 ExecStart=/bin/bash -lc 'exec "@PROJECT_ROOT@/proc_realsense/build/bin/proc_realsense" ${UAV_PROC_REALSENSE_ARGS:-}'
 Restart=on-failure
 RestartSec=2

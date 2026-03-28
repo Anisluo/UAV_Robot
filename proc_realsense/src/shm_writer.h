@@ -19,10 +19,10 @@ public:
     uint32_t drop_count() const;
 
 private:
-    bool notify_frame_ready(uint32_t slot_id, uint64_t frame_id, uint64_t timestamp_ns);
+    bool notify_frame_ready();
 
     int shm_fd_;
-    int notify_fd_;
+    int notify_fd_;   // Unix SOCK_DGRAM，向 UAV_RS_FRAME_NOTIFY_PATH 发 8 字节计数
     size_t map_size_;
     ShmRing *ring_;
     uint32_t drop_count_;

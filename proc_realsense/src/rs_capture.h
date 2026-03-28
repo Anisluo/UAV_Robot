@@ -31,12 +31,16 @@ public:
     bool snapshot(CaptureFrame &frame);
 
 private:
+    bool apply_profile(bool enable_depth);
+    bool try_start_mode(bool enable_depth, const char *label);
+
     uint64_t next_frame_id_;
     uint32_t width_;
     uint32_t height_;
     uint32_t fps_;
     int32_t exposure_us_;
     bool running_;
+    bool depth_enabled_;
     rs2::pipeline pipe_;
     rs2::config cfg_;
 };

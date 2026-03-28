@@ -66,8 +66,8 @@ bool ShmReader::bind_notify_socket() {
     }
     sockaddr_un addr{};
     addr.sun_family = AF_UNIX;
-    std::snprintf(addr.sun_path, sizeof(addr.sun_path), "%s", UAV_DATA_NOTIFY_PATH_C);
-    unlink(UAV_DATA_NOTIFY_PATH_C);
+    std::snprintf(addr.sun_path, sizeof(addr.sun_path), "%s", UAV_RS_FRAME_NOTIFY_PATH);
+    unlink(UAV_RS_FRAME_NOTIFY_PATH);
     if (bind(notify_fd_, reinterpret_cast<sockaddr *>(&addr), sizeof(addr)) != 0) {
         std::fprintf(stderr, "proc_npu: notify bind failed: %s\n", std::strerror(errno));
         return false;
@@ -87,7 +87,7 @@ void ShmReader::close() {
     if (notify_fd_ >= 0) {
         ::close(notify_fd_);
         notify_fd_ = -1;
-        unlink(UAV_DATA_NOTIFY_PATH_C);
+        unlink(UAV_RS_FRAME_NOTIFY_PATH);
     }
     map_size_ = 0;
 }

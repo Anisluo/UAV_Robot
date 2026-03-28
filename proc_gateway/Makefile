@@ -1,5 +1,5 @@
 CXX      ?= g++
-CXXFLAGS ?= -std=c++17 -Wall -Wextra -O2 -I../include -I../include/abi
+CXXFLAGS ?= -std=c++17 -Wall -Wextra -O2 -Iinclude -Isrc -I../common/include -I../common/include/abi
 LDFLAGS  ?=
 LDLIBS   ?= -ljpeg -lrt -lpthread
 
@@ -9,20 +9,26 @@ BIN_DIR   := $(BUILD_DIR)/bin
 TARGET    := $(BIN_DIR)/proc_gateway
 
 SRCS := \
+	app/gateway_application.cpp \
+	core/gateway_runtime.cpp \
 	src/main.cpp \
 	src/shm_reader.cpp \
 	src/jpeg_encoder.cpp \
 	src/ctrl_client.cpp \
-	../core/proto/proto_gripper_uart.c \
-	../core/proto/proto_zdt_arm.c \
-	../drv/dev/uart_posix.c \
-	../core/log/log.c
+	../uav_robotd/core/dev/arm.c \
+	../uav_robotd/core/proto/proto_gripper_uart.c \
+	../uav_robotd/core/proto/proto_zdt_arm.c \
+	../uav_robotd/drv/dev/uart_posix.c \
+	../uav_robotd/core/log/log.c
 
 OBJS := \
-	$(OBJ_DIR)/main.o \
-	$(OBJ_DIR)/shm_reader.o \
-	$(OBJ_DIR)/jpeg_encoder.o \
-	$(OBJ_DIR)/ctrl_client.o \
+	$(OBJ_DIR)/app/gateway_application.o \
+	$(OBJ_DIR)/core/gateway_runtime.o \
+	$(OBJ_DIR)/src/main.o \
+	$(OBJ_DIR)/src/shm_reader.o \
+	$(OBJ_DIR)/src/jpeg_encoder.o \
+	$(OBJ_DIR)/src/ctrl_client.o \
+	$(OBJ_DIR)/arm.o \
 	$(OBJ_DIR)/proto_gripper_uart.o \
 	$(OBJ_DIR)/proto_zdt_arm.o \
 	$(OBJ_DIR)/uart_posix.o \
@@ -38,19 +44,23 @@ dirs:
 $(TARGET): $(OBJS)
 	$(CXX) $(OBJS) -o $@ $(LDFLAGS) $(LDLIBS)
 
-$(OBJ_DIR)/%.o: src/%.cpp
+$(OBJ_DIR)/%.o: %.cpp
+	@mkdir -p $(dir $@)
 	$(CXX) $(CXXFLAGS) -c $< -o $@
 
-$(OBJ_DIR)/proto_zdt_arm.o: ../core/proto/proto_zdt_arm.c
+$(OBJ_DIR)/arm.o: ../uav_robotd/core/dev/arm.c
 	$(CXX) $(CXXFLAGS) -c $< -o $@
 
-$(OBJ_DIR)/proto_gripper_uart.o: ../core/proto/proto_gripper_uart.c
+$(OBJ_DIR)/proto_zdt_arm.o: ../uav_robotd/core/proto/proto_zdt_arm.c
 	$(CXX) $(CXXFLAGS) -c $< -o $@
 
-$(OBJ_DIR)/uart_posix.o: ../drv/dev/uart_posix.c
+$(OBJ_DIR)/proto_gripper_uart.o: ../uav_robotd/core/proto/proto_gripper_uart.c
 	$(CXX) $(CXXFLAGS) -c $< -o $@
 
-$(OBJ_DIR)/log.o: ../core/log/log.c
+$(OBJ_DIR)/uart_posix.o: ../uav_robotd/drv/dev/uart_posix.c
+	$(CXX) $(CXXFLAGS) -c $< -o $@
+
+$(OBJ_DIR)/log.o: ../uav_robotd/core/log/log.c
 	$(CXX) $(CXXFLAGS) -c $< -o $@
 
 install-deps:

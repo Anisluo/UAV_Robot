@@ -1,0 +1,17 @@
+[Unit]
+Description=UAV Robot Arm Process
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=@PROJECT_ROOT@
+EnvironmentFile=-/etc/default/uav_robot
+ExecStart=/bin/bash -lc 'exec "@PROJECT_ROOT@/proc_arm/build/bin/proc_arm" ${UAV_PROC_ARM_ARGS:-}'
+Restart=on-failure
+RestartSec=2
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

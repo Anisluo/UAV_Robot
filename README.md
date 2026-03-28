@@ -4,20 +4,25 @@
 
 `UAV_Robot` 是一个面向无人机/机器人协同控制的工程仓库，包含：
 
-- 主控应用层任务（`app/`）
-- 核心调度与通信框架（`core/`）
-- 设备与 I/O 驱动（`drv/`）
-- 公共头文件与 ABI 定义（`include/`）
-- 独立处理进程（`proc_npu/`、`proc_realsense/`）
+- 主控守护进程源码（`uav_robotd/app/`、`uav_robotd/core/`、`uav_robotd/drv/`）
+- 公共头文件与 ABI 定义（`common/include/`）
+- 独立处理进程（`proc_gateway/`、`proc_realsense/`、`proc_npu/`、`proc_car/`、`proc_gripper/`、`proc_arm/`、`proc_airport/`）
 
 ## 2. 目录结构
 
 ```text
 UAV_Robot/
-|- app/            # 业务任务与主程序入口
-|- core/           # bus/channel/router/reactor/scheduler 等核心模块
-|- drv/            # 设备驱动与底层 I/O
-|- include/        # 对外接口头文件与 ABI
+|- uav_robotd/     # 主控守护进程
+|  |- app/         # 业务任务与主程序入口
+|  |- core/        # bus/channel/router/reactor/scheduler 等核心模块
+|  |- drv/         # 设备驱动与底层 I/O
+|- common/
+|  |- include/     # uav_robotd 与 proc_* 共享头文件、ABI
+|- proc_gateway/   # 网关进程
+|- proc_car/       # 小车控制进程
+|- proc_gripper/   # 串口夹爪进程
+|- proc_arm/       # 机械臂进程
+|- proc_airport/   # 机场/平台锁进程
 |- proc_npu/       # NPU 相关进程
 |- proc_realsense/ # Realsense 相关进程
 |- tools/          # 辅助工具
@@ -27,6 +32,12 @@ UAV_Robot/
 ```
 
 ## 3. 构建与运行
+
+HostGUI 对接说明见：
+
+```text
+doc/HostGUI对接文档.md
+```
 
 首次拉取并进入项目目录：
 
@@ -110,6 +121,29 @@ sudo ./tools/install_autostart.sh --services uav_robotd,proc_gateway
 ```
 
 可在其中调整 `uav_robotd` 启动参数，以及底盘 CAN 参数，例如 `UAV_CAR_CAN_IFACE=can3`。
+
+夹爪按当前架构走独立串口，不再复用继电器控制。默认配置项为：
+
+```text
+UAV_GRIPPER_UART_PATH=/dev/ttyUSB0
+```
+
+夹爪协议为 `115200 8N1`，当前固化的控制指令如下：
+
+```text
+open  = 55 55 01 07 01 90 01 E8 03 7A
+close = 55 55 01 07 01 84 03 E8 03 84
+```
+
+通过 `proc_gateway` 可直接调用：
+
+```json
+{"id":30,"method":"airport.gripper","open":true}
+```
+
+```json
+{"id":31,"method":"airport.gripper","open":false}
+```
 
 如果要从开发机直接推送到远程 Ubuntu 主机：
 

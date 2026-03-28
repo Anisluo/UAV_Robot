@@ -1,5 +1,5 @@
 CXX ?= g++
-CXXFLAGS ?= -std=c++17 -Wall -Wextra -Werror -O2 -I../include -I../include/abi
+CXXFLAGS ?= -std=c++17 -Wall -Wextra -Werror -O2 -Iinclude -Isrc -I../common/include -I../common/include/abi
 LDFLAGS ?=
 LDLIBS ?= -lrknnrt -lpthread -lrt
 
@@ -9,6 +9,8 @@ BIN_DIR := $(BUILD_DIR)/bin
 TARGET := $(BIN_DIR)/proc_npu
 
 SRCS := \
+	app/npu_application.cpp \
+	core/npu_pipeline.cpp \
 	src/main.cpp \
 	src/shm_reader.cpp \
 	src/preprocess.cpp \
@@ -18,7 +20,7 @@ SRCS := \
 	src/health.cpp \
 	src/result_publisher.cpp
 
-OBJS := $(patsubst src/%.cpp,$(OBJ_DIR)/%.o,$(SRCS))
+OBJS := $(patsubst %.cpp,$(OBJ_DIR)/%.o,$(SRCS))
 
 .PHONY: all clean dirs
 
@@ -30,7 +32,7 @@ dirs:
 $(TARGET): $(OBJS)
 	$(CXX) $(OBJS) -o $@ $(LDFLAGS) $(LDLIBS)
 
-$(OBJ_DIR)/%.o: src/%.cpp
+$(OBJ_DIR)/%.o: %.cpp
 	@mkdir -p $(dir $@)
 	$(CXX) $(CXXFLAGS) -c $< -o $@
 

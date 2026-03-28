@@ -89,36 +89,24 @@ void ShmWriter::close() {
     map_size_ = 0;
 }
 
-bool ShmWriter::notify_frame_ready(uint32_t slot_id, uint64_t frame_id, uint64_t timestamp_ns) {
+// 向 proc_gateway 发送帧就绪通知：8 字节 uint64 计数（与 eventfd write 语义相同）。
+// proc_gateway epoll 监听 UAV_RS_FRAME_NOTIFY_PATH，收到后读 SHM 最新帧。
+bool ShmWriter::notify_frame_ready() {
     if (notify_fd_ < 0) {
         return false;
     }
-    UavIpcHeader hdr{};
-    hdr.magic = UAV_IPC_MAGIC;
-    hdr.version = UAV_ABI_VERSION;
-    hdr.type = UAV_IPC_MSG_FRAME_READY;
-    hdr.payload_size = sizeof(UavFrameReadyPayload);
-
-    UavFrameReadyPayload payload{};
-    payload.slot_id = slot_id;
-    payload.frame_id = frame_id;
-    payload.timestamp_ns = timestamp_ns;
-
-    uint8_t buffer[sizeof(UavIpcHeader) + sizeof(UavFrameReadyPayload)]{};
-    std::memcpy(buffer, &hdr, sizeof(hdr));
-    std::memcpy(buffer + sizeof(hdr), &payload, sizeof(payload));
-
+    const uint64_t val = 1;
     sockaddr_un addr{};
     addr.sun_family = AF_UNIX;
-    std::snprintf(addr.sun_path, sizeof(addr.sun_path), "%s", UAV_DATA_NOTIFY_PATH_C);
+    std::snprintf(addr.sun_path, sizeof(addr.sun_path), "%s", UAV_RS_FRAME_NOTIFY_PATH);
     const ssize_t sent = sendto(
         notify_fd_,
-        buffer,
-        sizeof(buffer),
+        &val,
+        sizeof(val),
         MSG_DONTWAIT,
         reinterpret_cast<sockaddr *>(&addr),
         sizeof(addr));
-    return sent == static_cast<ssize_t>(sizeof(buffer));
+    return sent == static_cast<ssize_t>(sizeof(val));
 }
 
 bool ShmWriter::write_frame(const CaptureFrame &frame) {
@@ -177,7 +165,7 @@ bool ShmWriter::write_frame(const CaptureFrame &frame) {
 
         store_state(&slot->state, UAV_SLOT_READY);
         ring_->write_index = frame.frame_id;
-        (void)notify_frame_ready(idx, frame.frame_id, frame.timestamp_ns);
+        (void)notify_frame_ready();
         return true;
     }
 }

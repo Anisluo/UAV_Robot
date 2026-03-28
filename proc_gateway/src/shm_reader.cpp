@@ -6,7 +6,11 @@
 
 #include <fcntl.h>
 #include <sys/mman.h>
+#include <sys/socket.h>
+#include <sys/un.h>
 #include <unistd.h>
+
+#include "abi/ipc_framing.h"
 
 ShmReader::ShmReader()  = default;
 ShmReader::~ShmReader() { close(); }
@@ -42,9 +46,44 @@ bool ShmReader::open(const std::string &shm_name) {
 }
 
 void ShmReader::close() {
-    if (ring_)    { munmap(ring_, map_size_); ring_ = nullptr; }
-    if (fd_ >= 0) { ::close(fd_); fd_ = -1; }
+    if (ring_)           { munmap(ring_, map_size_); ring_ = nullptr; }
+    if (fd_ >= 0)        { ::close(fd_); fd_ = -1; }
+    if (notify_fd_ >= 0) { ::close(notify_fd_); notify_fd_ = -1; }
     map_size_ = 0;
+}
+
+int ShmReader::open_notify_fd() {
+    if (notify_fd_ >= 0) return notify_fd_;
+
+    notify_fd_ = socket(AF_UNIX, SOCK_DGRAM, 0);
+    if (notify_fd_ < 0) {
+        std::fprintf(stderr, "proc_gateway: frame notify socket failed: %s\n", std::strerror(errno));
+        return -1;
+    }
+
+    sockaddr_un addr{};
+    addr.sun_family = AF_UNIX;
+    std::snprintf(addr.sun_path, sizeof(addr.sun_path), "%s", UAV_RS_FRAME_NOTIFY_PATH);
+    unlink(UAV_RS_FRAME_NOTIFY_PATH);
+
+    if (bind(notify_fd_, reinterpret_cast<sockaddr *>(&addr), sizeof(addr)) != 0) {
+        std::fprintf(stderr, "proc_gateway: frame notify bind failed: %s\n", std::strerror(errno));
+        ::close(notify_fd_);
+        notify_fd_ = -1;
+        return -1;
+    }
+
+    int flags = fcntl(notify_fd_, F_GETFL, 0);
+    fcntl(notify_fd_, F_SETFL, flags | O_NONBLOCK);
+    return notify_fd_;
+}
+
+void ShmReader::drain_notify_fd() {
+    if (notify_fd_ < 0) return;
+    uint64_t val;
+    while (recv(notify_fd_, &val, sizeof(val), MSG_DONTWAIT) == static_cast<ssize_t>(sizeof(val))) {
+        // 消费所有待读通知，防止 epoll 持续触发
+    }
 }
 
 bool ShmReader::read_latest(GatewayFrame &out) {

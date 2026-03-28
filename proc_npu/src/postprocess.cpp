@@ -104,10 +104,15 @@ UavCResult Postprocess::run(const InferenceFrame &frame,
                 const float X_mm = (cx_px - ppx) / fx * Z_mm;
                 const float Y_mm = (cy_px - ppy) / fy * Z_mm;
 
-                det.x_mm   = X_mm;
-                det.y_mm   = Y_mm;
-                det.z_mm   = Z_mm;
-                det.has_xyz = 1;
+        det.x_mm   = X_mm;
+        det.y_mm   = Y_mm;
+        det.z_mm   = Z_mm;
+        det.roll_deg = 0.0f;
+        det.pitch_deg = 0.0f;
+        det.yaw_deg = 0.0f;
+        det.has_xyz = 1;
+        det.has_rpy = 0;
+        det.grasp_mode = UAV_GRASP_MODE_3D;
             }
         }
 
