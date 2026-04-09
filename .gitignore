@@ -8,3 +8,4 @@ build/
 *.dylib
 *.exe
 *.log
+proc_arm.zip

@@ -1,5 +1,6 @@
 #include "arm_runtime.h"
 
+#include <array>
 #include <cerrno>
 #include <csignal>
 #include <cstdio>
@@ -8,28 +9,38 @@
 #include <poll.h>
 #include <string>
 
+#include <arpa/inet.h>
+#include <netinet/in.h>
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <unistd.h>
 
-extern "C" {
-#include "dev.h"
-}
+#include "arm_controller.h"
 
+extern "C" {
 #include "log.h"
+}
 
 namespace {
 constexpr const char *kTag = "proc_arm";
 constexpr const char *kSockPath = "/tmp/uav_proc_arm.sock";
+constexpr int kLegacyPortDefault = 12345;
 constexpr int kMaxClients = 8;
 constexpr size_t kBufSize = 4096;
+constexpr size_t kLegacyMaxPacketSize = 1U << 20;
 
 bool json_get_token(const char *json, const char *key, char *out, size_t out_size) {
     char needle[128];
-    std::snprintf(needle, sizeof(needle), "\"%s\"", key);
-    const char *p = std::strstr(json, needle);
+    const char *p;
     size_t i = 0;
-    if (p == nullptr || out == nullptr || out_size == 0U) {
+
+    if (json == nullptr || out == nullptr || out_size == 0U) {
+        return false;
+    }
+
+    std::snprintf(needle, sizeof(needle), "\"%s\"", key);
+    p = std::strstr(json, needle);
+    if (p == nullptr) {
         return false;
     }
 
@@ -67,6 +78,7 @@ bool json_get_int(const char *json, const char *key, int *out) {
     char token[64];
     char *end = nullptr;
     long value;
+
     if (out == nullptr || !json_get_token(json, key, token, sizeof(token))) {
         return false;
     }
@@ -78,19 +90,37 @@ bool json_get_int(const char *json, const char *key, int *out) {
     return true;
 }
 
-bool json_get_float(const char *json, const char *key, float *out) {
+bool json_get_double(const char *json, const char *key, double *out) {
     char token[64];
     char *end = nullptr;
-    float value;
+    double value;
+
     if (out == nullptr || !json_get_token(json, key, token, sizeof(token))) {
         return false;
     }
-    value = std::strtof(token, &end);
+    value = std::strtod(token, &end);
     if (end == token) {
         return false;
     }
     *out = value;
     return true;
+}
+
+bool json_get_bool(const char *json, const char *key, bool *out) {
+    char token[16];
+
+    if (out == nullptr || !json_get_token(json, key, token, sizeof(token))) {
+        return false;
+    }
+    if (std::strcmp(token, "true") == 0 || std::strcmp(token, "1") == 0) {
+        *out = true;
+        return true;
+    }
+    if (std::strcmp(token, "false") == 0 || std::strcmp(token, "0") == 0) {
+        *out = false;
+        return true;
+    }
+    return false;
 }
 
 std::string json_escape(const char *text) {
@@ -113,7 +143,7 @@ std::string extract_id_fragment(const char *line) {
     return std::string("\"id\":") + id;
 }
 
-std::string make_result(const std::string &id_fragment, const char *payload) {
+std::string make_result(const std::string &id_fragment, const std::string &payload) {
     return std::string("{\"jsonrpc\":\"2.0\",") + id_fragment + ",\"result\":" + payload + "}\n";
 }
 
@@ -123,9 +153,302 @@ std::string make_error(const std::string &id_fragment, int code, const char *mes
            ",\"message\":" + json_escape(message) + "}}\n";
 }
 
-std::string handle_request(const char *line) {
+std::string bool_result(const std::string &id_fragment, bool ok) {
+    return make_result(id_fragment, ok ? "{\"ok\":true}" : "{\"ok\":false}");
+}
+
+std::string number_payload(double value) {
+    char buf[64];
+    std::snprintf(buf, sizeof(buf), "%.2f", value);
+    return buf;
+}
+
+std::string array_payload(const std::array<double, 6> &values) {
+    char buf[256];
+    std::snprintf(buf,
+                  sizeof(buf),
+                  "[%.6f,%.6f,%.6f,%.6f,%.6f,%.6f]",
+                  values[0],
+                  values[1],
+                  values[2],
+                  values[3],
+                  values[4],
+                  values[5]);
+    return buf;
+}
+
+std::string array16_payload(const std::array<double, 16> &values) {
+    std::string out = "[";
+    char buf[64];
+    for (size_t i = 0; i < values.size(); ++i) {
+        std::snprintf(buf, sizeof(buf), "%.6f", values[i]);
+        if (i > 0U) {
+            out += ",";
+        }
+        out += buf;
+    }
+    out += "]";
+    return out;
+}
+
+bool extract_param_slice(const char *json, std::string *out) {
+    const char *p = std::strstr(json, "\"params\"");
+    const char *start;
+    int depth = 0;
+
+    if (out == nullptr || p == nullptr) {
+        return false;
+    }
+    p = std::strchr(p, ':');
+    if (p == nullptr) {
+        return false;
+    }
+    ++p;
+    while (*p == ' ' || *p == '\t') {
+        ++p;
+    }
+    start = p;
+    if (*p == '{' || *p == '[') {
+        const char open_ch = *p;
+        const char close_ch = (open_ch == '{') ? '}' : ']';
+        while (*p != '\0') {
+            if (*p == open_ch) {
+                ++depth;
+            } else if (*p == close_ch) {
+                --depth;
+                if (depth == 0) {
+                    ++p;
+                    out->assign(start, static_cast<size_t>(p - start));
+                    return true;
+                }
+            }
+            ++p;
+        }
+        return false;
+    }
+
+    while (*p != '\0' && *p != ',' && *p != '}') {
+        ++p;
+    }
+    out->assign(start, static_cast<size_t>(p - start));
+    return !out->empty();
+}
+
+bool parse_keyed_joints(const char *json, std::array<double, 6> *out) {
+    const char *keys[6] = {"j1_deg", "j2_deg", "j3_deg", "j4_deg", "j5_deg", "j6_deg"};
+    if (out == nullptr) {
+        return false;
+    }
+    for (size_t i = 0; i < out->size(); ++i) {
+        if (!json_get_double(json, keys[i], &(*out)[i])) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool parse_legacy_number_array(const std::string &text, std::array<double, 6> *out) {
+    const char *p = text.c_str();
+    char *end = nullptr;
+
+    if (out == nullptr) {
+        return false;
+    }
+    while (*p != '\0' && *p != '[') {
+        ++p;
+    }
+    if (*p != '[') {
+        return false;
+    }
+    ++p;
+    for (size_t i = 0; i < out->size(); ++i) {
+        while (*p == ' ' || *p == '\t') {
+            ++p;
+        }
+        (*out)[i] = std::strtod(p, &end);
+        if (end == p) {
+            return false;
+        }
+        p = end;
+        while (*p == ' ' || *p == '\t') {
+            ++p;
+        }
+        if (i + 1U < out->size()) {
+            if (*p != ',') {
+                return false;
+            }
+            ++p;
+        }
+    }
+    return true;
+}
+
+bool parse_legacy_angle_mode_params(const std::string &params,
+                                    std::array<double, 6> *joints_deg,
+                                    double *speed_ratio) {
+    const char *first_bracket;
+    const char *after_first;
+    char *end = nullptr;
+
+    if (joints_deg == nullptr || speed_ratio == nullptr) {
+        return false;
+    }
+    first_bracket = std::strchr(params.c_str(), '[');
+    if (first_bracket == nullptr) {
+        return false;
+    }
+    after_first = std::strchr(first_bracket + 1, ']');
+    if (after_first == nullptr) {
+        return false;
+    }
+    if (!parse_legacy_number_array(std::string(first_bracket, static_cast<size_t>(after_first - first_bracket + 1)),
+                                   joints_deg)) {
+        return false;
+    }
+    *speed_ratio = std::strtod(after_first + 1, &end);
+    if (end == after_first + 1) {
+        *speed_ratio = 1.0;
+    }
+    return true;
+}
+
+bool parse_legacy_pose_params(const std::string &params,
+                              double *x_mm,
+                              double *y_mm,
+                              double *z_mm,
+                              double *roll_deg,
+                              double *pitch_deg,
+                              double *yaw_deg,
+                              std::string *rotation_order,
+                              double *speed_ratio,
+                              bool require_speed) {
+    const char *p = params.c_str();
+    char *end = nullptr;
+    double *values[6] = {x_mm, y_mm, z_mm, roll_deg, pitch_deg, yaw_deg};
+
+    if (rotation_order == nullptr) {
+        return false;
+    }
+    while (*p != '\0' && *p != '[') {
+        ++p;
+    }
+    if (*p != '[') {
+        return false;
+    }
+    ++p;
+    for (size_t i = 0; i < 6; ++i) {
+        while (*p == ' ' || *p == '\t') {
+            ++p;
+        }
+        *values[i] = std::strtod(p, &end);
+        if (end == p) {
+            return false;
+        }
+        p = end;
+        while (*p == ' ' || *p == '\t') {
+            ++p;
+        }
+        if (*p != ',') {
+            return false;
+        }
+        ++p;
+    }
+    while (*p == ' ' || *p == '\t') {
+        ++p;
+    }
+    if (*p != '"') {
+        return false;
+    }
+    ++p;
+    {
+        const char *start = p;
+        while (*p != '\0' && *p != '"') {
+            ++p;
+        }
+        if (*p != '"') {
+            return false;
+        }
+        rotation_order->assign(start, static_cast<size_t>(p - start));
+        ++p;
+    }
+    if (speed_ratio != nullptr) {
+        while (*p == ' ' || *p == '\t' || *p == ',') {
+            ++p;
+        }
+        *speed_ratio = 1.0;
+        if (*p != ']') {
+            *speed_ratio = std::strtod(p, &end);
+            if (end == p && require_speed) {
+                return false;
+            }
+        } else if (require_speed) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool recv_all(int fd, void *buf, size_t len) {
+    size_t total = 0;
+    while (total < len) {
+        ssize_t n = recv(fd, static_cast<char *>(buf) + total, len - total, 0);
+        if (n <= 0) {
+            return false;
+        }
+        total += static_cast<size_t>(n);
+    }
+    return true;
+}
+
+bool send_all(int fd, const void *buf, size_t len) {
+    size_t total = 0;
+    while (total < len) {
+        ssize_t n = send(fd, static_cast<const char *>(buf) + total, len - total, MSG_NOSIGNAL);
+        if (n <= 0) {
+            return false;
+        }
+        total += static_cast<size_t>(n);
+    }
+    return true;
+}
+
+bool send_legacy_message(int fd, const std::string &payload) {
+    uint8_t hdr[8];
+    uint64_t len = static_cast<uint64_t>(payload.size());
+
+    for (int i = 7; i >= 0; --i) {
+        hdr[i] = static_cast<uint8_t>(len & 0xFFU);
+        len >>= 8;
+    }
+    return send_all(fd, hdr, sizeof(hdr)) && send_all(fd, payload.data(), payload.size());
+}
+
+bool recv_legacy_message(int fd, std::string *out) {
+    uint8_t hdr[8];
+    uint64_t len = 0;
+    std::string payload;
+
+    if (out == nullptr || !recv_all(fd, hdr, sizeof(hdr))) {
+        return false;
+    }
+    for (size_t i = 0; i < sizeof(hdr); ++i) {
+        len = (len << 8) | hdr[i];
+    }
+    if (len == 0U || len > kLegacyMaxPacketSize) {
+        return false;
+    }
+    payload.resize(static_cast<size_t>(len));
+    if (!recv_all(fd, payload.data(), payload.size())) {
+        return false;
+    }
+    *out = payload;
+    return true;
+}
+
+std::string handle_jsonrpc_request(const char *line) {
     char method[64] = {};
     std::string id_fragment = extract_id_fragment(line);
+    ArmController &controller = ArmController::instance();
 
     if (!json_get_token(line, "method", method, sizeof(method))) {
         return make_error(id_fragment, -32600, "missing method");
@@ -135,93 +458,356 @@ std::string handle_request(const char *line) {
         return make_result(id_fragment, "{\"ok\":true}");
     }
     if (std::strcmp(method, "arm.home") == 0) {
-        return make_result(id_fragment, arm_home() ? "{\"ok\":true}" : "{\"ok\":false}");
+        return bool_result(id_fragment, controller.home());
+    }
+    if (std::strcmp(method, "arm.home_joint") == 0) {
+        int joint_index = 0;
+        if (!json_get_int(line, "joint_index", &joint_index) &&
+            !json_get_int(line, "joint", &joint_index)) {
+            return make_error(id_fragment, -32602, "missing joint_index");
+        }
+        return bool_result(id_fragment, controller.homeJoint(joint_index));
     }
     if (std::strcmp(method, "arm.stop") == 0) {
-        return make_result(id_fragment, arm_stop() ? "{\"ok\":true}" : "{\"ok\":false}");
+        return bool_result(id_fragment, controller.stop());
+    }
+    if (std::strcmp(method, "arm.emergency_stop") == 0) {
+        bool enable = false;
+        if (!json_get_bool(line, "enable", &enable)) {
+            return make_error(id_fragment, -32602, "missing enable");
+        }
+        return bool_result(id_fragment, controller.emergencyStop(enable));
+    }
+    if (std::strcmp(method, "arm.set_free_mode") == 0) {
+        bool enable = false;
+        if (!json_get_bool(line, "enable", &enable)) {
+            return make_error(id_fragment, -32602, "missing enable");
+        }
+        return bool_result(id_fragment, controller.setFreeMode(enable));
     }
     if (std::strcmp(method, "arm.move_pose") == 0) {
         char pose[64] = {};
         if (!json_get_token(line, "pose", pose, sizeof(pose))) {
             return make_error(id_fragment, -32602, "missing pose");
         }
-        return make_result(id_fragment, arm_move(pose) ? "{\"ok\":true}" : "{\"ok\":false}");
+        return bool_result(id_fragment, controller.movePose(pose));
     }
     if (std::strcmp(method, "arm.move_xyz") == 0) {
-        float x_mm = 0.0F;
-        float y_mm = 0.0F;
-        float z_mm = 0.0F;
-        if (!json_get_float(line, "x_mm", &x_mm) ||
-            !json_get_float(line, "y_mm", &y_mm) ||
-            !json_get_float(line, "z_mm", &z_mm)) {
+        double x_mm = 0.0;
+        double y_mm = 0.0;
+        double z_mm = 0.0;
+        double eta_s = 0.0;
+        if (!json_get_double(line, "x_mm", &x_mm) ||
+            !json_get_double(line, "y_mm", &y_mm) ||
+            !json_get_double(line, "z_mm", &z_mm)) {
             return make_error(id_fragment, -32602, "missing xyz");
         }
-        return make_result(id_fragment,
-                           arm_move_to_xyz(x_mm, y_mm, z_mm) ? "{\"ok\":true}" : "{\"ok\":false}");
+        if (!controller.moveToXyz(x_mm, y_mm, z_mm, &eta_s)) {
+            return bool_result(id_fragment, false);
+        }
+        return make_result(id_fragment, std::string("{\"ok\":true,\"eta_s\":") + number_payload(eta_s) + "}");
     }
-    if (std::strcmp(method, "arm.move_pose6d") == 0) {
-        float x_mm = 0.0F;
-        float y_mm = 0.0F;
-        float z_mm = 0.0F;
-        float roll_deg = 0.0F;
-        float pitch_deg = 0.0F;
-        float yaw_deg = 0.0F;
-        if (!json_get_float(line, "x_mm", &x_mm) ||
-            !json_get_float(line, "y_mm", &y_mm) ||
-            !json_get_float(line, "z_mm", &z_mm) ||
-            !json_get_float(line, "roll_deg", &roll_deg) ||
-            !json_get_float(line, "pitch_deg", &pitch_deg) ||
-            !json_get_float(line, "yaw_deg", &yaw_deg)) {
+    if (std::strcmp(method, "arm.move_pose6d") == 0 || std::strcmp(method, "arm.move_xyz_rotation") == 0) {
+        double x_mm = 0.0;
+        double y_mm = 0.0;
+        double z_mm = 0.0;
+        double roll_deg = 0.0;
+        double pitch_deg = 0.0;
+        double yaw_deg = 0.0;
+        double speed_ratio = 1.0;
+        double eta_s = 0.0;
+        char rotation_order[16] = "zyx";
+        if (!json_get_double(line, "x_mm", &x_mm) ||
+            !json_get_double(line, "y_mm", &y_mm) ||
+            !json_get_double(line, "z_mm", &z_mm) ||
+            !json_get_double(line, "roll_deg", &roll_deg) ||
+            !json_get_double(line, "pitch_deg", &pitch_deg) ||
+            !json_get_double(line, "yaw_deg", &yaw_deg)) {
             return make_error(id_fragment, -32602, "missing pose6d");
         }
-        return make_result(
-            id_fragment,
-            arm_move_to_pose6d(x_mm, y_mm, z_mm, roll_deg, pitch_deg, yaw_deg)
-                ? "{\"ok\":true}"
-                : "{\"ok\":false}");
+        (void)json_get_double(line, "speed_ratio", &speed_ratio);
+        (void)json_get_token(line, "rotation_order", rotation_order, sizeof(rotation_order));
+        if (!controller.moveToPose6d(x_mm, y_mm, z_mm, roll_deg, pitch_deg, yaw_deg, rotation_order, speed_ratio, &eta_s)) {
+            return bool_result(id_fragment, false);
+        }
+        return make_result(id_fragment, std::string("{\"ok\":true,\"eta_s\":") + number_payload(eta_s) + "}");
     }
-    if (std::strcmp(method, "arm.move_joint_deg") == 0) {
+    if (std::strcmp(method, "arm.move_linear_xyz_rotation") == 0) {
+        double x_mm = 0.0;
+        double y_mm = 0.0;
+        double z_mm = 0.0;
+        double roll_deg = 0.0;
+        double pitch_deg = 0.0;
+        double yaw_deg = 0.0;
+        double eta_s = 0.0;
+        char rotation_order[16] = "zyx";
+        if (!json_get_double(line, "x_mm", &x_mm) ||
+            !json_get_double(line, "y_mm", &y_mm) ||
+            !json_get_double(line, "z_mm", &z_mm) ||
+            !json_get_double(line, "roll_deg", &roll_deg) ||
+            !json_get_double(line, "pitch_deg", &pitch_deg) ||
+            !json_get_double(line, "yaw_deg", &yaw_deg)) {
+            return make_error(id_fragment, -32602, "missing pose6d");
+        }
+        (void)json_get_token(line, "rotation_order", rotation_order, sizeof(rotation_order));
+        if (!controller.moveLinearPose6d(x_mm, y_mm, z_mm, roll_deg, pitch_deg, yaw_deg, rotation_order, &eta_s)) {
+            return bool_result(id_fragment, false);
+        }
+        return make_result(id_fragment, std::string("{\"ok\":true,\"eta_s\":") + number_payload(eta_s) + "}");
+    }
+    if (std::strcmp(method, "arm.move_joint") == 0 || std::strcmp(method, "arm.move_joint_deg") == 0) {
         int joint_index = 0;
-        float target_deg = 0.0F;
-        if (!json_get_int(line, "joint_index", &joint_index) ||
-            !json_get_float(line, "target_deg", &target_deg)) {
+        double target_deg = 0.0;
+        if ((!json_get_int(line, "joint_index", &joint_index) && !json_get_int(line, "joint", &joint_index)) ||
+            !json_get_double(line, "target_deg", &target_deg)) {
             return make_error(id_fragment, -32602, "missing joint command");
         }
-        return make_result(id_fragment,
-                           arm_move_joint_deg(joint_index, target_deg)
-                               ? "{\"ok\":true}"
-                               : "{\"ok\":false}");
+        return bool_result(id_fragment, controller.moveJointDeg(joint_index, target_deg));
     }
-    if (std::strcmp(method, "arm.move_joints_deg") == 0) {
-        float joints_deg[6];
-        const char *keys[6] = {"j1_deg", "j2_deg", "j3_deg", "j4_deg", "j5_deg", "j6_deg"};
-        for (int i = 0; i < 6; ++i) {
-            if (!json_get_float(line, keys[i], &joints_deg[i])) {
-                return make_error(id_fragment, -32602, "missing joint set");
-            }
+    if (std::strcmp(method, "arm.move_joints") == 0 ||
+        std::strcmp(method, "arm.move_joints_deg") == 0 ||
+        std::strcmp(method, "arm.angle_mode") == 0) {
+        std::array<double, 6> joints_deg{};
+        double speed_ratio = 1.0;
+        double eta_s = 0.0;
+        if (!parse_keyed_joints(line, &joints_deg)) {
+            return make_error(id_fragment, -32602, "missing joint set");
         }
-        return make_result(id_fragment,
-                           arm_move_joints_deg(joints_deg) ? "{\"ok\":true}" : "{\"ok\":false}");
+        (void)json_get_double(line, "speed_ratio", &speed_ratio);
+        if (!controller.moveJointsDeg(joints_deg, speed_ratio, &eta_s)) {
+            return bool_result(id_fragment, false);
+        }
+        return make_result(id_fragment, std::string("{\"ok\":true,\"eta_s\":") + number_payload(eta_s) + "}");
+    }
+    if (std::strcmp(method, "arm.dynamic_move") == 0) {
+        return make_error(id_fragment, -32601, "use legacy protocol for dynamic_move");
+    }
+    if (std::strcmp(method, "arm.get_motor_angles") == 0) {
+        return make_result(id_fragment, array_payload(controller.getMotorAngles()));
+    }
+    if (std::strcmp(method, "arm.get_pose") == 0) {
+        std::array<double, 6> pose{};
+        char rotation_order[16] = "zyx";
+        (void)json_get_token(line, "rotation_order", rotation_order, sizeof(rotation_order));
+        if (!controller.getPose(rotation_order, &pose)) {
+            return bool_result(id_fragment, false);
+        }
+        return make_result(id_fragment, array_payload(pose));
+    }
+    if (std::strcmp(method, "arm.get_transform") == 0 || std::strcmp(method, "arm.get_T") == 0) {
+        std::array<double, 16> transform{};
+        if (!controller.getTransform(&transform)) {
+            return bool_result(id_fragment, false);
+        }
+        return make_result(id_fragment, array16_payload(transform));
+    }
+    if (std::strcmp(method, "gripper.set") == 0) {
+        bool open = false;
+        if (!json_get_bool(line, "open", &open)) {
+            return make_error(id_fragment, -32602, "missing open");
+        }
+        return bool_result(id_fragment, controller.setGripperOpen(open));
+    }
+    if (std::strcmp(method, "arm.servo_gripper") == 0) {
+        int angle_deg = 0;
+        double eta_s = 0.0;
+        if (!json_get_int(line, "angle_deg", &angle_deg)) {
+            return make_error(id_fragment, -32602, "missing angle_deg");
+        }
+        if (!controller.setServoGripper(angle_deg, &eta_s)) {
+            return bool_result(id_fragment, false);
+        }
+        return make_result(id_fragment, std::string("{\"ok\":true,\"eta_s\":") + number_payload(eta_s) + "}");
     }
 
     return make_error(id_fragment, -32601, "method not found");
 }
+
+std::string handle_legacy_request(const std::string &request, bool *skip_default_response) {
+    char action[64] = {};
+    ArmController &controller = ArmController::instance();
+    std::string params;
+
+    if (skip_default_response != nullptr) {
+        *skip_default_response = false;
+    }
+    if (!json_get_token(request.c_str(), "action", action, sizeof(action))) {
+        return "null";
+    }
+    (void)extract_param_slice(request.c_str(), &params);
+
+    if (std::strcmp(action, "emergency_stop") == 0) {
+        double enable = 0.0;
+        (void)std::strtod(params.c_str(), nullptr);
+        json_get_double(request.c_str(), "params", &enable);
+        controller.emergencyStop(std::strstr(params.c_str(), "1") != nullptr);
+        return "0.05";
+    }
+    if (std::strcmp(action, "home_joint") == 0) {
+        int joint_index = static_cast<int>(std::strtol(params.c_str(), nullptr, 10));
+        return controller.homeJoint(joint_index) ? "0.05" : "-1";
+    }
+    if (std::strcmp(action, "angle_mode") == 0) {
+        std::array<double, 6> joints_deg{};
+        double speed_ratio = 1.0;
+        double eta_s = -1.0;
+        if (!parse_legacy_angle_mode_params(params, &joints_deg, &speed_ratio) ||
+            !controller.moveJointsDeg(joints_deg, speed_ratio, &eta_s)) {
+            return "-1";
+        }
+        return number_payload(eta_s);
+    }
+    if (std::strcmp(action, "move_xyz_rotation") == 0) {
+        double x_mm = 0.0;
+        double y_mm = 0.0;
+        double z_mm = 0.0;
+        double roll_deg = 0.0;
+        double pitch_deg = 0.0;
+        double yaw_deg = 0.0;
+        double speed_ratio = 1.0;
+        double eta_s = -1.0;
+        std::string rotation_order = "zyx";
+        if (!parse_legacy_pose_params(params,
+                                      &x_mm,
+                                      &y_mm,
+                                      &z_mm,
+                                      &roll_deg,
+                                      &pitch_deg,
+                                      &yaw_deg,
+                                      &rotation_order,
+                                      &speed_ratio,
+                                      true) ||
+            !controller.moveToPose6d(x_mm, y_mm, z_mm, roll_deg, pitch_deg, yaw_deg, rotation_order, speed_ratio, &eta_s)) {
+            return "-1";
+        }
+        return number_payload(eta_s);
+    }
+    if (std::strcmp(action, "move_linear_xyz_rotation") == 0) {
+        double x_mm = 0.0;
+        double y_mm = 0.0;
+        double z_mm = 0.0;
+        double roll_deg = 0.0;
+        double pitch_deg = 0.0;
+        double yaw_deg = 0.0;
+        double eta_s = -1.0;
+        std::string rotation_order = "zyx";
+        if (!parse_legacy_pose_params(params,
+                                      &x_mm,
+                                      &y_mm,
+                                      &z_mm,
+                                      &roll_deg,
+                                      &pitch_deg,
+                                      &yaw_deg,
+                                      &rotation_order,
+                                      nullptr,
+                                      false) ||
+            !controller.moveLinearPose6d(x_mm, y_mm, z_mm, roll_deg, pitch_deg, yaw_deg, rotation_order, &eta_s)) {
+            return "-1";
+        }
+        if (skip_default_response != nullptr) {
+            *skip_default_response = false;
+        }
+        return number_payload(eta_s);
+    }
+    if (std::strcmp(action, "gripper_on") == 0) {
+        return controller.setGripperOpen(false) ? "0.05" : "null";
+    }
+    if (std::strcmp(action, "gripper_off") == 0) {
+        return controller.setGripperOpen(true) ? "0.05" : "null";
+    }
+    if (std::strcmp(action, "servo_gripper") == 0) {
+        double eta_s = 1.0;
+        int angle_deg = static_cast<int>(std::strtol(params.c_str(), nullptr, 10));
+        return controller.setServoGripper(angle_deg, &eta_s) ? number_payload(eta_s) : "null";
+    }
+    if (std::strcmp(action, "robodk_simu") == 0) {
+        return "0.05";
+    }
+    if (std::strcmp(action, "set_free_mode") == 0) {
+        controller.setFreeMode(std::strstr(params.c_str(), "1") != nullptr);
+        return "0.10";
+    }
+    if (std::strcmp(action, "get_motor_angles") == 0) {
+        return array_payload(controller.getMotorAngles());
+    }
+    if (std::strcmp(action, "get_pose") == 0) {
+        std::array<double, 6> pose{};
+        std::string order = "zyx";
+        char token[16] = {};
+        if (json_get_token(request.c_str(), "params", token, sizeof(token)) && token[0] != '\0') {
+            order = token;
+        } else if (!params.empty() && params[0] == '"') {
+            order.assign(params.c_str() + 1, params.size() >= 2 ? params.size() - 2 : 0);
+        }
+        if (!controller.getPose(order, &pose)) {
+            return "null";
+        }
+        return array_payload(pose);
+    }
+    if (std::strcmp(action, "get_T") == 0) {
+        std::array<double, 16> transform{};
+        if (!controller.getTransform(&transform)) {
+            return "null";
+        }
+        transform[3] *= 1000.0;
+        transform[7] *= 1000.0;
+        transform[11] *= 1000.0;
+        return array16_payload(transform);
+    }
+    if (std::strcmp(action, "dynamic_move") == 0) {
+        std::array<double, 6> joints_deg{};
+        std::array<double, 6> current_pulses{};
+        std::array<double, 6> max_speed{};
+        double eta_s = 0.05;
+        size_t first_open = params.find('[');
+        size_t first_close = params.find(']');
+        if (first_open == std::string::npos || first_close == std::string::npos) {
+            return "-1";
+        }
+        if (!parse_legacy_number_array(params.substr(first_open, first_close - first_open + 1), &joints_deg)) {
+            return "-1";
+        }
+        {
+            size_t second_open = params.find('[', first_close + 1);
+            size_t second_close = params.find(']', second_open);
+            size_t third_open = params.find('[', second_close + 1);
+            size_t third_close = params.find(']', third_open);
+            if (second_open == std::string::npos || second_close == std::string::npos ||
+                third_open == std::string::npos || third_close == std::string::npos) {
+                return "-1";
+            }
+            if (!parse_legacy_number_array(params.substr(second_open, second_close - second_open + 1), &current_pulses) ||
+                !parse_legacy_number_array(params.substr(third_open, third_close - third_open + 1), &max_speed)) {
+                return "-1";
+            }
+        }
+        if (!controller.dynamicMove(joints_deg, current_pulses, max_speed, &eta_s)) {
+            return "-1";
+        }
+        return number_payload(eta_s);
+    }
+
+    return "null";
+}
 }
 
 int run_arm_runtime() {
-    int server_fd;
+    int server_fd = -1;
+    int legacy_fd = -1;
     struct sockaddr_un addr{};
+    struct sockaddr_in legacy_addr{};
     struct pollfd pfds[1 + kMaxClients];
     int client_fds[kMaxClients];
     char bufs[kMaxClients][kBufSize];
     size_t buf_lens[kMaxClients];
     int nclients = 0;
+    int legacy_port = kLegacyPortDefault;
 
     std::signal(SIGPIPE, SIG_IGN);
 
     server_fd = socket(AF_UNIX, SOCK_STREAM, 0);
     if (server_fd < 0) {
-        log_error(kTag, "socket failed: %s", std::strerror(errno));
+        log_error(kTag, "unix socket failed: %s", std::strerror(errno));
         return 1;
     }
 
@@ -234,89 +820,166 @@ int run_arm_runtime() {
         return 1;
     }
     if (listen(server_fd, kMaxClients) < 0) {
-        log_error(kTag, "listen failed: %s", std::strerror(errno));
+        log_error(kTag, "listen unix failed: %s", std::strerror(errno));
         close(server_fd);
         return 1;
+    }
+
+    if (const char *port_text = std::getenv("UAV_PROC_ARM_PORT")) {
+        legacy_port = std::atoi(port_text);
+        if (legacy_port <= 0) {
+            legacy_port = kLegacyPortDefault;
+        }
+    }
+    legacy_fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (legacy_fd >= 0) {
+        int reuse = 1;
+        setsockopt(legacy_fd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
+        std::memset(&legacy_addr, 0, sizeof(legacy_addr));
+        legacy_addr.sin_family = AF_INET;
+        legacy_addr.sin_port = htons(static_cast<uint16_t>(legacy_port));
+        legacy_addr.sin_addr.s_addr = htonl(INADDR_ANY);
+        if (bind(legacy_fd, reinterpret_cast<struct sockaddr *>(&legacy_addr), sizeof(legacy_addr)) < 0 ||
+            listen(legacy_fd, 2) < 0) {
+            log_warn(kTag, "legacy tcp bind/listen %d failed: %s", legacy_port, std::strerror(errno));
+            close(legacy_fd);
+            legacy_fd = -1;
+        } else {
+            log_info(kTag, "legacy tcp listening on 0.0.0.0:%d", legacy_port);
+        }
     }
 
     std::memset(buf_lens, 0, sizeof(buf_lens));
     for (int i = 0; i < kMaxClients; ++i) {
         client_fds[i] = -1;
     }
-    log_info(kTag, "listening on %s", kSockPath);
+    log_info(kTag, "jsonrpc listening on %s", kSockPath);
 
     while (true) {
         pfds[0].fd = server_fd;
         pfds[0].events = POLLIN;
-
         for (int i = 0; i < nclients; ++i) {
             pfds[1 + i].fd = client_fds[i];
             pfds[1 + i].events = POLLIN;
         }
 
-        if (poll(pfds, 1 + nclients, -1) < 0) {
+        if (poll(pfds, 1 + nclients, 100) < 0) {
             if (errno == EINTR) {
                 continue;
             }
+            log_error(kTag, "poll failed: %s", std::strerror(errno));
             break;
         }
 
         if ((pfds[0].revents & POLLIN) != 0) {
             int client_fd = accept(server_fd, nullptr, nullptr);
-            if (client_fd >= 0 && nclients < kMaxClients) {
-                client_fds[nclients] = client_fd;
-                buf_lens[nclients] = 0U;
-                ++nclients;
-            } else if (client_fd >= 0) {
-                close(client_fd);
+            if (client_fd >= 0) {
+                if (nclients >= kMaxClients) {
+                    close(client_fd);
+                } else {
+                    client_fds[nclients] = client_fd;
+                    pfds[1 + nclients].fd = client_fd;
+                    pfds[1 + nclients].events = POLLIN;
+                    buf_lens[nclients] = 0U;
+                    ++nclients;
+                }
+            }
+        }
+
+        if (legacy_fd >= 0) {
+            struct pollfd legacy_pfd{};
+            legacy_pfd.fd = legacy_fd;
+            legacy_pfd.events = POLLIN;
+            if (poll(&legacy_pfd, 1, 0) > 0 && (legacy_pfd.revents & POLLIN) != 0) {
+                int client_fd = accept(legacy_fd, nullptr, nullptr);
+                if (client_fd >= 0) {
+                    std::string request;
+                    while (recv_legacy_message(client_fd, &request)) {
+                        bool skip_default = false;
+                        std::string response = handle_legacy_request(request, &skip_default);
+                        if (!skip_default) {
+                            if (!send_legacy_message(client_fd, response)) {
+                                break;
+                            }
+                        }
+                    }
+                    close(client_fd);
+                }
             }
         }
 
         for (int i = 0; i < nclients;) {
-            const int idx = 1 + i;
-            if ((pfds[idx].revents & (POLLIN | POLLHUP | POLLERR)) == 0) {
+            bool removed = false;
+            if ((pfds[1 + i].revents & (POLLIN | POLLHUP | POLLERR)) != 0) {
+                ssize_t n = recv(client_fds[i],
+                                 bufs[i] + buf_lens[i],
+                                 sizeof(bufs[i]) - buf_lens[i] - 1U,
+                                 0);
+                if (n <= 0) {
+                    close(client_fds[i]);
+                    for (int j = i; j + 1 < nclients; ++j) {
+                        client_fds[j] = client_fds[j + 1];
+                        buf_lens[j] = buf_lens[j + 1];
+                        std::memcpy(bufs[j], bufs[j + 1], sizeof(bufs[j]));
+                    }
+                    --nclients;
+                    removed = true;
+                } else {
+                    buf_lens[i] += static_cast<size_t>(n);
+                    bufs[i][buf_lens[i]] = '\0';
+
+                    while (true) {
+                        char *newline = static_cast<char *>(std::memchr(bufs[i], '\n', buf_lens[i]));
+                        if (newline == nullptr) {
+                            break;
+                        }
+                        size_t line_len = static_cast<size_t>(newline - bufs[i]);
+                        std::string request(bufs[i], line_len);
+                        std::string response = handle_jsonrpc_request(request.c_str());
+                        if (!send_all(client_fds[i], response.data(), response.size())) {
+                            close(client_fds[i]);
+                            for (int j = i; j + 1 < nclients; ++j) {
+                                client_fds[j] = client_fds[j + 1];
+                                buf_lens[j] = buf_lens[j + 1];
+                                std::memcpy(bufs[j], bufs[j + 1], sizeof(bufs[j]));
+                            }
+                            --nclients;
+                            removed = true;
+                            break;
+                        }
+
+                        {
+                            size_t remaining = buf_lens[i] - line_len - 1U;
+                            std::memmove(bufs[i], newline + 1, remaining);
+                            buf_lens[i] = remaining;
+                            bufs[i][buf_lens[i]] = '\0';
+                        }
+                    }
+
+                    if (!removed && buf_lens[i] + 1U >= sizeof(bufs[i])) {
+                        close(client_fds[i]);
+                        for (int j = i; j + 1 < nclients; ++j) {
+                            client_fds[j] = client_fds[j + 1];
+                            buf_lens[j] = buf_lens[j + 1];
+                            std::memcpy(bufs[j], bufs[j + 1], sizeof(bufs[j]));
+                        }
+                        --nclients;
+                        removed = true;
+                    }
+                }
+            }
+            if (!removed) {
                 ++i;
-                continue;
             }
-
-            ssize_t n = read(pfds[idx].fd, bufs[i] + buf_lens[i], kBufSize - buf_lens[i] - 1U);
-            if (n <= 0) {
-                close(pfds[idx].fd);
-                if (i != nclients - 1) {
-                    client_fds[i] = client_fds[nclients - 1];
-                    buf_lens[i] = buf_lens[nclients - 1];
-                    std::memcpy(bufs[i], bufs[nclients - 1], buf_lens[i]);
-                }
-                client_fds[nclients - 1] = -1;
-                --nclients;
-                continue;
-            }
-
-            buf_lens[i] += static_cast<size_t>(n);
-            bufs[i][buf_lens[i]] = '\0';
-
-            char *start = bufs[i];
-            char *newline = nullptr;
-            while ((newline = static_cast<char *>(std::memchr(start, '\n',
-                                                               buf_lens[i] - static_cast<size_t>(start - bufs[i])))) != nullptr) {
-                *newline = '\0';
-                const std::string resp = handle_request(start);
-                ssize_t ignored = write(pfds[idx].fd, resp.c_str(), resp.size());
-                (void)ignored;
-                start = newline + 1;
-            }
-
-            {
-                const size_t consumed = static_cast<size_t>(start - bufs[i]);
-                buf_lens[i] -= consumed;
-                if (consumed > 0U && buf_lens[i] > 0U) {
-                    std::memmove(bufs[i], start, buf_lens[i]);
-                }
-            }
-            ++i;
         }
     }
 
+    for (int i = 0; i < nclients; ++i) {
+        close(client_fds[i]);
+    }
+    if (legacy_fd >= 0) {
+        close(legacy_fd);
+    }
     close(server_fd);
     unlink(kSockPath);
     return 0;

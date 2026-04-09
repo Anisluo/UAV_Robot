@@ -5,7 +5,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#define ZDT_ARM_CAN_MAX_FRAMES 2U
+#define ZDT_ARM_CAN_MAX_FRAMES 3U
 
 typedef struct {
     uint32_t can_id;
@@ -34,6 +34,17 @@ typedef struct {
     ZdtArmResponseType type;
 } ZdtArmResponse;
 
+typedef struct {
+    uint8_t zero_mode;
+    uint8_t zero_direction;
+    uint16_t zero_speed_rpm;
+    uint32_t zero_timeout_ms;
+    uint16_t collision_zero_speed_rpm;
+    uint16_t collision_zero_current_ma;
+    uint16_t collision_zero_time_ms;
+    bool enable_auto_zero;
+} ZdtArmZeroParams;
+
 bool proto_zdt_arm_encode_enable(uint8_t addr,
                                  bool enable,
                                  bool sync,
@@ -60,6 +71,10 @@ bool proto_zdt_arm_encode_trigger_home(uint8_t addr,
                                        uint8_t home_mode,
                                        bool sync,
                                        ZdtArmCanBatch *out_batch);
+bool proto_zdt_arm_encode_write_zero_params(uint8_t addr,
+                                            bool save,
+                                            const ZdtArmZeroParams *params,
+                                            ZdtArmCanBatch *out_batch);
 bool proto_zdt_arm_decode(const uint8_t *payload,
                           size_t len,
                           ZdtArmResponse *out_resp);

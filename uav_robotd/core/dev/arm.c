@@ -32,6 +32,14 @@
 #define ARM_CAN_DEFAULT_IFACE "can4"
 #define ARM_DEFAULT_ACK_TIMEOUT_MS 200
 #define ARM_DEFAULT_REACHED_TIMEOUT_MS 8000
+#define ARM_ZERO_MODE_DEFAULT 0U
+#define ARM_ZERO_DIRECTION_DEFAULT 0U
+#define ARM_ZERO_SPEED_DEFAULT_RPM 30U
+#define ARM_ZERO_TIMEOUT_DEFAULT_MS 10000U
+#define ARM_COLLISION_ZERO_SPEED_DEFAULT_RPM 300U
+#define ARM_COLLISION_ZERO_CURRENT_DEFAULT_MA 800U
+#define ARM_COLLISION_ZERO_TIME_DEFAULT_MS 60U
+#define ARM_AUTO_ZERO_DEFAULT 0U
 
 #define ARM_BASE_OFFSET_MM 55.0
 #define ARM_BASE_HEIGHT_MM 166.0
@@ -53,6 +61,10 @@ typedef struct {
     ArmJointConfig cfg;
     double target_deg;
 } ArmJointTarget;
+
+typedef struct {
+    double target_deg[ARM_JOINT_COUNT];
+} ArmPostHomeTargets;
 
 static int g_arm_can_fd = -1;
 static char g_arm_can_iface[IF_NAMESIZE] = ARM_CAN_DEFAULT_IFACE;
@@ -148,6 +160,46 @@ static int arm_get_home_settle_ms(void) {
         ms = 60000;
     }
     return ms;
+}
+
+static int arm_get_post_home_move_delay_ms(void) {
+    int ms = arm_getenv_int("UAV_ARM_POST_HOME_MOVE_DELAY_MS", 500);
+    if (ms < 0) {
+        ms = 0;
+    }
+    if (ms > 60000) {
+        ms = 60000;
+    }
+    return ms;
+}
+
+static ZdtArmZeroParams arm_get_zero_params(void) {
+    ZdtArmZeroParams params;
+
+    params.zero_mode = (uint8_t)arm_getenv_int("UAV_ARM_ZERO_MODE", ARM_ZERO_MODE_DEFAULT);
+    params.zero_direction = (uint8_t)arm_getenv_int("UAV_ARM_ZERO_DIRECTION", ARM_ZERO_DIRECTION_DEFAULT);
+    params.zero_speed_rpm = (uint16_t)arm_getenv_int("UAV_ARM_ZERO_SPEED_RPM", ARM_ZERO_SPEED_DEFAULT_RPM);
+    params.zero_timeout_ms = (uint32_t)arm_getenv_int("UAV_ARM_ZERO_TIMEOUT_MS", ARM_ZERO_TIMEOUT_DEFAULT_MS);
+    params.collision_zero_speed_rpm = (uint16_t)arm_getenv_int("UAV_ARM_COLLISION_ZERO_SPEED_RPM", ARM_COLLISION_ZERO_SPEED_DEFAULT_RPM);
+    params.collision_zero_current_ma = (uint16_t)arm_getenv_int("UAV_ARM_COLLISION_ZERO_CURRENT_MA", ARM_COLLISION_ZERO_CURRENT_DEFAULT_MA);
+    params.collision_zero_time_ms = (uint16_t)arm_getenv_int("UAV_ARM_COLLISION_ZERO_TIME_MS", ARM_COLLISION_ZERO_TIME_DEFAULT_MS);
+    params.enable_auto_zero = arm_getenv_int("UAV_ARM_ENABLE_AUTO_ZERO", ARM_AUTO_ZERO_DEFAULT) != 0;
+    return params;
+}
+
+static ArmPostHomeTargets arm_get_post_home_targets(void) {
+    static const double k_default_targets[ARM_JOINT_COUNT] = {180.0, 90.0, 83.0, 30.0, 110.0, 30.0};
+    static const char *k_target_env[ARM_JOINT_COUNT] = {
+        "UAV_ARM_J1_POST_HOME_DEG", "UAV_ARM_J2_POST_HOME_DEG", "UAV_ARM_J3_POST_HOME_DEG",
+        "UAV_ARM_J4_POST_HOME_DEG", "UAV_ARM_J5_POST_HOME_DEG", "UAV_ARM_J6_POST_HOME_DEG"
+    };
+    ArmPostHomeTargets targets;
+    size_t i;
+
+    for (i = 0; i < ARM_JOINT_COUNT; ++i) {
+        targets.target_deg[i] = arm_getenv_double(k_target_env[i], k_default_targets[i]);
+    }
+    return targets;
 }
 
 static int arm_can_init(void) {
@@ -412,6 +464,35 @@ static bool arm_enable_joint(uint8_t addr) {
     return arm_wait_ack(addr, 0xF3U);
 }
 
+static bool arm_write_zero_params(uint8_t addr) {
+    const ZdtArmZeroParams params = arm_get_zero_params();
+    const bool save = arm_getenv_int("UAV_ARM_ZERO_SAVE", 1) != 0;
+    ZdtArmCanBatch batch;
+
+    if (!proto_zdt_arm_encode_write_zero_params(addr, save, &params, &batch)) {
+        return false;
+    }
+    if (!arm_send_batch(&batch)) {
+        return false;
+    }
+    if (!arm_wait_ack(addr, 0x4CU)) {
+        return false;
+    }
+
+    log_info("core.dev.arm",
+             "arm zero params addr=%u mode=%u dir=%u zero_speed=%u timeout_ms=%u collision_speed=%u collision_current=%u collision_time=%u save=%d",
+             (unsigned int)addr,
+             (unsigned int)params.zero_mode,
+             (unsigned int)params.zero_direction,
+             (unsigned int)params.zero_speed_rpm,
+             (unsigned int)params.zero_timeout_ms,
+             (unsigned int)params.collision_zero_speed_rpm,
+             (unsigned int)params.collision_zero_current_ma,
+             (unsigned int)params.collision_zero_time_ms,
+             save ? 1 : 0);
+    return true;
+}
+
 static ArmJointConfig arm_joint_config(size_t joint_index) {
     static const double k_default_ratios[ARM_JOINT_COUNT] = {25.0, 20.0, 25.0, 10.0, 4.0, 1.0};
     static const double k_default_min_deg[ARM_JOINT_COUNT] = {-180.0, 0.0, -80.0, -30.0, -110.0, -30.0};
@@ -519,6 +600,21 @@ static bool arm_plan_joint_absolute(ArmJointConfig cfg,
                                    out_batch);
 }
 
+static bool arm_move_single_joint_absolute(ArmJointConfig cfg, double target_deg) {
+    ZdtArmCanBatch batch;
+
+    if (!arm_plan_joint_absolute(cfg, target_deg, false, &batch)) {
+        return false;
+    }
+    if (!arm_send_batch(&batch)) {
+        return false;
+    }
+    if (arm_should_wait_reached() && !arm_wait_position_reached(cfg.addr)) {
+        return false;
+    }
+    return true;
+}
+
 static bool arm_move_joints_deg_impl(const double joints_deg[ARM_JOINT_COUNT]) {
     ArmJointTarget targets[ARM_JOINT_COUNT];
     ZdtArmCanBatch batch;
@@ -563,17 +659,27 @@ static bool arm_move_joints_deg_impl(const double joints_deg[ARM_JOINT_COUNT]) {
 
 static bool arm_home_all_joints(void) {
     ZdtArmCanBatch batch;
+    const ArmPostHomeTargets post_home_targets = arm_get_post_home_targets();
     size_t i;
     const uint8_t home_mode = arm_get_home_mode();
     const int settle_ms = arm_get_home_settle_ms();
+    const int post_home_move_delay_ms = arm_get_post_home_move_delay_ms();
 
     arm_drain_rx();
     for (i = 0; i < ARM_JOINT_COUNT; ++i) {
         const uint8_t addr = (uint8_t)(i + 1U);
+        const ArmJointConfig cfg = arm_joint_config(i);
+        const double target_deg = post_home_targets.target_deg[i];
         if (!arm_enable_joint(addr)) {
             log_warn("core.dev.arm",
                      "arm home joint %u enable ack missed, continue with home trigger",
                      (unsigned int)addr);
+        }
+        if (!arm_write_zero_params(addr)) {
+            log_warn("core.dev.arm",
+                     "arm home joint %u zero params write failed",
+                     (unsigned int)addr);
+            return false;
         }
         if (!proto_zdt_arm_encode_trigger_home(addr,
                                                home_mode,
@@ -591,12 +697,65 @@ static bool arm_home_all_joints(void) {
                  "arm home joint %u/%u triggered",
                  (unsigned int)addr,
                  (unsigned int)ARM_JOINT_COUNT);
-        if (settle_ms > 0 && i + 1U < ARM_JOINT_COUNT) {
+        if (settle_ms > 0) {
             usleep((useconds_t)settle_ms * 1000U);
+        }
+        if (!arm_move_single_joint_absolute(cfg, target_deg)) {
+            log_warn("core.dev.arm",
+                     "arm post-home move joint %u -> %.2fdeg failed",
+                     (unsigned int)addr,
+                     target_deg);
+            return false;
+        }
+        log_info("core.dev.arm",
+                 "arm post-home move joint %u -> %.2fdeg",
+                 (unsigned int)addr,
+                 target_deg);
+        if (post_home_move_delay_ms > 0 && i + 1U < ARM_JOINT_COUNT) {
+            usleep((useconds_t)post_home_move_delay_ms * 1000U);
         }
     }
 
-    log_info("core.dev.arm", "arm home sequence completed, logical zero updated");
+    log_info("core.dev.arm", "arm home sequence completed with post-home safe pose updates");
+    return true;
+}
+
+static bool arm_home_single_joint(int joint_index) {
+    ZdtArmCanBatch batch;
+    const uint8_t home_mode = arm_get_home_mode();
+    const uint8_t addr = (uint8_t)joint_index;
+
+    if (joint_index < 1 || joint_index > (int)ARM_JOINT_COUNT) {
+        log_warn("core.dev.arm", "invalid home joint index=%d", joint_index);
+        return false;
+    }
+
+    arm_drain_rx();
+    if (!arm_enable_joint(addr)) {
+        log_warn("core.dev.arm",
+                 "arm home joint %u enable ack missed, continue with home trigger",
+                 (unsigned int)addr);
+    }
+    if (!arm_write_zero_params(addr)) {
+        log_warn("core.dev.arm",
+                 "arm home joint %u zero params write failed",
+                 (unsigned int)addr);
+        return false;
+    }
+    if (!proto_zdt_arm_encode_trigger_home(addr,
+                                           home_mode,
+                                           false,
+                                           &batch)) {
+        return false;
+    }
+    if (!arm_send_batch(&batch)) {
+        return false;
+    }
+    if (!arm_wait_ack(addr, 0x9AU)) {
+        return false;
+    }
+
+    log_info("core.dev.arm", "arm home single joint %u triggered", (unsigned int)addr);
     return true;
 }
 
@@ -621,6 +780,30 @@ static bool arm_stop_all_joints(void) {
         return false;
     }
     return arm_send_batch(&batch);
+}
+
+static bool arm_stop_single_joint(int joint_index) {
+    ZdtArmCanBatch batch;
+    const uint8_t addr = (uint8_t)joint_index;
+
+    if (joint_index < 1 || joint_index > (int)ARM_JOINT_COUNT) {
+        log_warn("core.dev.arm", "invalid stop joint index=%d", joint_index);
+        return false;
+    }
+
+    arm_drain_rx();
+    if (!proto_zdt_arm_encode_stop(addr, false, &batch)) {
+        return false;
+    }
+    if (!arm_send_batch(&batch)) {
+        return false;
+    }
+    if (!arm_wait_ack(addr, 0xFEU)) {
+        return false;
+    }
+
+    log_info("core.dev.arm", "arm stop single joint %u ok", (unsigned int)addr);
+    return true;
 }
 
 static bool arm_solve_position_ik(double x_mm,
@@ -782,7 +965,6 @@ bool arm_move_to_pose6d(float x_mm,
 bool arm_move_joint_deg(int joint_index, float target_deg) {
     ArmJointConfig cfg;
     ZdtArmCanBatch batch;
-    ZdtArmCanBatch sync_batch;
 
     if (joint_index < 1 || joint_index > (int)ARM_JOINT_COUNT) {
         log_warn("core.dev.arm", "invalid joint index=%d", joint_index);
@@ -791,19 +973,10 @@ bool arm_move_joint_deg(int joint_index, float target_deg) {
 
     arm_drain_rx();
     cfg = arm_joint_config((size_t)(joint_index - 1));
-    if (!arm_plan_joint_absolute(cfg, (double)target_deg, true, &batch)) {
+    if (!arm_plan_joint_absolute(cfg, (double)target_deg, false, &batch)) {
         return false;
     }
     if (!arm_send_batch(&batch)) {
-        return false;
-    }
-    if (!proto_zdt_arm_encode_sync_start(&sync_batch)) {
-        return false;
-    }
-    if (!arm_send_batch(&sync_batch)) {
-        return false;
-    }
-    if (!arm_wait_sync_ack(0U)) {
         return false;
     }
     if (arm_should_wait_reached() && !arm_wait_position_reached(cfg.addr)) {
@@ -832,6 +1005,29 @@ bool arm_move_joints_deg(const float joints_deg[6]) {
 
 bool arm_home(void) {
     return arm_home_all_joints();
+}
+
+bool arm_home_joint(int joint_index) {
+    return arm_home_single_joint(joint_index);
+}
+
+bool arm_set_zero_params(int joint_index) {
+    if (joint_index < 1 || joint_index > (int)ARM_JOINT_COUNT) {
+        log_warn("core.dev.arm", "invalid zero params joint index=%d", joint_index);
+        return false;
+    }
+
+    arm_drain_rx();
+    if (!arm_enable_joint((uint8_t)joint_index)) {
+        log_warn("core.dev.arm",
+                 "arm zero params joint %d enable ack missed, continue with write",
+                 joint_index);
+    }
+    return arm_write_zero_params((uint8_t)joint_index);
+}
+
+bool arm_stop_joint(int joint_index) {
+    return arm_stop_single_joint(joint_index);
 }
 
 bool arm_stop(void) {

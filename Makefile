@@ -1,5 +1,5 @@
 CC ?= gcc
-CFLAGS ?= -std=c11 -Wall -Wextra -Werror -Icommon/include -O2
+CFLAGS ?= -std=c11 -Wall -Wextra -Werror -Icommon/include -Iinclude -O2
 LDFLAGS ?= -lm
 
 BUILD_DIR := build
@@ -36,13 +36,20 @@ ROBOTD_SRCS := \
 	uav_robotd/drv/io/gpio_sysfs.c
 
 CLI_SRCS := tools/uav_cli.c
+ARM_TEST_SRCS := \
+	tools/arm_motor_test.c \
+	uav_robotd/core/log/log.c \
+	uav_robotd/core/proto/proto_zdt_arm.c \
+	uav_robotd/core/dev/relay.c \
+	uav_robotd/core/dev/arm.c
 
 ROBOTD_OBJS := $(patsubst %.c,$(OBJ_DIR)/%.o,$(ROBOTD_SRCS))
 CLI_OBJS := $(patsubst %.c,$(OBJ_DIR)/%.o,$(CLI_SRCS))
+ARM_TEST_OBJS := $(patsubst %.c,$(OBJ_DIR)/%.o,$(ARM_TEST_SRCS))
 
 .PHONY: all clean run install test dirs proc_realsense proc_npu proc_car proc_gripper proc_arm proc_airport
 
-all: dirs $(BIN_DIR)/uav_robotd $(BIN_DIR)/uav_cli proc_realsense proc_npu proc_car proc_gripper proc_arm proc_airport
+all: dirs $(BIN_DIR)/uav_robotd $(BIN_DIR)/uav_cli $(BIN_DIR)/arm_motor_test proc_realsense proc_npu proc_car proc_gripper proc_arm proc_airport
 
 dirs:
 	@mkdir -p $(BIN_DIR) \
@@ -65,6 +72,9 @@ $(BIN_DIR)/uav_robotd: dirs $(ROBOTD_OBJS)
 
 $(BIN_DIR)/uav_cli: dirs $(CLI_OBJS)
 	$(CC) $(CLI_OBJS) -o $@ $(LDFLAGS)
+
+$(BIN_DIR)/arm_motor_test: dirs $(ARM_TEST_OBJS)
+	$(CC) $(ARM_TEST_OBJS) -o $@ $(LDFLAGS)
 
 $(OBJ_DIR)/%.o: %.c
 	@mkdir -p $(dir $@)

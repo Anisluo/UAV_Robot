@@ -8,24 +8,30 @@ REMOTE_USER="ubuntu"
 REMOTE_HOST=""
 REMOTE_PATH=""
 REMOTE_PASSWORD=""
-SERVICES="uav_robotd,proc_realsense,proc_npu,proc_gateway"
+SERVICES="uav_robotd,proc_realsense,proc_npu,proc_gateway,proc_car,proc_gripper,proc_arm,proc_airport"
 
 usage() {
     cat <<'EOF'
 Usage:
-  ./tools/deploy_autostart_remote.sh --host 192.168.1.101 [options]
+  ./tools/deploy_rebuild_remote.sh --host 192.168.10.2 [options]
+
+Behavior:
+  1. Sync current UAV_Robot project to remote host
+  2. Stop old UAV_Robot services and leftover processes
+  3. Rebuild selected services on remote host
+  4. Reinstall systemd units and restart services
 
 Options:
-  --host        Remote host IP or name.
-  --user        Remote user name. Default: ubuntu
-  --password    Remote password. Optional, requires sshpass.
-  --remote-path Remote UAV_Robot path. Default: /home/<user>/UAV_Robot
-  --services    Comma-separated service list.
-  -h, --help    Show this help message.
+  --host        Remote host IP or hostname
+  --user        Remote user. Default: ubuntu
+  --password    Remote password. Optional, requires sshpass
+  --remote-path Remote project path. Default: /home/<user>/UAV_Robot
+  --services    Comma-separated services. Default: all
+  -h, --help    Show this help message
 
 Examples:
-  ./tools/deploy_autostart_remote.sh --host 192.168.1.101 --password ubuntu
-  ./tools/deploy_autostart_remote.sh --host 192.168.1.101 --remote-path /home/ubuntu/UAV_Robot --services uav_robotd,proc_gateway
+  ./tools/deploy_rebuild_remote.sh --host 192.168.10.2 --password ubuntu
+  ./tools/deploy_rebuild_remote.sh --host 192.168.10.2 --password ubuntu --services uav_robotd,proc_gateway,proc_arm
 EOF
 }
 
@@ -74,38 +80,47 @@ if [[ -z "${REMOTE_PATH}" ]]; then
 fi
 
 SSH_BASE=(ssh -o StrictHostKeyChecking=no)
-SCP_BASE=(scp -o StrictHostKeyChecking=no)
 if [[ -n "${REMOTE_PASSWORD}" ]]; then
     if ! command -v sshpass >/dev/null 2>&1; then
         echo "sshpass is required when --password is provided" >&2
         exit 1
     fi
     SSH_BASE=(sshpass -p "${REMOTE_PASSWORD}" ssh -o StrictHostKeyChecking=no)
-    SCP_BASE=(sshpass -p "${REMOTE_PASSWORD}" scp -o StrictHostKeyChecking=no)
 fi
 
 REMOTE="${REMOTE_USER}@${REMOTE_HOST}"
 
-"${SSH_BASE[@]}" "${REMOTE}" "mkdir -p ${REMOTE_PATH@Q}/tools ${REMOTE_PATH@Q}/systemd"
-"${SCP_BASE[@]}" "${PROJECT_ROOT}/tools/install_autostart.sh" "${REMOTE}:${REMOTE_PATH}/tools/install_autostart.sh"
-"${SCP_BASE[@]}" "${PROJECT_ROOT}/tools/service_manager.sh" "${REMOTE}:${REMOTE_PATH}/tools/service_manager.sh"
-"${SCP_BASE[@]}" "${PROJECT_ROOT}/systemd/"*.service "${REMOTE}:${REMOTE_PATH}/systemd/"
-"${SCP_BASE[@]}" "${PROJECT_ROOT}/systemd/uav_robot.env.example" "${REMOTE}:${REMOTE_PATH}/systemd/uav_robot.env.example"
+echo "Preparing remote path ${REMOTE}:${REMOTE_PATH}"
+"${SSH_BASE[@]}" "${REMOTE}" "mkdir -p ${REMOTE_PATH@Q}"
+
+echo "Syncing project files to remote ..."
+tar \
+    --exclude=".git" \
+    --exclude="build" \
+    --exclude="*/build" \
+    --exclude="*.pyc" \
+    --exclude="__pycache__" \
+    -cf - \
+    -C "${PROJECT_ROOT}" . \
+| "${SSH_BASE[@]}" "${REMOTE}" "tar -xf - -C ${REMOTE_PATH@Q}"
 
 REMOTE_CMD=$(cat <<EOF
 set -euo pipefail
 cd ${REMOTE_PATH@Q}
 chmod +x tools/install_autostart.sh
 chmod +x tools/service_manager.sh
+chmod +x tools/redeploy_services.sh
 EOF
 )
 
 if [[ -n "${REMOTE_PASSWORD}" ]]; then
-    REMOTE_CMD+=$'\n'"printf '%s\n' ${REMOTE_PASSWORD@Q} | sudo -S ./tools/install_autostart.sh --services ${SERVICES@Q}"
+    REMOTE_CMD+=$'\n'"printf '%s\n' ${REMOTE_PASSWORD@Q} | sudo -S ./tools/redeploy_services.sh --services ${SERVICES@Q}"
 else
-    REMOTE_CMD+=$'\n'"sudo ./tools/install_autostart.sh --services ${SERVICES@Q}"
+    REMOTE_CMD+=$'\n'"sudo ./tools/redeploy_services.sh --services ${SERVICES@Q}"
 fi
 
+echo "Running remote rebuild and restart ..."
 "${SSH_BASE[@]}" "${REMOTE}" "bash -lc ${REMOTE_CMD@Q}"
 
-echo "Remote autostart deployment completed for ${REMOTE}"
+echo
+echo "Remote deploy completed for ${REMOTE}"
