@@ -24,18 +24,18 @@ ROBOTD_SRCS := \
 	uav_robotd/core/proto/proto_gripper_uart.c \
 	uav_robotd/core/proto/proto_platform_lock.c \
 	uav_robotd/core/proto/proto_mesh_link.c \
-	uav_robotd/core/dev/arm.c \
+	uav_robotd/core/dev/arm_rpc_proxy.c \
 	uav_robotd/core/dev/car.c \
 	uav_robotd/core/dev/platform.c \
 	uav_robotd/core/dev/relay.c \
 	uav_robotd/core/dev/gripper.c \
 	uav_robotd/app/tasks/task_battery_pick.c \
+	uav_robotd/app/tasks/task_arm_demo.c \
 	uav_robotd/drv/dev/can_socketcan.c \
 	uav_robotd/drv/dev/uart_posix.c \
 	uav_robotd/drv/dev/mesh_eth.c \
 	uav_robotd/drv/io/gpio_sysfs.c
 
-CLI_SRCS := tools/uav_cli.c
 ARM_TEST_SRCS := \
 	tools/arm_motor_test.c \
 	uav_robotd/core/log/log.c \
@@ -44,12 +44,11 @@ ARM_TEST_SRCS := \
 	uav_robotd/core/dev/arm.c
 
 ROBOTD_OBJS := $(patsubst %.c,$(OBJ_DIR)/%.o,$(ROBOTD_SRCS))
-CLI_OBJS := $(patsubst %.c,$(OBJ_DIR)/%.o,$(CLI_SRCS))
 ARM_TEST_OBJS := $(patsubst %.c,$(OBJ_DIR)/%.o,$(ARM_TEST_SRCS))
 
-.PHONY: all clean run install test dirs proc_realsense proc_npu proc_car proc_gripper proc_arm proc_airport
+.PHONY: all clean run install test dirs proc_realsense proc_npu proc_gateway proc_car proc_gripper proc_arm proc_airport proc_grasp
 
-all: dirs $(BIN_DIR)/uav_robotd $(BIN_DIR)/uav_cli $(BIN_DIR)/arm_motor_test proc_realsense proc_npu proc_car proc_gripper proc_arm proc_airport
+all: dirs $(BIN_DIR)/uav_robotd $(BIN_DIR)/arm_motor_test proc_realsense proc_npu proc_gateway proc_car proc_gripper proc_arm proc_airport proc_grasp
 
 dirs:
 	@mkdir -p $(BIN_DIR) \
@@ -64,14 +63,10 @@ dirs:
 		$(OBJ_DIR)/uav_robotd/core/proto \
 		$(OBJ_DIR)/uav_robotd/core/dev \
 		$(OBJ_DIR)/uav_robotd/drv/dev \
-		$(OBJ_DIR)/uav_robotd/drv/io \
-		$(OBJ_DIR)/tools
+		$(OBJ_DIR)/uav_robotd/drv/io
 
 $(BIN_DIR)/uav_robotd: dirs $(ROBOTD_OBJS)
 	$(CC) $(ROBOTD_OBJS) -o $@ $(LDFLAGS)
-
-$(BIN_DIR)/uav_cli: dirs $(CLI_OBJS)
-	$(CC) $(CLI_OBJS) -o $@ $(LDFLAGS)
 
 $(BIN_DIR)/arm_motor_test: dirs $(ARM_TEST_OBJS)
 	$(CC) $(ARM_TEST_OBJS) -o $@ $(LDFLAGS)
@@ -86,20 +81,18 @@ run: all
 install: all
 	@mkdir -p /usr/local/bin
 	cp $(BIN_DIR)/uav_robotd /usr/local/bin/uav_robotd
-	cp $(BIN_DIR)/uav_cli /usr/local/bin/uav_cli
 
 test: all
 	$(BIN_DIR)/uav_robotd --self-test
-	$(BIN_DIR)/uav_cli start
-	$(BIN_DIR)/uav_cli estop
-	$(BIN_DIR)/uav_cli reset
-	$(BIN_DIR)/uav_cli shutdown
 
 proc_realsense:
 	$(MAKE) -C proc_realsense
 
 proc_npu:
 	$(MAKE) -C proc_npu
+
+proc_gateway:
+	$(MAKE) -C proc_gateway
 
 proc_car:
 	$(MAKE) -C proc_car
@@ -113,11 +106,16 @@ proc_arm:
 proc_airport:
 	$(MAKE) -C proc_airport
 
+proc_grasp:
+	$(MAKE) -C proc_grasp
+
 clean:
 	rm -rf $(BUILD_DIR)
 	$(MAKE) -C proc_realsense clean
 	$(MAKE) -C proc_npu clean
+	$(MAKE) -C proc_gateway clean
 	$(MAKE) -C proc_car clean
 	$(MAKE) -C proc_gripper clean
 	$(MAKE) -C proc_arm clean
 	$(MAKE) -C proc_airport clean
+	$(MAKE) -C proc_grasp clean

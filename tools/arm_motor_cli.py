@@ -1,13 +1,19 @@
 #!/usr/bin/env python3
+import json
 import os
 import shlex
+import socket
 import subprocess
 import sys
+import time
 
 
 DEFAULT_BIN = os.environ.get("UAV_ARM_TEST_BIN", "./build/bin/arm_motor_test")
 DEFAULT_JOINT = int(os.environ.get("UAV_ARM_JOINT", "1"))
 DEFAULT_HOME_MODE = int(os.environ.get("UAV_ARM_HOME_MODE", "2"))
+DEFAULT_POLL_MS = int(os.environ.get("UAV_ARM_POLL_MS", "250"))
+DEFAULT_TRANSPORT = os.environ.get("UAV_ARM_CLI_TRANSPORT", "proc_arm")
+DEFAULT_PROC_ARM_SOCK = os.environ.get("UAV_PROC_ARM_SOCK", "/tmp/uav_proc_arm.sock")
 
 
 def joint_ratio_env_name(joint):
@@ -35,6 +41,109 @@ def run_cmd(args):
     return result.returncode
 
 
+def run_cmd_with_monitor(args, joint, poll_ms):
+    if DEFAULT_TRANSPORT == "proc_arm":
+        method, params = transport_args_to_proc_arm(args)
+        print("\n$", f"proc_arm.{method}", json.dumps(params, ensure_ascii=True))
+        code = run_proc_arm_call(method, params)
+        print(format_angles_line(read_angles_payload(), joint))
+        return code
+
+    cmd = [DEFAULT_BIN] + args
+    print("\n$", " ".join(shlex.quote(part) for part in cmd))
+    process = subprocess.Popen(cmd)
+    last_line = None
+
+    while True:
+        try:
+            payload = read_angles_payload()
+        except Exception as exc:
+            payload = {"ok": False, "error": str(exc)}
+
+        line = format_angles_line(payload, joint)
+        if line != last_line:
+            print(line)
+            last_line = line
+
+        rc = process.poll()
+        if rc is not None:
+            return rc
+        time.sleep(max(poll_ms, 50) / 1000.0)
+
+
+def read_angles_payload():
+    response = proc_arm_request("arm.get_motor_angles", {})
+    result = response.get("result")
+    if not isinstance(result, list):
+        raise RuntimeError(f"unexpected proc_arm response: {response}")
+    return {"ok": True, "angles": result}
+
+
+def proc_arm_request(method, params):
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        sock.settimeout(5.0)
+        sock.connect(DEFAULT_PROC_ARM_SOCK)
+        payload = {"jsonrpc": "2.0", "id": 1, "method": method, "params": params}
+        sock.sendall((json.dumps(payload, ensure_ascii=True) + "\n").encode("utf-8"))
+        data = b""
+        while b"\n" not in data:
+            chunk = sock.recv(4096)
+            if not chunk:
+                break
+            data += chunk
+        if not data:
+            raise RuntimeError("empty proc_arm response")
+        return json.loads(data.decode("utf-8").splitlines()[0])
+    finally:
+        sock.close()
+
+
+def run_proc_arm_call(method, params):
+    response = proc_arm_request(method, params)
+    if "error" in response:
+        print(f"proc_arm error: {response['error']}")
+        return 2
+    result = response.get("result")
+    if isinstance(result, dict):
+        ok = result.get("ok", False)
+    else:
+        ok = bool(result)
+    return 0 if ok else 2
+
+
+def transport_args_to_proc_arm(args):
+    action = args[0]
+    if action == "home-joint":
+        return "arm.home_joint", {"joint": int(args[1]), "joint_index": int(args[1])}
+    if action == "move-joint":
+        return "arm.move_joint", {
+            "joint": int(args[1]),
+            "joint_index": int(args[1]),
+            "target_deg": float(args[2]),
+        }
+    if action == "stop":
+        return "arm.stop", {}
+    if action == "estop-joint":
+        return "arm.emergency_stop", {"enable": True}
+    if action == "set-zero-params":
+        raise RuntimeError("proc_arm transport does not expose set-zero-params")
+    raise RuntimeError(f"unsupported proc_arm action: {action}")
+
+
+def format_angles_line(payload, joint):
+    if not payload.get("ok"):
+        return f"angles: probe failed: {payload.get('error', 'unknown error')}"
+    angles = payload.get("angles", [])
+    if not isinstance(angles, list) or not angles:
+        return "angles: unavailable"
+    items = []
+    for index, value in enumerate(angles, start=1):
+        marker = "*" if index == joint else " "
+        items.append(f"{marker}J{index}={float(value):7.2f}")
+    return "angles: " + " ".join(items)
+
+
 def print_help():
     print(
         "Commands:\n"
@@ -48,8 +157,14 @@ def print_help():
         "  acc <n>           set move acceleration in env\n"
         "  zero-rpm <n>      set homing zero speed rpm in env\n"
         "  home-detect-rpm <n> set collision detect speed rpm in env\n"
+        "  angles            read motor angles once\n"
+        "  zero-here         set current joint position as software zero\n"
+        "  zero-reset        clear software zero for current joint\n"
+        "  poll-ms <n>       set monitor polling interval in ms\n"
+        "  home-watch        home current joint and poll angles\n"
         "  mode <n>          change home mode\n"
         "  goto <deg>        move active joint to absolute angle\n"
+        "  goto-watch <deg>  move active joint and poll angles\n"
         "  <deg>             same as goto <deg>\n"
         "  help              show this help\n"
         "  quit              exit\n"
@@ -59,13 +174,15 @@ def print_help():
 def main():
     joint = DEFAULT_JOINT
     home_mode = DEFAULT_HOME_MODE
+    poll_ms = DEFAULT_POLL_MS
 
     ensure_single_axis_defaults(joint)
     print("arm_motor_cli")
     print(f"  iface={os.environ.get('UAV_ARM_CAN_IFACE', '(default)')}")
     print(f"  binary={DEFAULT_BIN}")
+    print(f"  transport={DEFAULT_TRANSPORT} proc_arm_sock={DEFAULT_PROC_ARM_SOCK}")
     print(
-        "  joint={} home_mode={} ratio={} rpm={} acc={} zero_rpm={} home_detect_rpm={}".format(
+        "  joint={} home_mode={} ratio={} rpm={} acc={} zero_rpm={} home_detect_rpm={} poll_ms={}".format(
             joint,
             home_mode,
             get_joint_ratio(joint),
@@ -73,6 +190,7 @@ def main():
             get_env_value("UAV_ARM_ACC", "20"),
             get_env_value("UAV_ARM_ZERO_SPEED_RPM", "30"),
             get_env_value("UAV_ARM_COLLISION_ZERO_SPEED_RPM", "300"),
+            poll_ms,
         )
     )
     print_help()
@@ -161,20 +279,62 @@ def main():
             os.environ["UAV_ARM_COLLISION_ZERO_SPEED_RPM"] = parts[1]
             print(f"home_detect_rpm -> {get_env_value('UAV_ARM_COLLISION_ZERO_SPEED_RPM', '300')}")
             continue
+        if cmd == "poll-ms":
+            if len(parts) != 2:
+                print("usage: poll-ms <n>")
+                continue
+            try:
+                poll_ms = max(50, int(parts[1]))
+            except ValueError:
+                print("invalid poll-ms")
+                continue
+            print(f"poll_ms -> {poll_ms}")
+            continue
+        if cmd == "angles":
+            try:
+                print(format_angles_line(read_angles_payload(), joint))
+            except Exception as exc:
+                print(f"angles: probe failed: {exc}")
+            continue
+        if cmd == "zero-here":
+            code = run_proc_arm_call("arm.set_current_zero", {"joint": joint, "joint_index": joint})
+            print(f"exit={code}")
+            continue
+        if cmd == "zero-reset":
+            code = run_proc_arm_call("arm.reset_current_zero", {"joint": joint, "joint_index": joint})
+            print(f"exit={code}")
+            continue
         if cmd == "home":
-            code = run_cmd(["home-joint", str(joint), str(home_mode)])
+            if DEFAULT_TRANSPORT == "proc_arm":
+                code = run_proc_arm_call("arm.home_joint", {"joint": joint, "joint_index": joint})
+            else:
+                code = run_cmd(["home-joint", str(joint), str(home_mode)])
+            print(f"exit={code}")
+            continue
+        if cmd == "home-watch":
+            code = run_cmd_with_monitor(["home-joint", str(joint), str(home_mode)], joint, poll_ms)
             print(f"exit={code}")
             continue
         if cmd == "zero":
-            code = run_cmd(["set-zero-params", str(joint)])
+            if DEFAULT_TRANSPORT == "proc_arm":
+                print("zero is not supported via proc_arm transport")
+                code = 2
+            else:
+                code = run_cmd(["set-zero-params", str(joint)])
             print(f"exit={code}")
             continue
         if cmd == "estop":
-            code = run_cmd(["estop-joint", str(joint)])
+            if DEFAULT_TRANSPORT == "proc_arm":
+                code = run_proc_arm_call("arm.emergency_stop", {"enable": True})
+            else:
+                code = run_cmd(["estop-joint", str(joint)])
             print(f"exit={code}")
             continue
         if cmd == "stop":
-            code = run_cmd(["stop"])
+            if DEFAULT_TRANSPORT == "proc_arm":
+                code = run_proc_arm_call("arm.stop", {})
+            else:
+                code = run_cmd(["stop"])
             print(f"exit={code}")
             continue
         if cmd == "goto":
@@ -182,8 +342,15 @@ def main():
                 print("usage: goto <deg>")
                 continue
             angle_text = parts[1]
+        elif cmd == "goto-watch":
+            if len(parts) != 2:
+                print("usage: goto-watch <deg>")
+                continue
+            angle_text = parts[1]
+            watch_move = True
         else:
             angle_text = raw
+            watch_move = False
 
         try:
             angle = float(angle_text)
@@ -191,7 +358,12 @@ def main():
             print("unknown command, type help")
             continue
 
-        code = run_cmd(["move-joint", str(joint), str(angle)])
+        if cmd == "goto-watch":
+            code = run_cmd_with_monitor(["move-joint", str(joint), str(angle)], joint, poll_ms)
+        elif DEFAULT_TRANSPORT == "proc_arm":
+            code = run_proc_arm_call("arm.move_joint", {"joint": joint, "joint_index": joint, "target_deg": angle})
+        else:
+            code = run_cmd(["move-joint", str(joint), str(angle)])
         print(f"exit={code}")
 
 

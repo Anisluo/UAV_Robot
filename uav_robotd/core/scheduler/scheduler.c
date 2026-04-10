@@ -10,6 +10,7 @@ void scheduler_init(Scheduler *scheduler, EventBus *bus, SystemState *state) {
     device_registry_init(&scheduler->devices);
     app_battery_pick_start(&scheduler->battery_pick_3d, UAV_GRASP_MODE_3D);
     app_battery_pick_start(&scheduler->battery_pick_6d, UAV_GRASP_MODE_6D);
+    app_arm_demo_start(&scheduler->arm_demo);
     state->active_task = TASK_NONE;
 }
 
@@ -25,8 +26,14 @@ static const char *task_name(TaskType task) {
     switch (task) {
         case TASK_BATTERY_PICK:
             return "BATTERY_PICK_3D";
+        case TASK_BATTERY_PICK_3D:
+            return "BATTERY_PICK_3D";
         case TASK_BATTERY_PICK_6D:
             return "BATTERY_PICK_6D";
+        case TASK_ARM_DEMO:
+            return "ARM_DEMO";
+        case TASK_ARM_HOME:
+            return "ARM_HOME";
         case TASK_NONE:
         default:
             return "NONE";
@@ -109,6 +116,23 @@ void scheduler_handle(const Event *ev, EventBus *bus, SystemState *state, Schedu
             state->active_task = TASK_BATTERY_PICK_6D;
             log_info("task", "task start: BATTERY_PICK_6D");
             write_task_status(TASK_BATTERY_PICK_6D, "running", "");
+        } else if (ev->data.task.task == TASK_ARM_DEMO) {
+            app_arm_demo_start(&scheduler->arm_demo);
+            state->active_task = TASK_ARM_DEMO;
+            log_info("task", "task start: ARM_DEMO");
+            write_task_status(TASK_ARM_DEMO, "running", "");
+        } else if (ev->data.task.task == TASK_ARM_HOME) {
+            /* Single-shot: just call arm_home() (proxied to proc_arm) and
+             * mark done. The estop flag is checked by proc_arm itself. */
+            state->active_task = TASK_ARM_HOME;
+            log_info("task", "task start: ARM_HOME");
+            write_task_status(TASK_ARM_HOME, "running", "");
+            if (arm_home()) {
+                publish_task_done(bus, TASK_ARM_HOME);
+            } else {
+                publish_task_fail(bus, TASK_ARM_HOME,
+                                  "arm.home failed (proc_arm offline?)");
+            }
         }
         return;
     }
@@ -132,6 +156,26 @@ void scheduler_handle(const Event *ev, EventBus *bus, SystemState *state, Schedu
         return;
     }
 
+    if (ev->type == EVT_TIMER_TICK && state->active_task == TASK_ARM_DEMO) {
+        /* Honor a hot estop: if the supervisor latched it between ticks
+         * (e.g. user clicked 急停 mid-sweep), bail out cleanly. */
+        if (state->emergency_stop) {
+            publish_task_fail(bus, TASK_ARM_DEMO, "estop during arm_demo");
+            return;
+        }
+        char err[UAV_TEXT_MAX] = {0};
+        if (!app_arm_demo_step(&scheduler->arm_demo, &scheduler->devices,
+                               err, sizeof(err))) {
+            publish_task_fail(bus, TASK_ARM_DEMO,
+                              err[0] ? err : "arm_demo step failed");
+            return;
+        }
+        if (app_arm_demo_done(&scheduler->arm_demo)) {
+            publish_task_done(bus, TASK_ARM_DEMO);
+        }
+        return;
+    }
+
     if (ev->type == EVT_TASK_DONE) {
         log_info("task", "task done: %d", ev->data.task.task);
         write_task_status(ev->data.task.task, "done", "");
@@ -151,7 +195,13 @@ void scheduler_handle(const Event *ev, EventBus *bus, SystemState *state, Schedu
         state->emergency_stop = true;
         write_task_status(state->active_task, "stopped", "emergency stop");
         state->active_task = TASK_NONE;
+        /* dev_emergency_stop_all() handles arm + gripper. The chassis is
+         * NOT linked into proc_arm so we zero it here at the scheduler
+         * level instead of inside the shared relay.c. */
         dev_emergency_stop_all();
+        if (!car_set_velocity(0, 0)) {
+            log_warn("task", "car_set_velocity(0,0) failed during estop (no chassis?)");
+        }
         log_error("task", "all tasks canceled due to emergency stop");
         return;
     }

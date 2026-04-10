@@ -85,6 +85,173 @@ static void drain_npu_results(int fd) {
     }
 }
 
+// ─── proc_arm JSON-RPC forwarding (Unix stream socket) ───────────────────────
+// proc_arm owns the CAN bus for the arm.  All arm commands from the gateway
+// must be forwarded to proc_arm so they share one CAN socket, avoiding
+// ACK-frame races when both processes are bound to the same interface.
+static const char *proc_arm_sock_path() {
+    const char *e = std::getenv("UAV_PROC_ARM_SOCK");
+    return (e && e[0] != '\0') ? e : "/tmp/uav_proc_arm.sock";
+}
+
+// Sends one JSON-RPC request to proc_arm and returns the parsed "ok" field.
+// Returns false on socket error or if result.ok == false.
+static bool proc_arm_call(const char *method, const char *params_json) {
+    static int s_id = 1000;
+    int id = ++s_id;
+
+    int fd = ::socket(AF_UNIX, SOCK_STREAM, 0);
+    if (fd < 0) return false;
+
+    struct timeval tv{};
+    tv.tv_sec  = 30;   // arm homing can take several seconds
+    tv.tv_usec = 0;
+    ::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    ::setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+
+    sockaddr_un addr{};
+    addr.sun_family = AF_UNIX;
+    std::strncpy(addr.sun_path, proc_arm_sock_path(), sizeof(addr.sun_path) - 1);
+
+    if (::connect(fd, reinterpret_cast<sockaddr *>(&addr), sizeof(addr)) < 0) {
+        ::close(fd);
+        return false;
+    }
+
+    char req[512];
+    int req_len = std::snprintf(req, sizeof(req),
+        "{\"jsonrpc\":\"2.0\",\"id\":%d,\"method\":\"%s\",\"params\":%s}\n",
+        id, method, params_json);
+    if (req_len <= 0 || ::write(fd, req, (size_t)req_len) != req_len) {
+        ::close(fd);
+        return false;
+    }
+
+    // Read until newline
+    char buf[1024] = {};
+    int total = 0;
+    while (total < (int)sizeof(buf) - 1) {
+        ssize_t n = ::read(fd, buf + total, sizeof(buf) - 1 - (size_t)total);
+        if (n <= 0) break;
+        total += (int)n;
+        if (std::memchr(buf, '\n', (size_t)total)) break;
+    }
+    ::close(fd);
+    if (total <= 0) return false;
+
+    // Parse "ok" field: look for "ok":true
+    return std::strstr(buf, "\"ok\":true") != nullptr
+        || std::strstr(buf, "\"result\":true") != nullptr;
+}
+
+// Like proc_arm_call but returns the raw "result" value string instead of bool.
+// Returns empty string on failure.
+static std::string proc_arm_call_result(const char *method, const char *params_json) {
+    static int s_id = 2000;
+    int id = ++s_id;
+
+    int fd = ::socket(AF_UNIX, SOCK_STREAM, 0);
+    if (fd < 0) return {};
+
+    struct timeval tv{};
+    tv.tv_sec  = 5;
+    tv.tv_usec = 0;
+    ::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    ::setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+
+    sockaddr_un addr{};
+    addr.sun_family = AF_UNIX;
+    std::strncpy(addr.sun_path, proc_arm_sock_path(), sizeof(addr.sun_path) - 1);
+
+    if (::connect(fd, reinterpret_cast<sockaddr *>(&addr), sizeof(addr)) < 0) {
+        ::close(fd);
+        return {};
+    }
+
+    char req[512];
+    int req_len = std::snprintf(req, sizeof(req),
+        "{\"jsonrpc\":\"2.0\",\"id\":%d,\"method\":\"%s\",\"params\":%s}\n",
+        id, method, params_json);
+    if (req_len <= 0 || ::write(fd, req, (size_t)req_len) != req_len) {
+        ::close(fd);
+        return {};
+    }
+
+    char buf[2048] = {};
+    int total = 0;
+    while (total < (int)sizeof(buf) - 1) {
+        ssize_t n = ::read(fd, buf + total, sizeof(buf) - 1 - (size_t)total);
+        if (n <= 0) break;
+        total += (int)n;
+        if (std::memchr(buf, '\n', (size_t)total)) break;
+    }
+    ::close(fd);
+    if (total <= 0) return {};
+
+    // Extract the value after "result":
+    const char *tag = "\"result\":";
+    const char *pos = std::strstr(buf, tag);
+    if (!pos) return {};
+    return std::string(pos + std::strlen(tag));
+}
+
+// ─── proc_grasp JSON-RPC forwarding (Unix stream socket) ─────────────────────
+// proc_grasp exposes the same JSON-RPC framing as proc_arm / proc_npu at
+// UAV_CTRL_PATH_D. We talk to it the same way we talk to proc_arm: open
+// per-call, write one line, read one line, close.
+static std::string proc_grasp_call_raw(const char *method, const char *params_json) {
+    static int s_id = 7000;
+    int id = ++s_id;
+
+    int fd = ::socket(AF_UNIX, SOCK_STREAM, 0);
+    if (fd < 0) return {};
+
+    struct timeval tv{};
+    tv.tv_sec  = 5;
+    tv.tv_usec = 0;
+    ::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    ::setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+
+    sockaddr_un addr{};
+    addr.sun_family = AF_UNIX;
+    std::strncpy(addr.sun_path, UAV_CTRL_PATH_D, sizeof(addr.sun_path) - 1);
+
+    if (::connect(fd, reinterpret_cast<sockaddr *>(&addr), sizeof(addr)) < 0) {
+        ::close(fd);
+        return {};
+    }
+
+    char req[512];
+    int req_len = std::snprintf(req, sizeof(req),
+        "{\"id\":%d,\"method\":\"%s\",\"params\":%s}\n",
+        id, method, params_json);
+    if (req_len <= 0 || ::write(fd, req, (size_t)req_len) != req_len) {
+        ::close(fd);
+        return {};
+    }
+
+    char buf[2048] = {};
+    int total = 0;
+    while (total < (int)sizeof(buf) - 1) {
+        ssize_t n = ::read(fd, buf + total, sizeof(buf) - 1 - (size_t)total);
+        if (n <= 0) break;
+        total += (int)n;
+        if (std::memchr(buf, '\n', (size_t)total)) break;
+    }
+    ::close(fd);
+    if (total <= 0) return {};
+
+    const char *tag = "\"result\":";
+    const char *pos = std::strstr(buf, tag);
+    if (!pos) return {};
+    return std::string(pos + std::strlen(tag));
+}
+
+static bool proc_grasp_call_ok(const char *method, const char *params_json) {
+    std::string r = proc_grasp_call_raw(method, params_json);
+    return !r.empty() && r.find("\"ok\":true") != std::string::npos;
+}
+
 // ─── Task forwarding (UDP → uav_robotd --listen-port UAV_APP_CMD_PORT) ───────
 static int open_task_udp_socket() {
     int fd = ::socket(AF_INET, SOCK_DGRAM, 0);
@@ -246,193 +413,7 @@ static std::string json_escape(const std::string &input) {
     return out;
 }
 
-static std::string trim_copy(const std::string &input) {
-    size_t start = 0;
-    size_t end = input.size();
-    while (start < end && std::isspace(static_cast<unsigned char>(input[start]))) {
-        ++start;
-    }
-    while (end > start && std::isspace(static_cast<unsigned char>(input[end - 1U]))) {
-        --end;
-    }
-    return input.substr(start, end - start);
-}
-
-static std::string shell_quote(const std::string &input) {
-    std::string out = "'";
-    for (char ch : input) {
-        if (ch == '\'') {
-            out += "'\\''";
-        } else {
-            out.push_back(ch);
-        }
-    }
-    out.push_back('\'');
-    return out;
-}
-
-static bool run_arm_probe_json(const char *action,
-                               std::string &out_json,
-                               std::string &out_error) {
-    const char *script_env = std::getenv("UAV_ARM_ANGLE_PROBE_SCRIPT");
-    const char *sdk_env = std::getenv("UAV_ARM_SDK_SO_PATH");
-    const char *iface_env = std::getenv("UAV_ARM_CAN_IFACE");
-    const std::string script_path = (script_env && script_env[0] != '\0')
-        ? script_env
-        : "/home/ubuntu/UAV_Robot/tools/socketcan_pcanbasic_probe.py";
-    const std::string sdk_so_path = (sdk_env && sdk_env[0] != '\0')
-        ? sdk_env
-        : "/home/ubuntu/arm_sdk_probe/controller_core.cpython-38-aarch64-linux-gnu.so";
-    const std::string iface = (iface_env && iface_env[0] != '\0') ? iface_env : "can4";
-    int usb_id = 1;
-    if (const char *usb_env = std::getenv("UAV_ARM_SDK_USB_ID")) {
-        char *end = nullptr;
-        long parsed = std::strtol(usb_env, &end, 10);
-        if (end != usb_env && end != nullptr && *end == '\0') {
-            usb_id = static_cast<int>(parsed);
-        }
-    }
-    int probe_timeout_sec = 3;
-    if (const char *timeout_env = std::getenv("UAV_ARM_PROBE_TIMEOUT_SEC")) {
-        char *end = nullptr;
-        long parsed = std::strtol(timeout_env, &end, 10);
-        if (end != timeout_env && end != nullptr && *end == '\0' && parsed > 0 && parsed < 60) {
-            probe_timeout_sec = static_cast<int>(parsed);
-        }
-    }
-    const std::string cmd =
-        "timeout " + std::to_string(probe_timeout_sec) + "s python3 " + shell_quote(script_path) +
-        " --json --action " + shell_quote((action && action[0] != '\0') ? action : "angles") +
-        " --iface " + shell_quote(iface) +
-        " --sdk-so " + shell_quote(sdk_so_path) +
-        " --usb-id " + std::to_string(usb_id);
-    FILE *pipe = popen(cmd.c_str(), "r");
-    std::string output;
-    char buffer[256];
-
-    if (pipe == nullptr) {
-        out_error = "popen failed";
-        return false;
-    }
-    while (std::fgets(buffer, sizeof(buffer), pipe) != nullptr) {
-        output += buffer;
-    }
-    int status = pclose(pipe);
-
-    output = trim_copy(output);
-    if (status != 0 && output.empty()) {
-        out_error = "arm probe timeout or failure";
-        return false;
-    }
-    if (output.empty()) {
-        out_error = "empty probe output";
-        return false;
-    }
-    size_t json_pos = output.rfind('{');
-    if (json_pos == std::string::npos) {
-        out_error = output;
-        return false;
-    }
-    out_json = trim_copy(output.substr(json_pos));
-    return true;
-}
-
-static bool read_arm_angles_json(std::string &out_json, std::string &out_error) {
-    return run_arm_probe_json("angles", out_json, out_error);
-}
-
-static bool run_arm_home_json(std::string &out_json, std::string &out_error) {
-    return run_arm_probe_json("home", out_json, out_error);
-}
-
-static bool start_arm_home_background(std::string &out_error) {
-    const char *script_env = std::getenv("UAV_ARM_ANGLE_PROBE_SCRIPT");
-    const char *sdk_env = std::getenv("UAV_ARM_SDK_SO_PATH");
-    const char *iface_env = std::getenv("UAV_ARM_CAN_IFACE");
-    const std::string script_path = (script_env && script_env[0] != '\0')
-        ? script_env
-        : "/home/ubuntu/UAV_Robot/tools/socketcan_pcanbasic_probe.py";
-    const std::string sdk_so_path = (sdk_env && sdk_env[0] != '\0')
-        ? sdk_env
-        : "/home/ubuntu/arm_sdk_probe/controller_core.cpython-38-aarch64-linux-gnu.so";
-    const std::string iface = (iface_env && iface_env[0] != '\0') ? iface_env : "can4";
-    int usb_id = 1;
-    if (const char *usb_env = std::getenv("UAV_ARM_SDK_USB_ID")) {
-        char *end = nullptr;
-        long parsed = std::strtol(usb_env, &end, 10);
-        if (end != usb_env && end != nullptr && *end == '\0') {
-            usb_id = static_cast<int>(parsed);
-        }
-    }
-    int home_timeout_sec = 120;
-    if (const char *timeout_env = std::getenv("UAV_ARM_HOME_TIMEOUT_SEC")) {
-        char *end = nullptr;
-        long parsed = std::strtol(timeout_env, &end, 10);
-        if (end != timeout_env && end != nullptr && *end == '\0' && parsed > 0 && parsed < 3600) {
-            home_timeout_sec = static_cast<int>(parsed);
-        }
-    }
-
-    const std::string cmd =
-        "nohup timeout " + std::to_string(home_timeout_sec) + "s python3 " + shell_quote(script_path) +
-        " --json --action home" +
-        " --iface " + shell_quote(iface) +
-        " --sdk-so " + shell_quote(sdk_so_path) +
-        " --usb-id " + std::to_string(usb_id) +
-        " >/tmp/uav_arm_home.log 2>&1 </dev/null &";
-    int rc = std::system(cmd.c_str());
-    if (rc != 0) {
-        out_error = "failed to start arm home background task";
-        return false;
-    }
-    return true;
-}
-
-static bool get_cached_arm_angles_json(std::string &out_json, std::string &out_error) {
-    static std::mutex cache_mu;
-    static std::string cached_json =
-        "{\"ok\":true,\"initialized\":false,\"action\":\"angles\",\"angles\":[0.0,0.0,0.0,0.0,0.0,0.0]}";
-    static uint64_t cached_at_ms = 0;
-    static std::atomic<bool> refresh_in_flight{false};
-    int cache_ms = 1500;
-    if (const char *cache_env = std::getenv("UAV_ARM_PROBE_CACHE_MS")) {
-        char *end = nullptr;
-        long parsed = std::strtol(cache_env, &end, 10);
-        if (end != cache_env && end != nullptr && *end == '\0' && parsed >= 0 && parsed < 60000) {
-            cache_ms = static_cast<int>(parsed);
-        }
-    }
-
-    const uint64_t now = now_ms();
-    {
-        std::lock_guard<std::mutex> lk(cache_mu);
-        if (!cached_json.empty() && (now - cached_at_ms) < static_cast<uint64_t>(cache_ms)) {
-            out_json = cached_json;
-            return true;
-        }
-    }
-
-    bool expected = false;
-    if (refresh_in_flight.compare_exchange_strong(expected, true)) {
-        std::thread([&cache_mu, &cached_json, &cached_at_ms, &refresh_in_flight]() {
-            std::string fresh_json;
-            std::string fresh_error;
-            bool ok = read_arm_angles_json(fresh_json, fresh_error);
-            if (ok && !fresh_json.empty()) {
-                std::lock_guard<std::mutex> lk(cache_mu);
-                cached_json = fresh_json;
-                cached_at_ms = now_ms();
-            }
-            refresh_in_flight.store(false);
-        }).detach();
-    }
-
-    {
-        std::lock_guard<std::mutex> lk(cache_mu);
-        out_json = cached_json;
-        return true;
-    }
-}
+// (External Python probe script path removed — angles are read from proc_arm directly)
 
 static std::string read_text_file(const std::string &path) {
     std::ifstream ifs(path);
@@ -1481,14 +1462,16 @@ static void handle_rpc(int fd, const std::string &line,
     } else if (method == "task.start") {
         std::string task_name = json_str(s, "task");
         const char *cmd_str = "START_BATTERY_PICK";
-        if (task_name == "arm_home")       cmd_str = "RESET";
+        if (task_name == "arm_demo")             cmd_str = "START_ARM_DEMO";
+        else if (task_name == "arm_home")        cmd_str = "START_ARM_HOME";
+        else if (task_name == "battery_pick")    cmd_str = "START_BATTERY_PICK";
         else if (task_name == "battery_pick_3d") cmd_str = "START_BATTERY_PICK_3D";
         else if (task_name == "battery_pick_6d") cmd_str = "START_BATTERY_PICK_6D";
-        else if (task_name == "platform_lock") cmd_str = "START_BATTERY_PICK";
+        else if (task_name == "platform_lock")   cmd_str = "START_BATTERY_PICK";
         send_task_cmd(task_udp_fd, cmd_str);
         snprintf(resp, sizeof(resp),
-                 "{\"id\":%d,\"result\":{\"ok\":true,\"task\":\"%s\"}}\n",
-                 id, task_name.c_str());
+                 "{\"id\":%d,\"result\":{\"ok\":true,\"task\":\"%s\",\"cmd\":\"%s\"}}\n",
+                 id, task_name.c_str(), cmd_str);
 
     } else if (method == "task.stop") {
         send_task_cmd(task_udp_fd, "ESTOP");
@@ -1502,6 +1485,16 @@ static void handle_rpc(int fd, const std::string &line,
 
     } else if (method == "task.get_status") {
         std::string status = read_text_file(task_status_path());
+        /* scheduler.c writes the status JSON with a trailing newline. If we
+         * splice that straight into the JSON-RPC frame, the embedded \n
+         * shows up before the outer closing '}' and the HostGUI line-based
+         * parser splits one response into two malformed pieces. Strip any
+         * trailing whitespace before embedding. */
+        while (!status.empty() &&
+               (status.back() == '\n' || status.back() == '\r' ||
+                status.back() == ' '  || status.back() == '\t')) {
+            status.pop_back();
+        }
         if (status.empty()) {
             status = "{\"active\":false,\"task\":\"NONE\",\"status\":\"idle\",\"reason\":\"\"}";
         }
@@ -1513,12 +1506,77 @@ static void handle_rpc(int fd, const std::string &line,
         int max_lines = json_int(s, "max_lines", 100);
         if (max_lines < 1) max_lines = 1;
         if (max_lines > 500) max_lines = 500;
-        const std::string path = task_log_path();
-        const std::string logs = tail_lines_text(read_text_file(path), max_lines);
-        const std::string escaped = json_escape(logs);
-        snprintf(resp, sizeof(resp),
-                 "{\"id\":%d,\"result\":{\"path\":\"%s\",\"logs\":\"%s\"}}\n",
-                 id, path.c_str(), escaped.c_str());
+
+        /* Optional `source` selects which service log to fetch. Default
+         * "robotd" reads /tmp/uav_robotd.log (the file uav_robotd writes
+         * directly). Other sources are systemd units whose stdout/stderr
+         * goes to journald — we shell out to journalctl. proc_gateway runs
+         * as root so it has full journal access. */
+        std::string source = json_str(s, "source");
+        if (source.empty()) source = "robotd";
+
+        std::string source_label = source;
+        std::string logs;
+
+        if (source == "robotd" || source == "uav_robotd") {
+            const std::string path = task_log_path();
+            logs = tail_lines_text(read_text_file(path), max_lines);
+            source_label = path;
+        } else {
+            /* Map friendly source name → systemd unit. Reject anything we
+             * don't recognise so we can't be tricked into running arbitrary
+             * journalctl filters. */
+            const char *unit = nullptr;
+            if      (source == "proc_arm")        unit = "uav-proc-arm.service";
+            else if (source == "proc_gateway")    unit = "uav-proc-gateway.service";
+            else if (source == "proc_npu")        unit = "uav-proc-npu.service";
+            else if (source == "proc_realsense")  unit = "uav-proc-realsense.service";
+            else if (source == "proc_car")        unit = "uav-proc-car.service";
+            else if (source == "proc_gripper")    unit = "uav-proc-gripper.service";
+            else if (source == "proc_airport")    unit = "uav-proc-airport.service";
+            else if (source == "proc_grasp")      unit = "uav-proc-grasp.service";
+
+            if (unit == nullptr) {
+                logs = "[unknown log source: " + source + "]";
+                source_label = source;
+            } else {
+                char cmd[256];
+                snprintf(cmd, sizeof(cmd),
+                         "journalctl -u %s -n %d --no-pager -o short 2>&1",
+                         unit, max_lines);
+                FILE *fp = popen(cmd, "r");
+                if (fp == nullptr) {
+                    logs = "[popen failed: ";
+                    logs += strerror(errno);
+                    logs += "]";
+                } else {
+                    char buf[4096];
+                    while (fgets(buf, sizeof(buf), fp) != nullptr) {
+                        logs.append(buf);
+                    }
+                    pclose(fp);
+                }
+                source_label = unit;
+            }
+        }
+
+        const std::string escaped       = json_escape(logs);
+        const std::string escaped_label = json_escape(source_label);
+
+        /* Logs can easily exceed the 8 KB resp[] buffer, so build the
+         * frame in a std::string and write it directly, then return so we
+         * don't fall through to the bottom write_all that uses resp[]. */
+        std::string frame = "{\"id\":";
+        frame += std::to_string(id);
+        frame += ",\"result\":{\"source\":\"";
+        frame += escaped_label;
+        frame += "\",\"logs\":\"";
+        frame += escaped;
+        frame += "\"}}\n";
+        fprintf(stderr, "proc_gateway: RPC fd=%d resp: system.get_logs source=%s bytes=%zu\n",
+                fd, source.c_str(), frame.size());
+        write_all(fd, frame.data(), frame.size());
+        return;
 
     } else if (method == "video.set_enabled") {
         bool enabled = json_bool(s, "enabled", true);
@@ -1543,80 +1601,136 @@ static void handle_rpc(int fd, const std::string &line,
                  id, enabled ? "true" : "false", clients);
 
     } else if (method == "arm.home") {
-        std::string probe_error;
-        bool ok = start_arm_home_background(probe_error);
-        if (ok) {
-            snprintf(resp, sizeof(resp),
-                     "{\"id\":%d,\"result\":{\"ok\":true,\"started\":true}}\n",
-                     id);
-        } else {
-            const std::string escaped = json_escape(probe_error);
-            snprintf(resp, sizeof(resp),
-                     "{\"id\":%d,\"result\":{\"ok\":false,\"error\":\"%s\"}}\n",
-                     id,
-                     escaped.c_str());
-        }
-
-    } else if (method == "arm.stop") {
-        bool ok = arm_stop();
+        // Forward to proc_arm which owns the CAN bus
+        bool ok = proc_arm_call("arm.home", "{}");
         snprintf(resp, sizeof(resp),
                  "{\"id\":%d,\"result\":{\"ok\":%s}}\n",
                  id, ok ? "true" : "false");
 
+    } else if (method == "arm.stop") {
+        // Forward to proc_arm which owns the CAN bus. proc_arm's estop
+        // watchdog will see this on the unix-socket fd and abort any
+        // currently-running blocking move on the proc_arm side.
+        bool ok = proc_arm_call("arm.stop", "{}");
+        snprintf(resp, sizeof(resp),
+                 "{\"id\":%d,\"result\":{\"ok\":%s}}\n",
+                 id, ok ? "true" : "false");
+
+    } else if (method == "arm.emergency_stop") {
+        // Forward to proc_arm which owns the CAN bus.
+        bool enable = json_bool(s, "enable", true);
+        char params_json[32];
+        std::snprintf(params_json, sizeof(params_json),
+                      "{\"enable\":%s}", enable ? "true" : "false");
+        bool ok = proc_arm_call("arm.emergency_stop", params_json);
+        snprintf(resp, sizeof(resp),
+                 "{\"id\":%d,\"result\":{\"ok\":%s}}\n",
+                 id, ok ? "true" : "false");
+
+    } else if (method == "arm.set_speeds") {
+        // Forward to proc_arm which owns the runtime RPM overrides.
+        int move_rpm = json_int(s, "move_rpm", 0);
+        int zero_rpm = json_int(s, "zero_rpm", 0);
+        char params_json[64];
+        std::snprintf(params_json, sizeof(params_json),
+                      "{\"move_rpm\":%d,\"zero_rpm\":%d}", move_rpm, zero_rpm);
+        bool ok = proc_arm_call("arm.set_speeds", params_json);
+        snprintf(resp, sizeof(resp),
+                 "{\"id\":%d,\"result\":{\"ok\":%s,\"move_rpm\":%d,\"zero_rpm\":%d}}\n",
+                 id, ok ? "true" : "false", move_rpm, zero_rpm);
+
     } else if (method == "arm.move_pose") {
+        // Forward to proc_arm.
         std::string pose = json_str(s, "pose");
-        bool ok = !pose.empty() && arm_move(pose.c_str());
+        char params_json[128];
+        std::snprintf(params_json, sizeof(params_json),
+                      "{\"pose\":\"%s\"}", pose.c_str());
+        bool ok = !pose.empty() && proc_arm_call("arm.move_pose", params_json);
         snprintf(resp, sizeof(resp),
                  "{\"id\":%d,\"result\":{\"ok\":%s,\"pose\":\"%s\"}}\n",
                  id, ok ? "true" : "false", pose.c_str());
 
     } else if (method == "arm.move_xyz") {
+        // Forward to proc_arm.
         double x_mm = json_double(s, "x_mm", 0.0);
         double y_mm = json_double(s, "y_mm", 0.0);
         double z_mm = json_double(s, "z_mm", 0.0);
-        bool ok = arm_move_to_xyz((float)x_mm, (float)y_mm, (float)z_mm);
+        char params_json[160];
+        std::snprintf(params_json, sizeof(params_json),
+                      "{\"x_mm\":%.4f,\"y_mm\":%.4f,\"z_mm\":%.4f}",
+                      x_mm, y_mm, z_mm);
+        bool ok = proc_arm_call("arm.move_xyz", params_json);
         snprintf(resp, sizeof(resp),
                  "{\"id\":%d,\"result\":{\"ok\":%s,\"x_mm\":%.1f,\"y_mm\":%.1f,\"z_mm\":%.1f}}\n",
                  id, ok ? "true" : "false", x_mm, y_mm, z_mm);
 
+    } else if (method == "arm.home_joint") {
+        int joint = json_int(s, "joint", -1);
+        if (joint < 0) joint = json_int(s, "joint_index", -1);
+        char params_json[64];
+        std::snprintf(params_json, sizeof(params_json),
+                      "{\"joint\":%d,\"joint_index\":%d}", joint, joint);
+        bool ok = (joint >= 1 && joint <= 6) &&
+                  proc_arm_call("arm.home_joint", params_json);
+        snprintf(resp, sizeof(resp),
+                 "{\"id\":%d,\"result\":{\"ok\":%s,\"joint\":%d}}\n",
+                 id, ok ? "true" : "false", joint);
+
     } else if (method == "arm.move_joint") {
         int joint = json_int(s, "joint", -1);
         double target_deg = json_double(s, "target_deg", 0.0);
-        bool ok = arm_move_joint_deg(joint, (float)target_deg);
+        char params_json[128];
+        std::snprintf(params_json, sizeof(params_json),
+                      "{\"joint\":%d,\"joint_index\":%d,\"target_deg\":%.4f}",
+                      joint, joint, target_deg);
+        bool ok = (joint >= 1 && joint <= 6) &&
+                  proc_arm_call("arm.move_joint", params_json);
         snprintf(resp, sizeof(resp),
                  "{\"id\":%d,\"result\":{\"ok\":%s,\"joint\":%d,\"target_deg\":%.1f}}\n",
                  id, ok ? "true" : "false", joint, target_deg);
 
     } else if (method == "arm.move_joints") {
-        float joints_deg[6] = {
-            (float)json_double(s, "j1_deg", 0.0),
-            (float)json_double(s, "j2_deg", 0.0),
-            (float)json_double(s, "j3_deg", 0.0),
-            (float)json_double(s, "j4_deg", 0.0),
-            (float)json_double(s, "j5_deg", 0.0),
-            (float)json_double(s, "j6_deg", 0.0)
+        // Forward to proc_arm. The remote API expects an "arm.set_joints"
+        // method or a 6-element array; use the per-joint format that proc_arm
+        // already handles via arm.move_joints / arm.set_joints.
+        double j[6] = {
+            json_double(s, "j1_deg", 0.0),
+            json_double(s, "j2_deg", 0.0),
+            json_double(s, "j3_deg", 0.0),
+            json_double(s, "j4_deg", 0.0),
+            json_double(s, "j5_deg", 0.0),
+            json_double(s, "j6_deg", 0.0)
         };
-        bool ok = arm_move_joints_deg(joints_deg);
+        char params_json[256];
+        std::snprintf(params_json, sizeof(params_json),
+                      "{\"j1_deg\":%.4f,\"j2_deg\":%.4f,\"j3_deg\":%.4f,"
+                      "\"j4_deg\":%.4f,\"j5_deg\":%.4f,\"j6_deg\":%.4f}",
+                      j[0], j[1], j[2], j[3], j[4], j[5]);
+        bool ok = proc_arm_call("arm.move_joints", params_json);
         snprintf(resp, sizeof(resp),
                  "{\"id\":%d,\"result\":{\"ok\":%s,"
                  "\"joints_deg\":[%.1f,%.1f,%.1f,%.1f,%.1f,%.1f]}}\n",
                  id, ok ? "true" : "false",
-                 (double)joints_deg[0], (double)joints_deg[1], (double)joints_deg[2],
-                 (double)joints_deg[3], (double)joints_deg[4], (double)joints_deg[5]);
+                 j[0], j[1], j[2], j[3], j[4], j[5]);
 
     } else if (method == "arm.get_angles") {
-        std::string angles_json;
-        std::string angles_error;
-        bool ok = get_cached_arm_angles_json(angles_json, angles_error);
-        if (ok && !angles_json.empty()) {
+        // Forward to proc_arm which tracks signed current_joints_deg_ correctly.
+        // arm.get_motor_angles returns a JSON array directly as the result value.
+        std::string result_str = proc_arm_call_result("arm.get_motor_angles", "{}");
+        // result_str is like "[1.0,-25.0,0.0,0.0,0.0,0.0]\n" or empty on failure.
+        if (!result_str.empty() && result_str[0] == '[') {
+            // Truncate at the closing ']' of the array — everything after it
+            // (the JSON-RPC envelope's closing '}' and newline) must be stripped.
+            size_t last_bracket = result_str.rfind(']');
+            if (last_bracket != std::string::npos)
+                result_str = result_str.substr(0, last_bracket + 1);
             snprintf(resp, sizeof(resp),
-                     "{\"id\":%d,\"result\":%s}\n",
-                     id, angles_json.c_str());
+                     "{\"id\":%d,\"result\":{\"ok\":true,\"angles\":%s}}\n",
+                     id, result_str.c_str());
         } else {
-            const std::string escaped = json_escape(angles_error.empty() ? "arm.get_angles failed" : angles_error);
             snprintf(resp, sizeof(resp),
-                     "{\"id\":%d,\"result\":{\"ok\":false,\"error\":\"%s\"}}\n",
-                     id, escaped.c_str());
+                     "{\"id\":%d,\"result\":{\"ok\":false,\"error\":\"proc_arm unavailable\"}}\n",
+                     id);
         }
 
     } else if (method == "ugv.set_velocity") {
@@ -1698,6 +1812,51 @@ static void handle_rpc(int fd, const std::string &line,
         snprintf(resp, sizeof(resp),
                  "{\"id\":%d,\"result\":{\"ok\":%s,\"open\":%s}}\n",
                  id, ok ? "true" : "false", open ? "true" : "false");
+
+    // ── proc_grasp forwarding ────────────────────────────────────────────
+    } else if (method == "grasp.start" || method == "grasp.stop" ||
+               method == "grasp.run_once" || method == "grasp.set_mode" ||
+               method == "grasp.set_hand_eye") {
+        /* Extract balanced {...} for "params" so we can forward them
+         * verbatim to proc_grasp. */
+        std::string params_slice = "{}";
+        const char *pp = strstr(s, "\"params\":");
+        if (pp != nullptr) {
+            pp += strlen("\"params\":");
+            while (*pp == ' ' || *pp == '\t') ++pp;
+            if (*pp == '{') {
+                int depth = 0;
+                const char *start = pp;
+                for (; *pp != '\0'; ++pp) {
+                    if (*pp == '{') ++depth;
+                    else if (*pp == '}') {
+                        --depth;
+                        if (depth == 0) { ++pp; break; }
+                    }
+                }
+                params_slice.assign(start, (size_t)(pp - start));
+            }
+        }
+        bool ok = proc_grasp_call_ok(method.c_str(), params_slice.c_str());
+        snprintf(resp, sizeof(resp),
+                 "{\"id\":%d,\"result\":{\"ok\":%s}}\n",
+                 id, ok ? "true" : "false");
+
+    } else if (method == "grasp.get_status") {
+        std::string status = proc_grasp_call_raw("grasp.get_status", "{}");
+        /* status is "{...}}\n" — we need just the inner body. strip the
+         * outer "}}\n" that belongs to the proc_grasp frame envelope. */
+        while (!status.empty() && (status.back() == '\n' || status.back() == '\r')) {
+            status.pop_back();
+        }
+        if (status.size() >= 1 && status.back() == '}') {
+            status.pop_back();  // drop envelope close-brace
+        }
+        if (status.empty()) {
+            status = "{\"state\":\"unavailable\"}";
+        }
+        snprintf(resp, sizeof(resp),
+                 "{\"id\":%d,\"result\":%s}\n", id, status.c_str());
 
     } else {
         // Stub for arm/ugv/airport/gripper – acknowledge without hardware action

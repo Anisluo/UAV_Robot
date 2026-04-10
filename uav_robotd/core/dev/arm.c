@@ -3,6 +3,7 @@
 #include "dev.h"
 
 #include <errno.h>
+#include <fcntl.h>
 #include <math.h>
 #include <linux/can.h>
 #include <linux/can/raw.h>
@@ -27,19 +28,37 @@
 #define ARM_JOINT_COUNT 6U
 #define ARM_DEFAULT_RPM 300U
 #define ARM_DEFAULT_ACC 20U
+/* home_mode byte in 0x9A trigger-home command (ZDT step motor protocol):
+ *   0 = single-side limit-switch homing
+ *   1 = double-side limit-switch homing
+ *   2 = collision / stall-detection homing
+ *   3 = closed-loop position homing
+ * Must MATCH ARM_ZERO_MODE_DEFAULT below; otherwise the motor rejects 0x9A
+ * with status 0xE2 because the requested mode contradicts what 0x4C set up. */
 #define ARM_HOME_MODE_DEFAULT 2U
 #define ARM_MOTOR_PULSES_PER_REV 3200.0
 #define ARM_CAN_DEFAULT_IFACE "can4"
 #define ARM_DEFAULT_ACK_TIMEOUT_MS 200
 #define ARM_DEFAULT_REACHED_TIMEOUT_MS 8000
-#define ARM_ZERO_MODE_DEFAULT 0U
-#define ARM_ZERO_DIRECTION_DEFAULT 0U
+/* zero_mode byte in 0x4C write-zero-params command:
+ *   0 = disabled  1 = end-stop switch  2 = stall / collision detection
+ * Set to 2 so the motor drives until it physically stalls, not to position 0. */
+#define ARM_ZERO_MODE_DEFAULT 2U
+/* zero_direction byte in 0x4C write-zero-params command:
+ *   0 = forward (CW)  - same direction as positive move targets
+ *   1 = reverse (CCW) - opposite direction to positive move targets
+ * Default reverse so homing drives the joint AWAY from typical workspace
+ * positions and into a hard stop. Override per-joint via UAV_ARM_J<n>_ZERO_DIR
+ * or globally via UAV_ARM_ZERO_DIRECTION. */
+#define ARM_ZERO_DIRECTION_DEFAULT 1U
 #define ARM_ZERO_SPEED_DEFAULT_RPM 30U
 #define ARM_ZERO_TIMEOUT_DEFAULT_MS 10000U
 #define ARM_COLLISION_ZERO_SPEED_DEFAULT_RPM 300U
 #define ARM_COLLISION_ZERO_CURRENT_DEFAULT_MA 800U
 #define ARM_COLLISION_ZERO_TIME_DEFAULT_MS 60U
-#define ARM_AUTO_ZERO_DEFAULT 0U
+/* enable_auto_zero: 1 = motor automatically sets zero point after stall detection.
+ * Required so the stall position becomes the new absolute origin for later moves. */
+#define ARM_AUTO_ZERO_DEFAULT 1U
 
 #define ARM_BASE_OFFSET_MM 55.0
 #define ARM_BASE_HEIGHT_MM 166.0
@@ -68,6 +87,70 @@ typedef struct {
 
 static int g_arm_can_fd = -1;
 static char g_arm_can_iface[IF_NAMESIZE] = ARM_CAN_DEFAULT_IFACE;
+
+/* Runtime speed overrides set via arm_set_move_rpm / arm_set_zero_rpm.
+ * A value of 0 means "no override - fall back to env var / compiled default".
+ * The HostGUI ArmWidget pushes new values into these via the
+ * arm.set_speeds RPC whenever the user edits the speed fields. */
+static int g_arm_move_rpm_override = 0;
+static int g_arm_zero_rpm_override = 0;
+
+/* Emergency-stop signaling. The atomic flag can be set from any thread (e.g.
+ * proc_arm's watchdog) to interrupt blocking arm_wait_response calls. The
+ * self-pipe lets poll() in arm_receive_response_once wake up immediately on
+ * estop, instead of waiting for its full timeout.
+ *
+ * We use GCC __atomic_* builtins (instead of <stdatomic.h>) so this file
+ * compiles cleanly under both C (uav_robotd) and C++ (proc_arm). */
+static volatile int g_arm_estop_flag = 0;
+static int g_arm_estop_pipe[2] = {-1, -1};
+
+static int arm_estop_init_pipe(void) {
+    int flags;
+    if (g_arm_estop_pipe[0] >= 0) {
+        return 0;
+    }
+    if (pipe(g_arm_estop_pipe) < 0) {
+        log_error("core.dev.arm", "estop pipe create failed: %s", strerror(errno));
+        g_arm_estop_pipe[0] = g_arm_estop_pipe[1] = -1;
+        return -1;
+    }
+    flags = fcntl(g_arm_estop_pipe[0], F_GETFL, 0);
+    if (flags >= 0) {
+        (void)fcntl(g_arm_estop_pipe[0], F_SETFL, flags | O_NONBLOCK);
+    }
+    flags = fcntl(g_arm_estop_pipe[1], F_GETFL, 0);
+    if (flags >= 0) {
+        (void)fcntl(g_arm_estop_pipe[1], F_SETFL, flags | O_NONBLOCK);
+    }
+    return 0;
+}
+
+void arm_request_estop(void) {
+    __atomic_store_n(&g_arm_estop_flag, 1, __ATOMIC_RELEASE);
+    if (g_arm_estop_pipe[1] < 0) {
+        (void)arm_estop_init_pipe();
+    }
+    if (g_arm_estop_pipe[1] >= 0) {
+        char b = 'S';
+        ssize_t r = write(g_arm_estop_pipe[1], &b, 1);
+        (void)r;
+    }
+    log_warn("core.dev.arm", "arm_request_estop: estop flag set");
+}
+
+void arm_clear_estop(void) {
+    __atomic_store_n(&g_arm_estop_flag, 0, __ATOMIC_RELEASE);
+    if (g_arm_estop_pipe[0] >= 0) {
+        char buf[64];
+        while (read(g_arm_estop_pipe[0], buf, sizeof(buf)) > 0) {
+        }
+    }
+}
+
+bool arm_estop_requested(void) {
+    return __atomic_load_n(&g_arm_estop_flag, __ATOMIC_ACQUIRE) != 0;
+}
 
 static int arm_round_to_int(double value) {
     if (value >= 0.0) {
@@ -119,7 +202,12 @@ static double arm_deg_clamp(double value, double min_deg, double max_deg) {
 }
 
 static uint16_t arm_get_command_rpm(void) {
-    int rpm = arm_getenv_int("UAV_ARM_RPM", ARM_DEFAULT_RPM);
+    int rpm;
+    if (g_arm_move_rpm_override > 0) {
+        rpm = g_arm_move_rpm_override;
+    } else {
+        rpm = arm_getenv_int("UAV_ARM_RPM", ARM_DEFAULT_RPM);
+    }
     if (rpm < 1) {
         rpm = 1;
     }
@@ -127,6 +215,30 @@ static uint16_t arm_get_command_rpm(void) {
         rpm = 3000;
     }
     return (uint16_t)rpm;
+}
+
+void arm_set_move_rpm(int rpm) {
+    g_arm_move_rpm_override = (rpm > 0) ? rpm : 0;
+    log_info("core.dev.arm", "arm_set_move_rpm -> %d", g_arm_move_rpm_override);
+}
+
+void arm_set_zero_rpm(int rpm) {
+    g_arm_zero_rpm_override = (rpm > 0) ? rpm : 0;
+    log_info("core.dev.arm", "arm_set_zero_rpm -> %d", g_arm_zero_rpm_override);
+}
+
+int arm_get_move_rpm(void) {
+    if (g_arm_move_rpm_override > 0) {
+        return g_arm_move_rpm_override;
+    }
+    return arm_getenv_int("UAV_ARM_RPM", ARM_DEFAULT_RPM);
+}
+
+int arm_get_zero_rpm(void) {
+    if (g_arm_zero_rpm_override > 0) {
+        return g_arm_zero_rpm_override;
+    }
+    return arm_getenv_int("UAV_ARM_ZERO_SPEED_RPM", ARM_ZERO_SPEED_DEFAULT_RPM);
 }
 
 static uint8_t arm_get_command_acc(void) {
@@ -173,12 +285,39 @@ static int arm_get_post_home_move_delay_ms(void) {
     return ms;
 }
 
-static ZdtArmZeroParams arm_get_zero_params(void) {
+/* Look up the zero (homing) direction for a specific joint.
+ *
+ * Resolution order (first one set wins):
+ *   1. UAV_ARM_J<n>_ZERO_DIR  - per-joint override (n = 1..6)
+ *   2. UAV_ARM_ZERO_DIRECTION - global override
+ *   3. ARM_ZERO_DIRECTION_DEFAULT - compiled-in default
+ *
+ * Accepted values: 0 = forward (CW), 1 = reverse (CCW). */
+static uint8_t arm_get_zero_direction_for_joint(uint8_t addr) {
+    if (addr >= 1U && addr <= ARM_JOINT_COUNT) {
+        char env_name[32];
+        snprintf(env_name, sizeof(env_name), "UAV_ARM_J%u_ZERO_DIR", (unsigned)addr);
+        const char *per_joint = getenv(env_name);
+        if (per_joint != NULL && per_joint[0] != '\0') {
+            return (uint8_t)arm_getenv_int(env_name, ARM_ZERO_DIRECTION_DEFAULT);
+        }
+    }
+    return (uint8_t)arm_getenv_int("UAV_ARM_ZERO_DIRECTION",
+                                   ARM_ZERO_DIRECTION_DEFAULT);
+}
+
+static ZdtArmZeroParams arm_get_zero_params_for_joint(uint8_t addr) {
     ZdtArmZeroParams params;
 
     params.zero_mode = (uint8_t)arm_getenv_int("UAV_ARM_ZERO_MODE", ARM_ZERO_MODE_DEFAULT);
-    params.zero_direction = (uint8_t)arm_getenv_int("UAV_ARM_ZERO_DIRECTION", ARM_ZERO_DIRECTION_DEFAULT);
-    params.zero_speed_rpm = (uint16_t)arm_getenv_int("UAV_ARM_ZERO_SPEED_RPM", ARM_ZERO_SPEED_DEFAULT_RPM);
+    params.zero_direction = arm_get_zero_direction_for_joint(addr);
+    /* Honor a runtime override (set via arm_set_zero_rpm) before falling
+     * back to the env var or compiled default. */
+    if (g_arm_zero_rpm_override > 0) {
+        params.zero_speed_rpm = (uint16_t)g_arm_zero_rpm_override;
+    } else {
+        params.zero_speed_rpm = (uint16_t)arm_getenv_int("UAV_ARM_ZERO_SPEED_RPM", ARM_ZERO_SPEED_DEFAULT_RPM);
+    }
     params.zero_timeout_ms = (uint32_t)arm_getenv_int("UAV_ARM_ZERO_TIMEOUT_MS", ARM_ZERO_TIMEOUT_DEFAULT_MS);
     params.collision_zero_speed_rpm = (uint16_t)arm_getenv_int("UAV_ARM_COLLISION_ZERO_SPEED_RPM", ARM_COLLISION_ZERO_SPEED_DEFAULT_RPM);
     params.collision_zero_current_ma = (uint16_t)arm_getenv_int("UAV_ARM_COLLISION_ZERO_CURRENT_MA", ARM_COLLISION_ZERO_CURRENT_DEFAULT_MA);
@@ -186,6 +325,7 @@ static ZdtArmZeroParams arm_get_zero_params(void) {
     params.enable_auto_zero = arm_getenv_int("UAV_ARM_ENABLE_AUTO_ZERO", ARM_AUTO_ZERO_DEFAULT) != 0;
     return params;
 }
+
 
 static ArmPostHomeTargets arm_get_post_home_targets(void) {
     static const double k_default_targets[ARM_JOINT_COUNT] = {180.0, 90.0, 83.0, 30.0, 110.0, 30.0};
@@ -304,11 +444,13 @@ static void arm_drain_rx(void) {
 static bool arm_receive_response_once(uint8_t *out_addr,
                                       ZdtArmResponse *out_resp,
                                       int timeout_ms) {
-    struct pollfd pfd;
+    struct pollfd pfd[2];
     struct can_frame frame;
     ssize_t nread;
     ZdtArmResponse resp;
     uint8_t addr = 0U;
+    int nfds = 1;
+    int prc;
 
     if (out_addr == NULL || out_resp == NULL) {
         return false;
@@ -317,13 +459,33 @@ static bool arm_receive_response_once(uint8_t *out_addr,
         return false;
     }
 
-    memset(&pfd, 0, sizeof(pfd));
-    pfd.fd = g_arm_can_fd;
-    pfd.events = POLLIN;
-    if (poll(&pfd, 1, timeout_ms) <= 0) {
+    /* Fast-path: if estop already requested, do not enter another wait. */
+    if (__atomic_load_n(&g_arm_estop_flag, __ATOMIC_ACQUIRE)) {
         return false;
     }
-    if ((pfd.revents & POLLIN) == 0) {
+
+    (void)arm_estop_init_pipe();
+
+    memset(pfd, 0, sizeof(pfd));
+    pfd[0].fd = g_arm_can_fd;
+    pfd[0].events = POLLIN;
+    if (g_arm_estop_pipe[0] >= 0) {
+        pfd[1].fd = g_arm_estop_pipe[0];
+        pfd[1].events = POLLIN;
+        nfds = 2;
+    }
+
+    prc = poll(pfd, (nfds_t)nfds, timeout_ms);
+    if (prc <= 0) {
+        return false;
+    }
+    if (nfds == 2 && (pfd[1].revents & POLLIN) != 0) {
+        /* Estop pipe signaled - abort immediately. The flag check on the
+         * next call will keep returning false until arm_clear_estop. */
+        log_warn("core.dev.arm", "arm wait aborted by estop signal");
+        return false;
+    }
+    if ((pfd[0].revents & POLLIN) == 0) {
         return false;
     }
 
@@ -438,6 +600,14 @@ static bool arm_should_wait_reached(void) {
     return arm_getenv_int("UAV_ARM_WAIT_REACHED", 0) != 0;
 }
 
+static bool arm_require_enable_ack(void) {
+    return arm_getenv_int("UAV_ARM_REQUIRE_ENABLE_ACK", 0) != 0;
+}
+
+static bool arm_require_zero_params_ack(void) {
+    return arm_getenv_int("UAV_ARM_REQUIRE_ZERO_PARAMS_ACK", 0) != 0;
+}
+
 static bool arm_send_batch(const ZdtArmCanBatch *batch) {
     size_t i;
 
@@ -465,7 +635,7 @@ static bool arm_enable_joint(uint8_t addr) {
 }
 
 static bool arm_write_zero_params(uint8_t addr) {
-    const ZdtArmZeroParams params = arm_get_zero_params();
+    const ZdtArmZeroParams params = arm_get_zero_params_for_joint(addr);
     const bool save = arm_getenv_int("UAV_ARM_ZERO_SAVE", 1) != 0;
     ZdtArmCanBatch batch;
 
@@ -476,7 +646,16 @@ static bool arm_write_zero_params(uint8_t addr) {
         return false;
     }
     if (!arm_wait_ack(addr, 0x4CU)) {
-        return false;
+        if (arm_require_zero_params_ack()) {
+            log_warn("core.dev.arm",
+                     "arm zero params addr=%u ack missed, abort by policy",
+                     (unsigned int)addr);
+            return false;
+        }
+        log_warn("core.dev.arm",
+                 "arm zero params addr=%u ack missed, continue with existing/latched params",
+                 (unsigned int)addr);
+        return true;
     }
 
     log_info("core.dev.arm",
@@ -555,7 +734,15 @@ static bool arm_plan_joint_position(uint8_t addr,
     }
 
     if (!arm_enable_joint(addr)) {
-        return false;
+        if (arm_require_enable_ack()) {
+            log_warn("core.dev.arm",
+                     "arm move joint %u enable ack missed, abort by policy",
+                     (unsigned int)addr);
+            return false;
+        }
+        log_warn("core.dev.arm",
+                 "arm move joint %u enable ack missed, continue with position command",
+                 (unsigned int)addr);
     }
 
     signed_pulses = arm_round_to_int(target_deg * pulses_per_degree * (double)dir_sign) +
@@ -755,6 +942,14 @@ static bool arm_home_single_joint(int joint_index) {
         return false;
     }
 
+    /* Wait for the motor to complete stall-detection homing before returning.
+     * Without this delay the caller immediately sends a move-to-safe command
+     * while the motor is still travelling to the hard-stop. */
+    const int settle_ms = arm_get_home_settle_ms();
+    if (settle_ms > 0) {
+        usleep((useconds_t)settle_ms * 1000U);
+    }
+
     log_info("core.dev.arm", "arm home single joint %u triggered", (unsigned int)addr);
     return true;
 }
@@ -762,24 +957,64 @@ static bool arm_home_single_joint(int joint_index) {
 static bool arm_stop_all_joints(void) {
     ZdtArmCanBatch batch;
     size_t i;
+    bool any_responded = false;
 
     arm_drain_rx();
+    /* Use sync=false so each motor stops IMMEDIATELY upon receiving the
+     * frame. The previous sync=true version queued the stop in the motor
+     * and required a sync_start broadcast to trigger it; that left the
+     * motor in a queued/synced state from which subsequent home (0x9A)
+     * commands are rejected with 0xE2. Direct stops avoid that pitfall. */
     for (i = 0; i < ARM_JOINT_COUNT; ++i) {
-        if (!proto_zdt_arm_encode_stop((uint8_t)(i + 1U), true, &batch)) {
-            return false;
+        const uint8_t addr = (uint8_t)(i + 1U);
+        if (!proto_zdt_arm_encode_stop(addr, false, &batch)) {
+            continue;
         }
         if (!arm_send_batch(&batch)) {
-            return false;
+            continue;
         }
-        if (!arm_wait_ack((uint8_t)(i + 1U), 0xFEU)) {
-            return false;
+        /* Probe whether ANY response came back. The ZDT motor may answer
+         * with status=OK (it just stopped) OR status=REJECTED (it was
+         * already idle/stopped). Both cases mean the motor is on the bus
+         * and now in a stopped state - treat both as success. Only a true
+         * timeout (no frame at all) means the motor is not connected. */
+        ZdtArmResponse resp;
+        uint8_t resp_addr = 0U;
+        bool got_response = false;
+        const int ack_timeout_ms =
+            arm_getenv_int("UAV_ARM_ACK_TIMEOUT_MS", ARM_DEFAULT_ACK_TIMEOUT_MS);
+        while (arm_receive_response_once(&resp_addr, &resp, ack_timeout_ms)) {
+            if (resp_addr != 0U && resp_addr != addr) {
+                continue;
+            }
+            if (resp.cmd != 0xFEU) {
+                continue;
+            }
+            got_response = true;
+            break;
+        }
+        if (!got_response) {
+            log_warn("core.dev.arm",
+                     "joint %u stop no response (not connected?)",
+                     (unsigned)addr);
+            continue;
+        }
+        any_responded = true;
+        if (resp.type == ZDT_ARM_RESP_ACK_REJECTED) {
+            log_info("core.dev.arm",
+                     "joint %u stop rejected status=0x%02X (already idle)",
+                     (unsigned)addr, (unsigned)resp.status);
+        } else {
+            log_info("core.dev.arm", "joint %u stopped", (unsigned)addr);
         }
     }
 
-    if (!proto_zdt_arm_encode_sync_start(&batch)) {
+    if (!any_responded) {
+        log_error("core.dev.arm", "emergency stop: no joints responded");
         return false;
     }
-    return arm_send_batch(&batch);
+
+    return true;
 }
 
 static bool arm_stop_single_joint(int joint_index) {
@@ -1031,5 +1266,9 @@ bool arm_stop_joint(int joint_index) {
 }
 
 bool arm_stop(void) {
+    /* Clear the estop pipe/flag so the stop frames below can wait for ack
+     * normally. The flag was likely set by the watchdog that triggered us. */
+    arm_clear_estop();
+    log_warn("core.dev.arm", "arm_stop: executing emergency stop on all joints");
     return arm_stop_all_joints();
 }

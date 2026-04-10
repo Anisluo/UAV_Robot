@@ -1,13 +1,18 @@
 #include "arm_runtime.h"
 
 #include <array>
+#include <atomic>
 #include <cerrno>
 #include <csignal>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <mutex>
 #include <poll.h>
 #include <string>
+#include <thread>
+#include <unordered_set>
+#include <vector>
 
 #include <arpa/inet.h>
 #include <netinet/in.h>
@@ -18,8 +23,90 @@
 #include "arm_controller.h"
 
 extern "C" {
+#include "dev.h"
 #include "log.h"
 }
+
+namespace {
+/* Global registry of currently-active client fds (legacy TCP + unix JSON-RPC).
+ * The estop watchdog thread iterates over this set, peeks at each fd's
+ * receive buffer with MSG_PEEK, and signals an emergency stop the moment it
+ * sees any stop request - even though the main thread is busy executing a
+ * blocking move command and cannot drain the buffer itself. */
+std::mutex g_client_fds_mutex;
+std::unordered_set<int> g_client_fds;
+std::atomic<bool> g_estop_watchdog_running{false};
+std::thread g_estop_watchdog_thread;
+
+void register_client_fd(int fd) {
+    std::lock_guard<std::mutex> lock(g_client_fds_mutex);
+    g_client_fds.insert(fd);
+}
+
+void unregister_client_fd(int fd) {
+    std::lock_guard<std::mutex> lock(g_client_fds_mutex);
+    g_client_fds.erase(fd);
+}
+
+bool buffer_contains_stop(const char *buf, size_t len) {
+    /* Search for any of the known stop tokens. We accept both legacy
+     * action-style ("action":"emergency_stop") and JSON-RPC method names
+     * ("arm.stop" / "arm.emergency_stop"). */
+    static const char *kTokens[] = {
+        "emergency_stop",
+        "arm.stop",
+        "arm.emergency_stop",
+    };
+    for (size_t i = 0; i < sizeof(kTokens) / sizeof(kTokens[0]); ++i) {
+        const char *needle = kTokens[i];
+        size_t nlen = std::strlen(needle);
+        if (nlen > len) {
+            continue;
+        }
+        for (size_t j = 0; j + nlen <= len; ++j) {
+            if (std::memcmp(buf + j, needle, nlen) == 0) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+void estop_watchdog_loop() {
+    log_info("proc_arm.estop", "watchdog started");
+    char peek_buf[2048];
+    while (g_estop_watchdog_running.load()) {
+        std::vector<int> snapshot;
+        {
+            std::lock_guard<std::mutex> lock(g_client_fds_mutex);
+            snapshot.assign(g_client_fds.begin(), g_client_fds.end());
+        }
+        for (int fd : snapshot) {
+            ssize_t n = recv(fd, peek_buf, sizeof(peek_buf), MSG_PEEK | MSG_DONTWAIT);
+            if (n > 0) {
+                if (buffer_contains_stop(peek_buf, static_cast<size_t>(n))) {
+                    if (!arm_estop_requested()) {
+                        log_warn("proc_arm.estop",
+                                 "stop token detected on fd=%d, signaling estop",
+                                 fd);
+                        arm_request_estop();
+                    }
+                }
+            }
+        }
+        usleep(20000);  /* 20 ms poll interval */
+    }
+    log_info("proc_arm.estop", "watchdog stopped");
+}
+
+void start_estop_watchdog() {
+    if (g_estop_watchdog_running.exchange(true)) {
+        return;
+    }
+    g_estop_watchdog_thread = std::thread(estop_watchdog_loop);
+}
+
+}  // namespace
 
 namespace {
 constexpr const char *kTag = "proc_arm";
@@ -485,6 +572,30 @@ std::string handle_jsonrpc_request(const char *line) {
         }
         return bool_result(id_fragment, controller.setFreeMode(enable));
     }
+    if (std::strcmp(method, "arm.set_speeds") == 0) {
+        int move_rpm = 0;
+        int zero_rpm = 0;
+        const bool has_move = json_get_int(line, "move_rpm", &move_rpm);
+        const bool has_zero = json_get_int(line, "zero_rpm", &zero_rpm);
+        if (has_move) {
+            arm_set_move_rpm(move_rpm);
+        }
+        if (has_zero) {
+            arm_set_zero_rpm(zero_rpm);
+        }
+        char payload[128];
+        std::snprintf(payload, sizeof(payload),
+                      "{\"ok\":true,\"move_rpm\":%d,\"zero_rpm\":%d}",
+                      arm_get_move_rpm(), arm_get_zero_rpm());
+        return make_result(id_fragment, payload);
+    }
+    if (std::strcmp(method, "arm.get_speeds") == 0) {
+        char payload[128];
+        std::snprintf(payload, sizeof(payload),
+                      "{\"ok\":true,\"move_rpm\":%d,\"zero_rpm\":%d}",
+                      arm_get_move_rpm(), arm_get_zero_rpm());
+        return make_result(id_fragment, payload);
+    }
     if (std::strcmp(method, "arm.move_pose") == 0) {
         char pose[64] = {};
         if (!json_get_token(line, "pose", pose, sizeof(pose))) {
@@ -584,6 +695,22 @@ std::string handle_jsonrpc_request(const char *line) {
     }
     if (std::strcmp(method, "arm.get_motor_angles") == 0) {
         return make_result(id_fragment, array_payload(controller.getMotorAngles()));
+    }
+    if (std::strcmp(method, "arm.set_current_zero") == 0) {
+        int joint_index = 0;
+        if (!json_get_int(line, "joint_index", &joint_index) &&
+            !json_get_int(line, "joint", &joint_index)) {
+            return make_error(id_fragment, -32602, "missing joint_index");
+        }
+        return bool_result(id_fragment, controller.setCurrentZero(joint_index));
+    }
+    if (std::strcmp(method, "arm.reset_current_zero") == 0) {
+        int joint_index = 0;
+        if (!json_get_int(line, "joint_index", &joint_index) &&
+            !json_get_int(line, "joint", &joint_index)) {
+            return make_error(id_fragment, -32602, "missing joint_index");
+        }
+        return bool_result(id_fragment, controller.resetCurrentZero(joint_index));
     }
     if (std::strcmp(method, "arm.get_pose") == 0) {
         std::array<double, 6> pose{};
@@ -730,6 +857,14 @@ std::string handle_legacy_request(const std::string &request, bool *skip_default
     if (std::strcmp(action, "get_motor_angles") == 0) {
         return array_payload(controller.getMotorAngles());
     }
+    if (std::strcmp(action, "set_current_zero") == 0) {
+        int joint_index = static_cast<int>(std::strtol(params.c_str(), nullptr, 10));
+        return controller.setCurrentZero(joint_index) ? "0.05" : "-1";
+    }
+    if (std::strcmp(action, "reset_current_zero") == 0) {
+        int joint_index = static_cast<int>(std::strtol(params.c_str(), nullptr, 10));
+        return controller.resetCurrentZero(joint_index) ? "0.05" : "-1";
+    }
     if (std::strcmp(action, "get_pose") == 0) {
         std::array<double, 6> pose{};
         std::string order = "zyx";
@@ -855,6 +990,8 @@ int run_arm_runtime() {
     }
     log_info(kTag, "jsonrpc listening on %s", kSockPath);
 
+    start_estop_watchdog();
+
     while (true) {
         pfds[0].fd = server_fd;
         pfds[0].events = POLLIN;
@@ -882,6 +1019,7 @@ int run_arm_runtime() {
                     pfds[1 + nclients].events = POLLIN;
                     buf_lens[nclients] = 0U;
                     ++nclients;
+                    register_client_fd(client_fd);
                 }
             }
         }
@@ -893,6 +1031,7 @@ int run_arm_runtime() {
             if (poll(&legacy_pfd, 1, 0) > 0 && (legacy_pfd.revents & POLLIN) != 0) {
                 int client_fd = accept(legacy_fd, nullptr, nullptr);
                 if (client_fd >= 0) {
+                    register_client_fd(client_fd);
                     std::string request;
                     while (recv_legacy_message(client_fd, &request)) {
                         bool skip_default = false;
@@ -903,6 +1042,7 @@ int run_arm_runtime() {
                             }
                         }
                     }
+                    unregister_client_fd(client_fd);
                     close(client_fd);
                 }
             }
@@ -916,6 +1056,7 @@ int run_arm_runtime() {
                                  sizeof(bufs[i]) - buf_lens[i] - 1U,
                                  0);
                 if (n <= 0) {
+                    unregister_client_fd(client_fds[i]);
                     close(client_fds[i]);
                     for (int j = i; j + 1 < nclients; ++j) {
                         client_fds[j] = client_fds[j + 1];
@@ -937,6 +1078,7 @@ int run_arm_runtime() {
                         std::string request(bufs[i], line_len);
                         std::string response = handle_jsonrpc_request(request.c_str());
                         if (!send_all(client_fds[i], response.data(), response.size())) {
+                            unregister_client_fd(client_fds[i]);
                             close(client_fds[i]);
                             for (int j = i; j + 1 < nclients; ++j) {
                                 client_fds[j] = client_fds[j + 1];
@@ -957,6 +1099,7 @@ int run_arm_runtime() {
                     }
 
                     if (!removed && buf_lens[i] + 1U >= sizeof(bufs[i])) {
+                        unregister_client_fd(client_fds[i]);
                         close(client_fds[i]);
                         for (int j = i; j + 1 < nclients; ++j) {
                             client_fds[j] = client_fds[j + 1];
@@ -975,6 +1118,7 @@ int run_arm_runtime() {
     }
 
     for (int i = 0; i < nclients; ++i) {
+        unregister_client_fd(client_fds[i]);
         close(client_fds[i]);
     }
     if (legacy_fd >= 0) {

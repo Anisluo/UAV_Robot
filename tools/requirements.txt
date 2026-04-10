@@ -1,3 +1,4 @@
-opencv-python
-pyzmq
-numpy
+paramiko          # required by deploy.py
+opencv-python     # used by diagnostic scripts
+pyzmq             # used by diagnostic scripts
+numpy             # used by diagnostic scripts

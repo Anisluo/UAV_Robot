@@ -19,6 +19,11 @@ extern "C" {
 /* ── proc_npu 控制通道（JSON-RPC, SOCK_STREAM） ────────────────────── */
 #define UAV_CTRL_PATH_C "/tmp/uav_proc_npu.ctrl.sock"
 
+/* ── proc_grasp 控制通道（JSON-RPC, SOCK_STREAM） ──────────────────── *
+ * proc_grasp 把 proc_npu 的视觉结果翻译成机械臂动作，              *
+ * 通过此 socket 暴露 grasp.start / grasp.stop / grasp.run_once 等。  */
+#define UAV_CTRL_PATH_D "/tmp/uav_proc_grasp.ctrl.sock"
+
 /* ── proc_realsense → proc_gateway 帧就绪通知（eventfd 文件路径） ─── *
  * proc_realsense 创建此文件并将 eventfd 编号写入；                    *
  * proc_gateway 打开后通过 eventfd_read() 监听新帧到达。               *
@@ -31,8 +36,9 @@ extern "C" {
 #define UAV_RS_FRAME_NOTIFY_PATH "/tmp/uav_rs_frame_notify.sock"
 
 /* ── proc_npu 推结果路径（SOCK_DGRAM，保持不变） ──────────────────── */
-#define UAV_NPU_RESULT_GW_PATH  "/tmp/uav_gw_npu_rx.sock"   /* proc_gateway */
-#define UAV_NPU_RESULT_APP_PATH "/tmp/uav_app_npu_rx.sock"  /* uav_robotd   */
+#define UAV_NPU_RESULT_GW_PATH    "/tmp/uav_gw_npu_rx.sock"     /* proc_gateway */
+#define UAV_NPU_RESULT_APP_PATH   "/tmp/uav_app_npu_rx.sock"    /* uav_robotd   */
+#define UAV_NPU_RESULT_GRASP_PATH "/tmp/uav_grasp_npu_rx.sock"  /* proc_grasp   */
 
 /* ── uav_robotd 文本指令端口 ──────────────────────────────────────── */
 #define UAV_APP_CMD_PORT 9001U

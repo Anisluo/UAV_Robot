@@ -4,6 +4,7 @@
 #include <string.h>
 #include <sys/socket.h>
 #include <unistd.h>
+#include <stdbool.h>
 #include "event.h"
 #include "io.h"
 
@@ -86,12 +87,19 @@ bool io_read_command(IOAdapter *io, char *out, size_t out_len, int timeout_ms) {
         nfds++;
     }
 
-    pfds[nfds].fd = STDIN_FILENO;
-    pfds[nfds].events = POLLIN;
-    pfds[nfds].revents = 0;
-    nfds++;
+    /* Only poll stdin when it is an interactive terminal.
+     * When launched via nohup/daemon, stdin is /dev/null which always
+     * returns POLLHUP and causes the main loop to spin at 100% CPU. */
+    bool stdin_is_tty = isatty(STDIN_FILENO);
+    nfds_t stdin_idx = nfds;
+    if (stdin_is_tty) {
+        pfds[nfds].fd = STDIN_FILENO;
+        pfds[nfds].events = POLLIN;
+        pfds[nfds].revents = 0;
+        nfds++;
+    }
 
-    if (poll(pfds, nfds, timeout_ms) <= 0) {
+    if (nfds == 0 || poll(pfds, nfds, timeout_ms) <= 0) {
         return false;
     }
 
@@ -105,7 +113,7 @@ bool io_read_command(IOAdapter *io, char *out, size_t out_len, int timeout_ms) {
         return out[0] != '\0';
     }
 
-    if (pfds[nfds - 1].revents & POLLIN) {
+    if (stdin_is_tty && (pfds[stdin_idx].revents & POLLIN)) {
         if (fgets(out, (int)out_len, stdin) == NULL) {
             return false;
         }

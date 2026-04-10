@@ -1,0 +1,17 @@
+[Unit]
+Description=UAV Robot Grasp Process
+After=uav-proc-npu.service uav-proc-arm.service
+Wants=uav-proc-npu.service uav-proc-arm.service
+
+[Service]
+Type=simple
+WorkingDirectory=@PROJECT_ROOT@
+EnvironmentFile=-/etc/default/uav_robot
+ExecStart=/bin/bash -lc 'exec "@PROJECT_ROOT@/proc_grasp/build/bin/proc_grasp" ${UAV_PROC_GRASP_ARGS:-}'
+Restart=on-failure
+RestartSec=2
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

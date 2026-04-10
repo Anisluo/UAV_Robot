@@ -14,12 +14,16 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
+#include <time.h>
+
 #include "log.h"
 
 #define CAN_DEFAULT_IFACE "can3"
+#define CAN_RETRY_INTERVAL_S 5
 
 static int g_can_fd = -1;
 static char g_can_iface[IF_NAMESIZE] = CAN_DEFAULT_IFACE;
+static time_t g_can_last_fail = 0;
 
 int can_socketcan_init(void) {
     struct ifreq ifr;
@@ -29,6 +33,14 @@ int can_socketcan_init(void) {
 
     if (g_can_fd >= 0) {
         return 0;
+    }
+
+    /* Throttle retry to avoid spinning when the interface is absent */
+    {
+        time_t now = time(NULL);
+        if (g_can_last_fail != 0 && (now - g_can_last_fail) < CAN_RETRY_INTERVAL_S) {
+            return -1;
+        }
     }
 
     if (iface != NULL && iface[0] != '\0') {
@@ -49,6 +61,7 @@ int can_socketcan_init(void) {
                   g_can_iface,
                   strerror(errno));
         close(fd);
+        g_can_last_fail = time(NULL);
         return -1;
     }
 
@@ -61,6 +74,7 @@ int can_socketcan_init(void) {
                   g_can_iface,
                   strerror(errno));
         close(fd);
+        g_can_last_fail = time(NULL);
         return -1;
     }
 

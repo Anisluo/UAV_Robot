@@ -9,3 +9,4 @@ build/
 *.exe
 *.log
 proc_arm.zip
+.vscode/

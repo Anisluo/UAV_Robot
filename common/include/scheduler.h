@@ -5,11 +5,13 @@
 #include "system.h"
 #include "device_registry.h"
 #include "app_battery_pick.h"
+#include "app_arm_demo.h"
 
 typedef struct {
     DeviceRegistry devices;
     BatteryPickTask battery_pick_3d;
     BatteryPickTask battery_pick_6d;
+    ArmDemoTask     arm_demo;
 } Scheduler;
 
 void scheduler_init(Scheduler *scheduler, EventBus *bus, SystemState *state);

@@ -61,7 +61,9 @@ void supervisor_handle(const Event *ev, EventBus *bus, SystemState *state) {
 
     if (cmd == CMD_START_BATTERY_PICK ||
         cmd == CMD_START_BATTERY_PICK_3D ||
-        cmd == CMD_START_BATTERY_PICK_6D) {
+        cmd == CMD_START_BATTERY_PICK_6D ||
+        cmd == CMD_START_ARM_DEMO ||
+        cmd == CMD_START_ARM_HOME) {
         if (state->active_task != TASK_NONE) {
             publish_feedback(bus, ev->ts_ms, cmd, false, "task already running");
             log_warn("dispatcher", "reject start because task %d is running", state->active_task);
@@ -76,6 +78,10 @@ void supervisor_handle(const Event *ev, EventBus *bus, SystemState *state) {
             out.data.task.task = TASK_BATTERY_PICK_6D;
         } else if (cmd == CMD_START_BATTERY_PICK_3D) {
             out.data.task.task = TASK_BATTERY_PICK_3D;
+        } else if (cmd == CMD_START_ARM_DEMO) {
+            out.data.task.task = TASK_ARM_DEMO;
+        } else if (cmd == CMD_START_ARM_HOME) {
+            out.data.task.task = TASK_ARM_HOME;
         } else {
             out.data.task.task = TASK_BATTERY_PICK;
         }

@@ -221,6 +221,7 @@ ArmController &ArmController::instance() {
 
 ArmController::ArmController()
     : current_joints_deg_{0.0, 0.0, 0.0, 0.0, 0.0, 0.0},
+      zero_offsets_deg_{0.0, 0.0, 0.0, 0.0, 0.0, 0.0},
       estop_enabled_(false),
       free_mode_enabled_(false),
       servo_angle_deg_(0) {}
@@ -253,6 +254,7 @@ bool ArmController::homeJoint(int joint_index) {
     }
     if (joint_index >= 1 && joint_index <= static_cast<int>(kJointCount)) {
         current_joints_deg_[static_cast<size_t>(joint_index - 1)] = 0.0;
+        zero_offsets_deg_[static_cast<size_t>(joint_index - 1)] = 0.0;
     }
     return true;
 }
@@ -291,14 +293,19 @@ bool ArmController::movePose(const std::string &pose_name) {
 }
 
 bool ArmController::moveJointDeg(int joint_index, double target_deg) {
+    double physical_target_deg = target_deg;
+
     if (estop_enabled_ || free_mode_enabled_) {
         return false;
     }
-    if (!arm_move_joint_deg(joint_index, static_cast<float>(target_deg))) {
+    if (joint_index >= 1 && joint_index <= static_cast<int>(kJointCount)) {
+        physical_target_deg += zero_offsets_deg_[static_cast<size_t>(joint_index - 1)];
+    }
+    if (!arm_move_joint_deg(joint_index, static_cast<float>(physical_target_deg))) {
         return false;
     }
     if (joint_index >= 1 && joint_index <= static_cast<int>(kJointCount)) {
-        current_joints_deg_[static_cast<size_t>(joint_index - 1)] = target_deg;
+        current_joints_deg_[static_cast<size_t>(joint_index - 1)] = physical_target_deg;
     }
     return true;
 }
@@ -313,19 +320,26 @@ bool ArmController::moveJointsInternal(const std::array<double, 6> &joints_deg,
         return false;
     }
     for (size_t i = 0; i < kJointCount; ++i) {
-        if (joints_deg[i] < kJointMinDeg[i] || joints_deg[i] > kJointMaxDeg[i]) {
+        const double physical_target_deg = joints_deg[i] + zero_offsets_deg_[i];
+        if (physical_target_deg < kJointMinDeg[i] || physical_target_deg > kJointMaxDeg[i]) {
             return false;
         }
-        targets[i] = static_cast<float>(joints_deg[i]);
+        targets[i] = static_cast<float>(physical_target_deg);
     }
     if (eta_s != nullptr) {
-        *eta_s = estimateMotionTime(current_joints_deg_, joints_deg, speed_ratio);
+        std::array<double, 6> physical_targets = joints_deg;
+        for (size_t i = 0; i < kJointCount; ++i) {
+            physical_targets[i] += zero_offsets_deg_[i];
+        }
+        *eta_s = estimateMotionTime(current_joints_deg_, physical_targets, speed_ratio);
     }
     if (!arm_move_joints_deg(targets)) {
         return false;
     }
     if (update_cache) {
-        current_joints_deg_ = joints_deg;
+        for (size_t i = 0; i < kJointCount; ++i) {
+            current_joints_deg_[i] = static_cast<double>(targets[i]);
+        }
     }
     return true;
 }
@@ -432,8 +446,37 @@ bool ArmController::setServoGripper(int angle_deg, double *eta_s) {
     return true;
 }
 
+bool ArmController::setCurrentZero(int joint_index) {
+    if (joint_index < 1 || joint_index > static_cast<int>(kJointCount)) {
+        return false;
+    }
+    zero_offsets_deg_[static_cast<size_t>(joint_index - 1)] = current_joints_deg_[static_cast<size_t>(joint_index - 1)];
+    log_info(kTag,
+             "set current zero joint=%d physical=%.2f reported->0",
+             joint_index,
+             current_joints_deg_[static_cast<size_t>(joint_index - 1)]);
+    return true;
+}
+
+bool ArmController::resetCurrentZero(int joint_index) {
+    if (joint_index < 1 || joint_index > static_cast<int>(kJointCount)) {
+        return false;
+    }
+    zero_offsets_deg_[static_cast<size_t>(joint_index - 1)] = 0.0;
+    log_info(kTag, "reset current zero joint=%d", joint_index);
+    return true;
+}
+
+std::array<double, 6> ArmController::reportedJointsDeg() const {
+    std::array<double, 6> reported = current_joints_deg_;
+    for (size_t i = 0; i < kJointCount; ++i) {
+        reported[i] -= zero_offsets_deg_[i];
+    }
+    return reported;
+}
+
 std::array<double, 6> ArmController::getMotorAngles() const {
-    return current_joints_deg_;
+    return reportedJointsDeg();
 }
 
 bool ArmController::getPose(const std::string &rotation_order, std::array<double, 6> *pose) const {

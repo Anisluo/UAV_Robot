@@ -42,6 +42,8 @@ public:
 
     bool setGripperOpen(bool open);
     bool setServoGripper(int angle_deg, double *eta_s);
+    bool setCurrentZero(int joint_index);
+    bool resetCurrentZero(int joint_index);
 
     std::array<double, 6> getMotorAngles() const;
     bool getPose(const std::string &rotation_order, std::array<double, 6> *pose) const;
@@ -56,8 +58,10 @@ private:
                             double speed_ratio,
                             bool update_cache,
                             double *eta_s);
+    std::array<double, 6> reportedJointsDeg() const;
 
     std::array<double, 6> current_joints_deg_;
+    std::array<double, 6> zero_offsets_deg_;
     bool estop_enabled_;
     bool free_mode_enabled_;
     int servo_angle_deg_;

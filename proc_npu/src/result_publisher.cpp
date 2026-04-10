@@ -38,8 +38,9 @@ void ResultPublisher::close()
 void ResultPublisher::publish(const UavCResult &result)
 {
     if (fd_ < 0) return;
-    send_to(UAV_NPU_RESULT_GW_PATH,  result);
-    send_to(UAV_NPU_RESULT_APP_PATH, result);
+    send_to(UAV_NPU_RESULT_GW_PATH,    result);
+    send_to(UAV_NPU_RESULT_APP_PATH,   result);
+    send_to(UAV_NPU_RESULT_GRASP_PATH, result);
 }
 
 bool ResultPublisher::send_to(const char *path, const UavCResult &result)
