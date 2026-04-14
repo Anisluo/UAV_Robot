@@ -3,7 +3,6 @@
 #include <stdlib.h>
 #include <string.h>
 #include "event_bus.h"
-#include "can_channel.h"
 #include "reactor.h"
 #include "router.h"
 #include "scheduler.h"
@@ -93,7 +92,6 @@ int main(int argc, char **argv) {
     int safety_loops = 0;
     while (!state.shutdown) {
         reactor_poll(&reactor, &bus, 200);
-        can_channel_poll(&bus);
 
         Event ev;
         while (event_bus_try_pop(&bus, &ev)) {

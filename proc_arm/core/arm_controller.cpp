@@ -16,8 +16,12 @@ constexpr const char *kTag = "proc_arm.controller";
 constexpr size_t kJointCount = 6;
 constexpr double kMotorPulsesPerRev = 3200.0;
 constexpr std::array<double, kJointCount> kGearRatios = {25.0, 20.0, 25.0, 10.0, 4.0, 1.0};
-constexpr std::array<double, kJointCount> kJointMinDeg = {-180.0, 0.0, -80.0, -30.0, -110.0, -30.0};
-constexpr std::array<double, kJointCount> kJointMaxDeg = {180.0, 180.0, 83.0, 305.0, 110.0, 305.0};
+// After stall-homing the stall position becomes the physical hard stop at 0°.
+// The motor can only rotate in one direction away from the stall, so the valid
+// range is [0, travel].  The travel values below are the total mechanical range
+// each joint can cover in that single direction.
+constexpr std::array<double, kJointCount> kJointMinDeg = {0.0, 0.0, 0.0, 0.0, 0.0, 0.0};
+constexpr std::array<double, kJointCount> kJointMaxDeg = {360.0, 180.0, 163.0, 335.0, 220.0, 335.0};
 constexpr double kBaseOffsetMm = 55.0;
 constexpr double kBaseHeightMm = 166.0;
 constexpr double kLink2Mm = 200.0;
@@ -144,9 +148,24 @@ bool solvePositionIk(double x_mm, double y_mm, double z_mm, std::array<double, 6
                    std::atan2(link3_eff_mm * std::sin(phi_rad),
                               kLink2Mm + link3_eff_mm * std::cos(phi_rad));
 
-    (*out_joints_deg)[0] = std::atan2(y_mm, x_mm) * 180.0 / kPi;
-    (*out_joints_deg)[1] = shoulder_rad * 180.0 / kPi;
-    (*out_joints_deg)[2] = (phi_rad - link3_beta_rad) * 180.0 / kPi;
+    double j1_deg = std::atan2(y_mm, x_mm) * 180.0 / kPi;
+    double j2_deg = shoulder_rad * 180.0 / kPi;
+    double j3_deg = (phi_rad - link3_beta_rad) * 180.0 / kPi;
+
+    // Normalize angles into [0, max] range — stall homing places the hard
+    // stop at 0° so all valid positions are non-negative.
+    if (j1_deg < 0.0) j1_deg += 360.0;
+    if (j2_deg < 0.0) j2_deg += 360.0;
+    if (j3_deg < 0.0) j3_deg += 360.0;
+
+    // Reject solutions outside the mechanical travel.
+    if (j1_deg > kJointMaxDeg[0] || j2_deg > kJointMaxDeg[1] || j3_deg > kJointMaxDeg[2]) {
+        return false;
+    }
+
+    (*out_joints_deg)[0] = j1_deg;
+    (*out_joints_deg)[1] = j2_deg;
+    (*out_joints_deg)[2] = j3_deg;
     (*out_joints_deg)[3] = 0.0;
     (*out_joints_deg)[4] = 0.0;
     (*out_joints_deg)[5] = 0.0;
@@ -298,15 +317,20 @@ bool ArmController::moveJointDeg(int joint_index, double target_deg) {
     if (estop_enabled_ || free_mode_enabled_) {
         return false;
     }
-    if (joint_index >= 1 && joint_index <= static_cast<int>(kJointCount)) {
-        physical_target_deg += zero_offsets_deg_[static_cast<size_t>(joint_index - 1)];
+    if (joint_index < 1 || joint_index > static_cast<int>(kJointCount)) {
+        return false;
+    }
+    const size_t idx = static_cast<size_t>(joint_index - 1);
+    physical_target_deg += zero_offsets_deg_[idx];
+    if (physical_target_deg < kJointMinDeg[idx] || physical_target_deg > kJointMaxDeg[idx]) {
+        log_error(kTag, "moveJointDeg joint=%d target=%.2f out of range [%.1f, %.1f]",
+                  joint_index, physical_target_deg, kJointMinDeg[idx], kJointMaxDeg[idx]);
+        return false;
     }
     if (!arm_move_joint_deg(joint_index, static_cast<float>(physical_target_deg))) {
         return false;
     }
-    if (joint_index >= 1 && joint_index <= static_cast<int>(kJointCount)) {
-        current_joints_deg_[static_cast<size_t>(joint_index - 1)] = physical_target_deg;
-    }
+    current_joints_deg_[idx] = physical_target_deg;
     return true;
 }
 
@@ -384,9 +408,16 @@ bool ArmController::moveToPose6d(double x_mm,
         !solvePositionIk(x_mm, y_mm, z_mm, &joints_deg)) {
         return false;
     }
-    joints_deg[3] = clampValue(roll_deg, kJointMinDeg[3], kJointMaxDeg[3]);
-    joints_deg[4] = clampValue(pitch_deg, kJointMinDeg[4], kJointMaxDeg[4]);
-    joints_deg[5] = clampValue(yaw_deg, kJointMinDeg[5], kJointMaxDeg[5]);
+    // Map orientation angles into the [0, max] range before clamping.
+    double r = roll_deg;
+    double p = pitch_deg;
+    double yw = yaw_deg;
+    if (r < 0.0) r += 360.0;
+    if (p < 0.0) p += 360.0;
+    if (yw < 0.0) yw += 360.0;
+    joints_deg[3] = clampValue(r, kJointMinDeg[3], kJointMaxDeg[3]);
+    joints_deg[4] = clampValue(p, kJointMinDeg[4], kJointMaxDeg[4]);
+    joints_deg[5] = clampValue(yw, kJointMinDeg[5], kJointMaxDeg[5]);
 
     if (eta_s != nullptr) {
         *eta_s = estimateMotionTime(current_joints_deg_, joints_deg, speed_ratio);
@@ -476,6 +507,21 @@ std::array<double, 6> ArmController::reportedJointsDeg() const {
 }
 
 std::array<double, 6> ArmController::getMotorAngles() const {
+    double hw[6] = {};
+    int n = arm_read_motor_angles(hw);
+    if (n > 0) {
+        std::array<double, 6> result{};
+        for (size_t i = 0; i < kJointCount; ++i) {
+            if (std::isnan(hw[i])) {
+                // Joint didn't respond — fall back to cached value.
+                result[i] = current_joints_deg_[i] - zero_offsets_deg_[i];
+            } else {
+                result[i] = hw[i];
+            }
+        }
+        return result;
+    }
+    // All joints failed — return cached.
     return reportedJointsDeg();
 }
 

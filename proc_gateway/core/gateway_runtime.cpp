@@ -195,6 +195,61 @@ static std::string proc_arm_call_result(const char *method, const char *params_j
     return std::string(pos + std::strlen(tag));
 }
 
+// ─── proc_car JSON-RPC forwarding (Unix stream socket) ──────────────────────
+// proc_car owns the CAN bus for the chassis motors.  All ugv commands from
+// the gateway are forwarded to proc_car so there is a single CAN owner,
+// same pattern as proc_arm.
+static const char *proc_car_sock_path() {
+    const char *e = std::getenv("UAV_PROC_CAR_SOCK");
+    return (e && e[0] != '\0') ? e : "/tmp/uav_proc_car.sock";
+}
+
+static bool proc_car_call(const char *method, const char *params_json) {
+    static int s_id = 4000;
+    int id = ++s_id;
+
+    int fd = ::socket(AF_UNIX, SOCK_STREAM, 0);
+    if (fd < 0) return false;
+
+    struct timeval tv{};
+    tv.tv_sec  = 5;
+    tv.tv_usec = 0;
+    ::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    ::setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+
+    sockaddr_un addr{};
+    addr.sun_family = AF_UNIX;
+    std::strncpy(addr.sun_path, proc_car_sock_path(), sizeof(addr.sun_path) - 1);
+
+    if (::connect(fd, reinterpret_cast<sockaddr *>(&addr), sizeof(addr)) < 0) {
+        ::close(fd);
+        return false;
+    }
+
+    char req[512];
+    int req_len = std::snprintf(req, sizeof(req),
+        "{\"jsonrpc\":\"2.0\",\"id\":%d,\"method\":\"%s\",\"params\":%s}\n",
+        id, method, params_json);
+    if (req_len <= 0 || ::write(fd, req, (size_t)req_len) != req_len) {
+        ::close(fd);
+        return false;
+    }
+
+    char buf[1024] = {};
+    int total = 0;
+    while (total < (int)sizeof(buf) - 1) {
+        ssize_t n = ::read(fd, buf + total, sizeof(buf) - 1 - (size_t)total);
+        if (n <= 0) break;
+        total += (int)n;
+        if (std::memchr(buf, '\n', (size_t)total)) break;
+    }
+    ::close(fd);
+    if (total <= 0) return false;
+
+    return std::strstr(buf, "\"ok\":true") != nullptr
+        || std::strstr(buf, "\"result\":true") != nullptr;
+}
+
 // ─── proc_grasp JSON-RPC forwarding (Unix stream socket) ─────────────────────
 // proc_grasp exposes the same JSON-RPC framing as proc_arm / proc_npu at
 // UAV_CTRL_PATH_D. We talk to it the same way we talk to proc_arm: open
@@ -295,11 +350,6 @@ static int listen_on(uint16_t port) {
         close(fd); return -1;
     }
     return fd;
-}
-
-static void set_nonblock(int fd) {
-    int f = fcntl(fd, F_GETFL, 0);
-    fcntl(fd, F_SETFL, f | O_NONBLOCK);
 }
 
 static void set_nodelay(int fd) {
@@ -722,8 +772,12 @@ public:
     }
 };
 
-// ─── UGV CAN control ────────────────────────────────────────────────────────
-class ChassisCanController {
+// ─── UGV CAN control (REMOVED) ──────────────────────────────────────────────
+// Chassis CAN control has been moved to proc_car.  proc_gateway now forwards
+// ugv.set_velocity / ugv.stop to /tmp/uav_proc_car.sock via proc_car_call().
+// The ChassisCanController class below is kept commented out for reference.
+#if 0
+class ChassisCanController_REMOVED {
 public:
     bool set_velocity(double vx_mps, double omega_rad_s) {
         if (!ensure_ready()) return false;
@@ -954,7 +1008,8 @@ private:
     }
 };
 
-static ChassisCanController g_chassis;
+#endif // ChassisCanController_REMOVED
+
 static AirportRelayBank g_airport_relays;
 static ArmGripperSerial g_arm_gripper;
 
@@ -1737,13 +1792,20 @@ static void handle_rpc(int fd, const std::string &line,
         double vx    = json_double(s, "vx", 0.0);
         double vy    = json_double(s, "vy", 0.0);
         double omega = json_double(s, "omega", 0.0);
-        bool ok = g_chassis.set_velocity(vx, omega);
+        // Convert m/s to mm/s and rad/s to mdeg/s for proc_car
+        int linear_mm_s  = static_cast<int>(vx * 1000.0);
+        int angular_mdeg_s = static_cast<int>(omega * 180.0 / 3.14159265 * 1000.0);
+        char params[128];
+        std::snprintf(params, sizeof(params),
+                      "{\"linear_mm_s\":%d,\"angular_mdeg_s\":%d}",
+                      linear_mm_s, angular_mdeg_s);
+        bool ok = proc_car_call("car.set_velocity", params);
         snprintf(resp, sizeof(resp),
                  "{\"id\":%d,\"result\":{\"ok\":%s,\"vx\":%.3f,\"vy\":%.3f,\"omega\":%.3f}}\n",
                  id, ok ? "true" : "false", vx, vy, omega);
 
     } else if (method == "ugv.stop") {
-        bool ok = g_chassis.stop();
+        bool ok = proc_car_call("car.stop", "{}");
         snprintf(resp, sizeof(resp),
                  "{\"id\":%d,\"result\":{\"ok\":%s}}\n",
                  id, ok ? "true" : "false");

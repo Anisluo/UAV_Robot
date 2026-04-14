@@ -29,6 +29,9 @@ void arm_set_move_rpm(int rpm);
 void arm_set_zero_rpm(int rpm);
 int  arm_get_move_rpm(void);
 int  arm_get_zero_rpm(void);
+/* Read real encoder positions from motors via CAN (ZDT cmd 0x33).
+ * Fills angles[6] in degrees.  Returns number of joints that responded. */
+int  arm_read_motor_angles(double angles[6]);
 bool platform_lock(bool lock);
 bool car_set_velocity(int linear_mm_s, int angular_mdeg_s);
 bool gripper_open(bool open);

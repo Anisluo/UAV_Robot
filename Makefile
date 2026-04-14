@@ -15,24 +15,17 @@ ROBOTD_SRCS := \
 	uav_robotd/core/router/router.c \
 	uav_robotd/core/scheduler/scheduler.c \
 	uav_robotd/core/supervisor/supervisor.c \
-	uav_robotd/core/channel/can_channel.c \
 	uav_robotd/core/channel/mesh_channel.c \
 	uav_robotd/core/channel/bc_channel.c \
 	uav_robotd/core/channel/uart_channel.c \
-	uav_robotd/core/proto/proto_zdt_arm.c \
-	uav_robotd/core/proto/proto_robomodule_drv.c \
-	uav_robotd/core/proto/proto_gripper_uart.c \
-	uav_robotd/core/proto/proto_platform_lock.c \
 	uav_robotd/core/proto/proto_mesh_link.c \
 	uav_robotd/core/dev/arm_rpc_proxy.c \
-	uav_robotd/core/dev/car.c \
-	uav_robotd/core/dev/platform.c \
+	uav_robotd/core/dev/car_rpc_proxy.c \
+	uav_robotd/core/dev/platform_rpc_proxy.c \
+	uav_robotd/core/dev/gripper_rpc_proxy.c \
 	uav_robotd/core/dev/relay.c \
-	uav_robotd/core/dev/gripper.c \
 	uav_robotd/app/tasks/task_battery_pick.c \
 	uav_robotd/app/tasks/task_arm_demo.c \
-	uav_robotd/drv/dev/can_socketcan.c \
-	uav_robotd/drv/dev/uart_posix.c \
 	uav_robotd/drv/dev/mesh_eth.c \
 	uav_robotd/drv/io/gpio_sysfs.c
 
