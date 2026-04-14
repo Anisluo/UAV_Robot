@@ -103,6 +103,51 @@ int GraspApplication::run()
     ArmClient arm;
     GraspPipeline pipeline(&listener, &arm);
 
+    // Load hand-eye calibration from file on startup if available.
+    // Path is configurable via UAV_HAND_EYE_PATH, default /etc/uav_robot/hand_eye.txt
+    // File format: 12 space- or newline-separated floats (row-major 3x4 affine):
+    //   r00 r01 r02 tx
+    //   r10 r11 r12 ty
+    //   r20 r21 r22 tz
+    {
+        const char *he_path = std::getenv("UAV_HAND_EYE_PATH");
+        if (he_path == nullptr || he_path[0] == '\0') {
+            he_path = "/etc/uav_robot/hand_eye.txt";
+        }
+        FILE *fp = std::fopen(he_path, "r");
+        if (fp != nullptr) {
+            std::array<float, 12> m{};
+            int parsed = 0;
+            char line[256];
+            // Read line-by-line, skip # comments, then tokenize floats.
+            while (parsed < 12 && std::fgets(line, sizeof(line), fp) != nullptr) {
+                char *p = line;
+                while (*p == ' ' || *p == '\t') ++p;
+                if (*p == '#' || *p == '\n' || *p == '\0') continue;
+                char *tok = std::strtok(p, " \t\r\n");
+                while (tok != nullptr && parsed < 12) {
+                    if (tok[0] == '#') break;
+                    char *end = nullptr;
+                    float v = std::strtof(tok, &end);
+                    if (end != tok) m[parsed++] = v;
+                    tok = std::strtok(nullptr, " \t\r\n");
+                }
+            }
+            std::fclose(fp);
+            if (parsed == 12 && pipeline.set_hand_eye(m)) {
+                std::fprintf(stderr, "proc_grasp: loaded hand-eye from %s\n", he_path);
+            } else {
+                std::fprintf(stderr,
+                             "proc_grasp: hand-eye file %s has %d/12 floats — using identity\n",
+                             he_path, parsed);
+            }
+        } else {
+            std::fprintf(stderr,
+                         "proc_grasp: no hand-eye file at %s — using identity (push via grasp.set_hand_eye)\n",
+                         he_path);
+        }
+    }
+
     CtrlServer ctrl;
     bool ok = ctrl.start(UAV_CTRL_PATH_D,
         [&](int /*id*/, const std::string &method,
@@ -159,6 +204,28 @@ int GraspApplication::run()
                 if (!pipeline.set_hand_eye(m)) {
                     return "{\"ok\":false,\"error\":\"invalid matrix\"}";
                 }
+                return "{\"ok\":true}";
+            }
+            if (method == "grasp.set_place_target") {
+                // params: {x_mm, y_mm, z_mm, roll_deg, pitch_deg, yaw_deg}
+                auto get = [&](const char *key, float def) {
+                    float arr[1] = {def};
+                    char needle[32];
+                    std::snprintf(needle, sizeof(needle), "\"%s\"", key);
+                    auto pos = params.find(needle);
+                    if (pos == std::string::npos) return def;
+                    pos = params.find(':', pos);
+                    if (pos == std::string::npos) return def;
+                    arr[0] = std::strtof(params.c_str() + pos + 1, nullptr);
+                    return arr[0];
+                };
+                float x = get("x_mm", 0.0F);
+                float y = get("y_mm", 0.0F);
+                float z = get("z_mm", 280.0F);
+                float r = get("roll_deg", 180.0F);
+                float p = get("pitch_deg", 0.0F);
+                float yw = get("yaw_deg", 0.0F);
+                pipeline.set_place_target(x, y, z, r, p, yw);
                 return "{\"ok\":true}";
             }
             if (method == "grasp.get_status") {

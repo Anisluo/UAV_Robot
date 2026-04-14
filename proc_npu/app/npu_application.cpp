@@ -9,6 +9,8 @@
 #include <string>
 #include <thread>
 
+#include <sys/stat.h>
+
 #include "abi/ipc_framing.h"
 #include "ctrl_server.h"
 #include "npu_pipeline.h"
@@ -17,12 +19,29 @@
 #include "shm_reader.h"
 
 namespace {
+constexpr const char *kFaceTriggerFlag    = "/tmp/uav_face_tracker_enabled";
+constexpr const char *kBatteryTriggerFlag = "/tmp/uav_battery_tracker_enabled";
+
 const char *strategy_model_name(int32_t id) {
     switch (id) {
         case UAV_STRATEGY_BATTERY_V2: return "battery_v2.rknn";
         case UAV_STRATEGY_CUSTOM:     return "custom.rknn";
+        case UAV_STRATEGY_FACE:       return "";  // handled by face_tracker.py
+        case UAV_STRATEGY_BATTERY_CV: return "";  // handled by battery_tracker.py
         case UAV_STRATEGY_DEFAULT:
         default:                      return "default.rknn";
+    }
+}
+
+// Create/remove a trigger flag. Python sidecars poll for these files and
+// run / idle accordingly — keeps them silent until their strategy is
+// selected, so they don't compete with the RKNN detector.
+void set_trigger_flag(const char *path, bool on) {
+    if (on) {
+        FILE *f = std::fopen(path, "w");
+        if (f) { std::fputs("1\n", f); std::fclose(f); }
+    } else {
+        std::remove(path);
     }
 }
 
@@ -119,6 +138,11 @@ int NpuApplication::run() {
         if (method == "npu.set_strategy") {
             int32_t strategy_id = get_int32("strategy", UAV_STRATEGY_DEFAULT);
             const char *name = strategy_model_name(strategy_id);
+            // Toggle the face_tracker.py sidecar via a trigger flag file.
+            set_trigger_flag(kFaceTriggerFlag,
+                             strategy_id == UAV_STRATEGY_FACE);
+            set_trigger_flag(kBatteryTriggerFlag,
+                             strategy_id == UAV_STRATEGY_BATTERY_CV);
             {
                 std::lock_guard<std::mutex> lk(model_mu);
                 pending_model = name;
@@ -165,8 +189,57 @@ int NpuApplication::run() {
                 }
             }
 
-            if (!infer_enabled.load() || !infer.loaded()) {
+            if (!infer_enabled.load()) {
                 std::this_thread::sleep_for(std::chrono::milliseconds(10));
+                continue;
+            }
+            // ── No RKNN model loaded? Fall back to stub detection so the
+            //    downstream pipeline (proc_grasp + HostGUI overlay) still
+            //    sees *something* for integration testing.  Disable with
+            //    UAV_NPU_STUB=0. ─────────────────────────────────────────
+            if (!infer.loaded()) {
+                static bool s_stub_enabled = []() {
+                    const char *e = std::getenv("UAV_NPU_STUB");
+                    return (e == nullptr || e[0] == '\0' || e[0] != '0');
+                }();
+                // Skip stub entirely when a Python sidecar owns the
+                // detection path — otherwise the stub would stomp its
+                // UavCResult on the gateway's cache every 100 ms.
+                struct stat st;
+                bool face_active    = (::stat(kFaceTriggerFlag, &st) == 0);
+                bool battery_active = (::stat(kBatteryTriggerFlag, &st) == 0);
+                if (!s_stub_enabled || face_active || battery_active) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+                    continue;
+                }
+                // Pull one frame to know the image dimensions.
+                InferenceFrame frame{};
+                {
+                    std::lock_guard<std::mutex> lk(latest_mu);
+                    if (!has_latest) {
+                        ;  // no frame yet
+                    } else {
+                        frame = latest;
+                    }
+                }
+                UavCResult stub{};
+                stub.frame_id = static_cast<uint64_t>(now_ns());
+                stub.num_detections = 1;
+                UavDetection &d = stub.detections[0];
+                d.class_id  = 0;
+                d.score     = 0.99F;
+                // Center quarter of frame (fallback 640x480 if unknown).
+                uint32_t w = frame.slot.width  > 0U ? frame.slot.width  : 640U;
+                uint32_t h = frame.slot.height > 0U ? frame.slot.height : 480U;
+                d.x1 = static_cast<float>(w) * 0.375F;
+                d.y1 = static_cast<float>(h) * 0.375F;
+                d.x2 = static_cast<float>(w) * 0.625F;
+                d.y2 = static_cast<float>(h) * 0.625F;
+                d.has_xyz = 0U;
+                d.has_rpy = 0U;
+                d.grasp_mode = UAV_GRASP_MODE_3D;
+                publisher.publish(stub);
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
                 continue;
             }
 

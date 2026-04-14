@@ -18,9 +18,11 @@ typedef enum {
 } UavProcId;
 
 typedef enum {
-    UAV_STRATEGY_DEFAULT    = 0,  /* default.rknn – square battery detection */
-    UAV_STRATEGY_BATTERY_V2 = 1,  /* battery_v2.rknn */
-    UAV_STRATEGY_CUSTOM     = 2   /* custom.rknn */
+    UAV_STRATEGY_DEFAULT     = 0,  /* default.rknn – square battery detection */
+    UAV_STRATEGY_BATTERY_V2  = 1,  /* battery_v2.rknn */
+    UAV_STRATEGY_CUSTOM      = 2,  /* custom.rknn */
+    UAV_STRATEGY_FACE        = 3,  /* Python face_tracker.py (Haar cascade) */
+    UAV_STRATEGY_BATTERY_CV  = 4   /* Python battery_tracker.py (DJI Mavic 3) */
 } UavStrategyId;
 
 typedef enum {

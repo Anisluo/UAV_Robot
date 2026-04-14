@@ -114,15 +114,26 @@ bool ShmReader::read_latest(GatewayFrame &out) {
         return false;   // grabbed by someone else
     }
 
-    out.frame_id = slot->frame_id;
-    out.width    = slot->width;
-    out.height   = slot->height;
-    out.stride   = slot->stride;
+    out.frame_id    = slot->frame_id;
+    out.width       = slot->width;
+    out.height      = slot->height;
+    out.stride      = slot->stride;
+    out.depth_scale = slot->depth_scale;
 
     const uint32_t color_size = slot->stride * slot->height;
+    const uint32_t depth_size = slot->width * slot->height * 2U;   // uint16
     const uint8_t *payload    = shm_ring_slot_payload_const(ring_, best_idx);
     out.color.assign(payload + slot->color_offset,
                      payload + slot->color_offset + color_size);
+    // Depth is optional in the ring (depth_offset == 0 / depth_scale == 0
+    // means the writer didn't attach depth).  Only copy when present, so
+    // the consumer can fall back to RGB only if the source has no depth.
+    if (slot->depth_scale > 0.0F && slot->depth_offset != slot->color_offset) {
+        out.depth.assign(payload + slot->depth_offset,
+                         payload + slot->depth_offset + depth_size);
+    } else {
+        out.depth.clear();
+    }
 
     __atomic_store_n(&slot->state, (uint32_t)UAV_SLOT_FREE, __ATOMIC_RELEASE);
     last_frame_id_ = out.frame_id;

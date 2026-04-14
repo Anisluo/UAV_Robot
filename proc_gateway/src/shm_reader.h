@@ -11,8 +11,10 @@ struct GatewayFrame {
     uint64_t             frame_id{0};
     uint32_t             width{0};
     uint32_t             height{0};
-    uint32_t             stride{0};   // bytes per color row (BGR8: width*3)
-    std::vector<uint8_t> color;       // BGR8 pixels
+    uint32_t             stride{0};       // bytes per color row (BGR8: width*3)
+    float                depth_scale{0};  // metres per depth unit (uint16)
+    std::vector<uint8_t> color;           // BGR8 pixels (size = stride * height)
+    std::vector<uint8_t> depth;           // raw uint16 depth (size = w*h*2)
 };
 
 class ShmReader {

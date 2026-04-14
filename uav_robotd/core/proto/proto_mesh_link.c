@@ -31,6 +31,12 @@ CommandType proto_parse_command(const char *raw) {
     if (strcmp(buf, "START_ARM_HOME") == 0 || strcmp(buf, "ARM_HOME") == 0) {
         return CMD_START_ARM_HOME;
     }
+    if (strcmp(buf, "START_PICK_PLACE") == 0 || strcmp(buf, "PICK_PLACE") == 0) {
+        return CMD_START_PICK_PLACE;
+    }
+    if (strcmp(buf, "START_FACE_TRACK") == 0 || strcmp(buf, "FACE_TRACK") == 0) {
+        return CMD_START_FACE_TRACK;
+    }
     if (strcmp(buf, "ESTOP") == 0 || strcmp(buf, "EMERGENCY_STOP") == 0) {
         return CMD_EMERGENCY_STOP;
     }
@@ -50,6 +56,8 @@ const char *proto_command_name(CommandType cmd) {
         case CMD_START_BATTERY_PICK_6D: return "START_BATTERY_PICK_6D";
         case CMD_START_ARM_DEMO: return "START_ARM_DEMO";
         case CMD_START_ARM_HOME: return "START_ARM_HOME";
+        case CMD_START_PICK_PLACE: return "START_PICK_PLACE";
+        case CMD_START_FACE_TRACK: return "START_FACE_TRACK";
         case CMD_EMERGENCY_STOP: return "EMERGENCY_STOP";
         case CMD_RESET_FAULT: return "RESET_FAULT";
         case CMD_SHUTDOWN: return "SHUTDOWN";

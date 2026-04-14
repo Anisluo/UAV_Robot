@@ -11,6 +11,8 @@ void scheduler_init(Scheduler *scheduler, EventBus *bus, SystemState *state) {
     app_battery_pick_start(&scheduler->battery_pick_3d, UAV_GRASP_MODE_3D);
     app_battery_pick_start(&scheduler->battery_pick_6d, UAV_GRASP_MODE_6D);
     app_arm_demo_start(&scheduler->arm_demo);
+    app_pick_place_start(&scheduler->pick_place);
+    app_face_track_start(&scheduler->face_track);
     state->active_task = TASK_NONE;
 }
 
@@ -34,6 +36,10 @@ static const char *task_name(TaskType task) {
             return "ARM_DEMO";
         case TASK_ARM_HOME:
             return "ARM_HOME";
+        case TASK_PICK_PLACE:
+            return "PICK_PLACE";
+        case TASK_FACE_TRACK:
+            return "FACE_TRACK";
         case TASK_NONE:
         default:
             return "NONE";
@@ -121,6 +127,16 @@ void scheduler_handle(const Event *ev, EventBus *bus, SystemState *state, Schedu
             state->active_task = TASK_ARM_DEMO;
             log_info("task", "task start: ARM_DEMO");
             write_task_status(TASK_ARM_DEMO, "running", "");
+        } else if (ev->data.task.task == TASK_PICK_PLACE) {
+            app_pick_place_start(&scheduler->pick_place);
+            state->active_task = TASK_PICK_PLACE;
+            log_info("task", "task start: PICK_PLACE");
+            write_task_status(TASK_PICK_PLACE, "running", "");
+        } else if (ev->data.task.task == TASK_FACE_TRACK) {
+            app_face_track_start(&scheduler->face_track);
+            state->active_task = TASK_FACE_TRACK;
+            log_info("task", "task start: FACE_TRACK");
+            write_task_status(TASK_FACE_TRACK, "running", "");
         } else if (ev->data.task.task == TASK_ARM_HOME) {
             /* Single-shot: just call arm_home() (proxied to proc_arm) and
              * mark done. The estop flag is checked by proc_arm itself. */
@@ -152,6 +168,42 @@ void scheduler_handle(const Event *ev, EventBus *bus, SystemState *state, Schedu
 
         if (app_battery_pick_done(task)) {
             publish_task_done(bus, state->active_task);
+        }
+        return;
+    }
+
+    if (ev->type == EVT_TIMER_TICK && state->active_task == TASK_FACE_TRACK) {
+        if (state->emergency_stop) {
+            publish_task_fail(bus, TASK_FACE_TRACK, "estop during face_track");
+            return;
+        }
+        char err[UAV_TEXT_MAX] = {0};
+        if (!app_face_track_step(&scheduler->face_track, &scheduler->devices,
+                                 err, sizeof(err))) {
+            publish_task_fail(bus, TASK_FACE_TRACK,
+                              err[0] ? err : "face_track step failed");
+            return;
+        }
+        /* face_track runs indefinitely — no done check, stopped by ESTOP */
+        return;
+    }
+
+    if (ev->type == EVT_TIMER_TICK && state->active_task == TASK_PICK_PLACE) {
+        if (state->emergency_stop) {
+            publish_task_fail(bus, TASK_PICK_PLACE, "estop during pick_place");
+            return;
+        }
+        char err[UAV_TEXT_MAX] = {0};
+        if (!app_pick_place_step(&scheduler->pick_place, &scheduler->devices,
+                                 err, sizeof(err))) {
+            publish_task_fail(bus, TASK_PICK_PLACE,
+                              scheduler->pick_place.last_error[0]
+                                  ? scheduler->pick_place.last_error
+                                  : (err[0] ? err : "pick_place step failed"));
+            return;
+        }
+        if (app_pick_place_done(&scheduler->pick_place)) {
+            publish_task_done(bus, TASK_PICK_PLACE);
         }
         return;
     }

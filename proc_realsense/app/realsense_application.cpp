@@ -48,9 +48,6 @@ int RealsenseApplication::run() {
     constexpr uint32_t kDefaultWidth = 424;
     constexpr uint32_t kDefaultHeight = 240;
     constexpr uint32_t kDefaultFps = 15;
-    constexpr uint32_t kColorStride = kDefaultWidth * 3U;
-    constexpr uint32_t kDepthStride = kDefaultWidth * 2U;
-    constexpr uint32_t kSlotPayload = (kColorStride + kDepthStride) * kDefaultHeight;
 
     std::atomic<bool> running{true};
     std::atomic<bool> capture_enabled{true};
@@ -60,6 +57,15 @@ int RealsenseApplication::run() {
     std::atomic<uint32_t> cfg_w{initial_width};
     std::atomic<uint32_t> cfg_h{initial_height};
     std::atomic<uint32_t> cfg_fps{initial_fps};
+
+    // Size the ring payload for the *runtime* resolution. The old fixed
+    // constant only fit 424x240; bumping UAV_REALSENSE_WIDTH/HEIGHT without
+    // this caused the writer to silently drop every frame (shm slot too
+    // small to hold color+depth). Use the max of default and env so the
+    // slot still fits after a later realsense.set_profile down-switch.
+    const uint32_t pay_w = (initial_width  > kDefaultWidth)  ? initial_width  : kDefaultWidth;
+    const uint32_t pay_h = (initial_height > kDefaultHeight) ? initial_height : kDefaultHeight;
+    const uint32_t kSlotPayload = (pay_w * 3U + pay_w * 2U) * pay_h;
 
     RSCapture capture;
     ShmWriter writer;

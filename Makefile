@@ -26,6 +26,8 @@ ROBOTD_SRCS := \
 	uav_robotd/core/dev/relay.c \
 	uav_robotd/app/tasks/task_battery_pick.c \
 	uav_robotd/app/tasks/task_arm_demo.c \
+	uav_robotd/app/tasks/task_pick_place.c \
+	uav_robotd/app/tasks/task_face_track.c \
 	uav_robotd/drv/dev/mesh_eth.c \
 	uav_robotd/drv/io/gpio_sysfs.c
 

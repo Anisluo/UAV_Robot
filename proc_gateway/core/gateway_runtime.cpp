@@ -24,6 +24,7 @@
 
 #include <arpa/inet.h>
 #include <fcntl.h>
+#include <sys/stat.h>
 #include <linux/can.h>
 #include <linux/can/raw.h>
 #include <netinet/in.h>
@@ -57,6 +58,12 @@ struct NpuResultStore {
 
 static NpuResultStore g_npu_result;
 
+// ─── Video source selection (declared here so the RPC handler further
+//     down can see it; implementation colorize_depth() lives near the
+//     video-push loop). 0 = RGB (default), 1 = colorized depth.
+enum : int { VIDEO_SRC_RGB = 0, VIDEO_SRC_DEPTH = 1 };
+static std::atomic<int> g_video_source{VIDEO_SRC_RGB};
+
 static int open_npu_result_socket() {
     ::unlink(UAV_NPU_RESULT_GW_PATH);
     int fd = ::socket(AF_UNIX, SOCK_DGRAM, 0);
@@ -68,6 +75,8 @@ static int open_npu_result_socket() {
     if (::bind(fd, reinterpret_cast<sockaddr *>(&addr), sizeof(addr)) < 0) {
         ::close(fd); return -1;
     }
+    // Allow non-root clients (face_tracker.py runs as ubuntu) to sendto.
+    (void)::chmod(UAV_NPU_RESULT_GW_PATH, 0666);
     int flags = fcntl(fd, F_GETFL, 0);
     fcntl(fd, F_SETFL, flags | O_NONBLOCK);
     return fd;
@@ -193,6 +202,59 @@ static std::string proc_arm_call_result(const char *method, const char *params_j
     const char *pos = std::strstr(buf, tag);
     if (!pos) return {};
     return std::string(pos + std::strlen(tag));
+}
+
+// ─── proc_npu JSON-RPC forwarding (Unix stream socket) ─────────────────────
+// The legacy binary ctrl channel (ctrl_c.send_cmd) never actually reached
+// proc_npu's JSON-RPC SOCK_STREAM server, so strategy-switch commands from
+// the HostGUI silently no-oped.  Forward them as real JSON-RPC instead, so
+// proc_npu's npu.set_strategy / npu.start / npu.stop handlers — which
+// toggle the Python-sidecar trigger flags — run as intended.
+static const char *proc_npu_sock_path() {
+    const char *e = std::getenv("UAV_PROC_NPU_SOCK");
+    return (e && e[0] != '\0') ? e : "/tmp/uav_proc_npu.ctrl.sock";
+}
+
+static bool proc_npu_call(const char *method, const char *params_json) {
+    static int s_id = 2000;
+    int id = ++s_id;
+
+    int fd = ::socket(AF_UNIX, SOCK_STREAM, 0);
+    if (fd < 0) return false;
+
+    struct timeval tv{};
+    tv.tv_sec  = 3;
+    tv.tv_usec = 0;
+    ::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    ::setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+
+    sockaddr_un addr{};
+    addr.sun_family = AF_UNIX;
+    std::strncpy(addr.sun_path, proc_npu_sock_path(), sizeof(addr.sun_path) - 1);
+    if (::connect(fd, reinterpret_cast<sockaddr *>(&addr), sizeof(addr)) < 0) {
+        ::close(fd);
+        return false;
+    }
+
+    char req[256];
+    int req_len = std::snprintf(req, sizeof(req),
+        "{\"jsonrpc\":\"2.0\",\"id\":%d,\"method\":\"%s\",\"params\":%s}\n",
+        id, method, params_json);
+    if (req_len <= 0 || ::write(fd, req, (size_t)req_len) != req_len) {
+        ::close(fd);
+        return false;
+    }
+
+    char buf[512] = {};
+    int total = 0;
+    while (total < (int)sizeof(buf) - 1) {
+        ssize_t n = ::read(fd, buf + total, sizeof(buf) - 1 - (size_t)total);
+        if (n <= 0) break;
+        total += (int)n;
+        if (std::memchr(buf, '\n', (size_t)total)) break;
+    }
+    ::close(fd);
+    return total > 0 && std::strstr(buf, "\"ok\":true") != nullptr;
 }
 
 // ─── proc_car JSON-RPC forwarding (Unix stream socket) ──────────────────────
@@ -1455,10 +1517,17 @@ static void handle_rpc(int fd, const std::string &line,
 
     } else if (method == "npu.set_strategy") {
         int strategy = json_int(s, "strategy_id", 0);
+        // Forward via JSON-RPC — this is the path that makes proc_npu
+        // toggle the face_tracker / battery_tracker trigger flags.
+        // Keep the legacy binary broadcast too for any other consumer
+        // still listening for UAV_CTRL_C_SET_STRATEGY.
+        char params[64];
+        std::snprintf(params, sizeof(params), "{\"strategy\":%d}", strategy);
+        bool ok = proc_npu_call("npu.set_strategy", params);
         ctrl_c.send_cmd(UAV_CTRL_C_SET_STRATEGY, strategy);
         snprintf(resp, sizeof(resp),
-                 "{\"id\":%d,\"result\":{\"ok\":true,\"strategy_id\":%d}}\n",
-                 id, strategy);
+                 "{\"id\":%d,\"result\":{\"ok\":%s,\"strategy_id\":%d}}\n",
+                 id, ok ? "true" : "false", strategy);
 
     } else if (method == "npu.set_threshold") {
         // threshold is a float in params; parse via a simple float extraction
@@ -1522,6 +1591,8 @@ static void handle_rpc(int fd, const std::string &line,
         else if (task_name == "battery_pick")    cmd_str = "START_BATTERY_PICK";
         else if (task_name == "battery_pick_3d") cmd_str = "START_BATTERY_PICK_3D";
         else if (task_name == "battery_pick_6d") cmd_str = "START_BATTERY_PICK_6D";
+        else if (task_name == "pick_place")      cmd_str = "START_PICK_PLACE";
+        else if (task_name == "face_track")      cmd_str = "START_FACE_TRACK";
         else if (task_name == "platform_lock")   cmd_str = "START_BATTERY_PICK";
         send_task_cmd(task_udp_fd, cmd_str);
         snprintf(resp, sizeof(resp),
@@ -1651,9 +1722,33 @@ static void handle_rpc(int fd, const std::string &line,
     } else if (method == "video.get_status") {
         const bool enabled = (video_stream_enabled != nullptr) ? *video_stream_enabled : true;
         const int clients = (vid_clients != nullptr) ? (int)vid_clients->size() : 0;
+        const char *src_str = (g_video_source.load() == VIDEO_SRC_DEPTH)
+                                ? "depth" : "rgb";
         snprintf(resp, sizeof(resp),
-                 "{\"id\":%d,\"result\":{\"enabled\":%s,\"clients\":%d}}\n",
-                 id, enabled ? "true" : "false", clients);
+                 "{\"id\":%d,\"result\":{\"enabled\":%s,\"clients\":%d,"
+                 "\"source\":\"%s\"}}\n",
+                 id, enabled ? "true" : "false", clients, src_str);
+
+    } else if (method == "video.set_source") {
+        // Accept either {"source":"depth"} / "rgb" or a raw int 0 / 1.
+        // Only one stream is sent at a time to keep :7002 bandwidth flat —
+        // the renderer on the RK3588 swaps source at the next frame.
+        std::string src = json_str(s, "source");
+        int new_src = VIDEO_SRC_RGB;
+        if (src == "depth" || src == "DEPTH" || src == "1") {
+            new_src = VIDEO_SRC_DEPTH;
+        } else if (src == "rgb" || src == "RGB" || src == "color" || src == "0") {
+            new_src = VIDEO_SRC_RGB;
+        } else {
+            // Fall back to an int param named "source" for convenience.
+            const int iv = json_int(s, "source", -1);
+            if (iv == 1) new_src = VIDEO_SRC_DEPTH;
+            else if (iv == 0) new_src = VIDEO_SRC_RGB;
+        }
+        g_video_source.store(new_src);
+        snprintf(resp, sizeof(resp),
+                 "{\"id\":%d,\"result\":{\"ok\":true,\"source\":\"%s\"}}\n",
+                 id, (new_src == VIDEO_SRC_DEPTH) ? "depth" : "rgb");
 
     } else if (method == "arm.home") {
         // Forward to proc_arm which owns the CAN bus
@@ -1930,6 +2025,66 @@ static void handle_rpc(int fd, const std::string &line,
     write_all(fd, resp, strlen(resp));
 }
 
+// (VIDEO_SRC_* + g_video_source are declared above, near the top of the
+//  file, so that the RPC handler — which sits earlier in the source —
+//  can reference them too.)
+
+// Depth range used for the colormap (metres).  Anything nearer / farther /
+// invalid renders black, so the user sees a clean cut-off instead of a
+// noisy band at the extremes.
+static constexpr float DEPTH_MAP_MIN_M = 0.20F;   // ~20 cm
+static constexpr float DEPTH_MAP_MAX_M = 1.50F;   // 150 cm
+
+// Render a uint16 depth buffer to a BGR image using a cheap turbo-style
+// colormap (blue → cyan → green → yellow → red).  Writes `out` in place,
+// sized to w*h*3 bytes — downstream can hand this straight to
+// JpegEncoder::encode() exactly like a colour frame, no special path.
+static void colorize_depth(const uint8_t *depth16,
+                            uint32_t w, uint32_t h,
+                            float depth_scale_m,
+                            std::vector<uint8_t> &out)
+{
+    out.resize(static_cast<size_t>(w) * h * 3U);
+    const uint16_t *d = reinterpret_cast<const uint16_t *>(depth16);
+    const float z_min = DEPTH_MAP_MIN_M;
+    const float z_max = DEPTH_MAP_MAX_M;
+    const float inv_span = 1.0F / (z_max - z_min);
+
+    for (uint32_t i = 0; i < w * h; ++i) {
+        const uint16_t raw = d[i];
+        if (raw == 0U) {                      // invalid depth
+            out[i * 3 + 0] = 0; out[i * 3 + 1] = 0; out[i * 3 + 2] = 0;
+            continue;
+        }
+        const float z = static_cast<float>(raw) * depth_scale_m;
+        if (z < z_min || z > z_max) {
+            out[i * 3 + 0] = 0; out[i * 3 + 1] = 0; out[i * 3 + 2] = 0;
+            continue;
+        }
+        float t = (z - z_min) * inv_span;   // near=0 (blue), far=1 (red)
+        if (t < 0.0F) t = 0.0F; else if (t > 1.0F) t = 1.0F;
+
+        float r, g, b;
+        if (t < 0.25F) {                    // blue → cyan
+            float s = t * 4.0F;
+            r = 0.0F; g = s;        b = 1.0F;
+        } else if (t < 0.50F) {             // cyan → green
+            float s = (t - 0.25F) * 4.0F;
+            r = 0.0F; g = 1.0F;     b = 1.0F - s;
+        } else if (t < 0.75F) {             // green → yellow
+            float s = (t - 0.50F) * 4.0F;
+            r = s;    g = 1.0F;     b = 0.0F;
+        } else {                            // yellow → red
+            float s = (t - 0.75F) * 4.0F;
+            r = 1.0F; g = 1.0F - s; b = 0.0F;
+        }
+        // Store BGR (the encoder swaps to RGB row-by-row).
+        out[i * 3 + 0] = static_cast<uint8_t>(b * 255.0F);
+        out[i * 3 + 1] = static_cast<uint8_t>(g * 255.0F);
+        out[i * 3 + 2] = static_cast<uint8_t>(r * 255.0F);
+    }
+}
+
 // ─── Push one JPEG frame to a video client ───────────────────────────────────
 // Returns false if the client should be closed.
 static bool push_frame(int fd, const std::vector<uint8_t> &jpeg) {
@@ -2096,8 +2251,26 @@ int run_gateway_runtime() {
 
         // ── Read latest frame from shm → encode → push to video clients ──────
         if (video_stream_enabled && shm.is_open() && shm.read_latest(frame) && !vid_clients.empty()) {
-            std::vector<uint8_t> jpeg = encoder.encode(
-                frame.color.data(), frame.width, frame.height, frame.stride);
+            std::vector<uint8_t> jpeg;
+            const int src = g_video_source.load();
+            if (src == VIDEO_SRC_DEPTH && !frame.depth.empty()
+                && frame.depth_scale > 0.0F) {
+                // Colorize depth → BGR, then JPEG-encode via the same path
+                // as the RGB stream so :7002 frame format stays uniform.
+                static thread_local std::vector<uint8_t> depth_bgr;
+                colorize_depth(frame.depth.data(),
+                               frame.width, frame.height,
+                               frame.depth_scale, depth_bgr);
+                jpeg = encoder.encode(depth_bgr.data(),
+                                      frame.width, frame.height,
+                                      frame.width * 3U);
+            } else {
+                // Default / fallback: colour frame. Also used when the
+                // user selected DEPTH but the current slot doesn't carry
+                // a depth buffer (source ran without depth enabled).
+                jpeg = encoder.encode(
+                    frame.color.data(), frame.width, frame.height, frame.stride);
+            }
             if (!jpeg.empty()) {
                 std::vector<int> dead_vid;
                 for (int vfd : vid_clients) {

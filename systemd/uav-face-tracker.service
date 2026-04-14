@@ -1,0 +1,18 @@
+[Unit]
+Description=UAV Robot Face Tracker (Python sidecar)
+After=uav-proc-realsense.service
+Wants=uav-proc-realsense.service
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=@PROJECT_ROOT@
+Environment=PYTHONPATH=/home/ubuntu/.local/lib/python3.8/site-packages
+ExecStart=/usr/bin/python3 @PROJECT_ROOT@/tools/face_tracker.py
+Restart=on-failure
+RestartSec=3
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

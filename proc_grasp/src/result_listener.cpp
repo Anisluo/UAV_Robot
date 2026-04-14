@@ -7,6 +7,7 @@
 
 #include <fcntl.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <sys/un.h>
 #include <unistd.h>
 
@@ -50,6 +51,8 @@ bool ResultListener::open()
         fd_ = -1;
         return false;
     }
+    // Allow non-root clients (face_tracker.py runs as ubuntu) to sendto.
+    (void)::chmod(UAV_NPU_RESULT_GRASP_PATH, 0666);
 
     int flags = fcntl(fd_, F_GETFL, 0);
     if (flags >= 0) {

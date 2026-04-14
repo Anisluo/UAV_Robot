@@ -6,6 +6,7 @@
 #include <string.h>
 #include <unistd.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <sys/un.h>
 
 static int g_fd = -1;
@@ -30,6 +31,8 @@ static bool ensure_socket(void) {
         g_fd = -1;
         return false;
     }
+    /* Allow non-root clients (face_tracker.py runs as ubuntu) to sendto. */
+    (void)chmod(UAV_NPU_RESULT_APP_PATH, 0666);
 
     /* Non-blocking */
     int flags = 0;
@@ -108,6 +111,48 @@ bool npu_read_latest_grasp_pose(UavGraspMode requested_mode, NpuGraspPose *out_p
         out_pose->has_xyz = det->has_xyz != 0;
         out_pose->has_rpy = det->has_rpy != 0;
         out_pose->grasp_mode = det->grasp_mode;
+        return true;
+    }
+    return false;
+}
+
+#define UAV_FACE_CLASS_ID 100
+
+bool npu_read_latest_face(float *cx_px, float *cy_px,
+                          float *frame_w, float *frame_h) {
+    UavCResult r;
+    ssize_t n;
+    bool found = false;
+    UavCResult latest;
+
+    if (cx_px == NULL || cy_px == NULL) return false;
+    if (!ensure_socket()) return false;
+
+    /* Drain datagrams, keep last one that contains a face detection. */
+    while ((n = recv(g_fd, &r, sizeof(r), MSG_DONTWAIT)) == (ssize_t)sizeof(r)) {
+        for (uint32_t i = 0; i < r.num_detections && i < UAV_MAX_DETECTIONS; ++i) {
+            if (r.detections[i].class_id == UAV_FACE_CLASS_ID) {
+                latest = r;
+                found  = true;
+                break;
+            }
+        }
+    }
+    if (!found) return false;
+
+    /* Return the first face (largest area would be better but this is
+     * simple and adequate for a single-subject tracker). */
+    for (uint32_t i = 0; i < latest.num_detections && i < UAV_MAX_DETECTIONS; ++i) {
+        const UavDetection *d = &latest.detections[i];
+        if (d->class_id != UAV_FACE_CLASS_ID) continue;
+        *cx_px = (d->x1 + d->x2) * 0.5F;
+        *cy_px = (d->y1 + d->y2) * 0.5F;
+        /* x2/y2 gives us an upper bound on frame size when cx/cy are at
+         * the center of the image — but we can't know exact frame w/h
+         * from the detection alone. Use sensible defaults unless the
+         * caller already has them: 640x480 matches RealSense default. */
+        if (frame_w) *frame_w = 640.0F;
+        if (frame_h) *frame_h = 480.0F;
         return true;
     }
     return false;

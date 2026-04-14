@@ -27,18 +27,37 @@ GraspPipeline::GraspPipeline(ResultListener *listener, ArmClient *arm)
 const char *GraspPipeline::state_name(State s)
 {
     switch (s) {
-        case State::IDLE:         return "idle";
-        case State::CONFIRM:      return "confirm";
-        case State::PRE_APPROACH: return "pre_approach";
-        case State::GRIPPER_OPEN: return "gripper_open";
-        case State::DESCEND:      return "descend";
-        case State::GRASP:        return "grasp";
-        case State::LIFT:         return "lift";
-        case State::RETREAT:      return "retreat";
-        case State::DONE:         return "done";
-        case State::FAIL:         return "fail";
+        case State::IDLE:           return "idle";
+        case State::CONFIRM:        return "confirm";
+        case State::PRE_APPROACH:   return "pre_approach";
+        case State::GRIPPER_OPEN:   return "gripper_open";
+        case State::DESCEND:        return "descend";
+        case State::GRASP:          return "grasp";
+        case State::LIFT:           return "lift";
+        case State::PLACE_APPROACH: return "place_approach";
+        case State::PLACE_DESCEND:  return "place_descend";
+        case State::PLACE_RELEASE:  return "place_release";
+        case State::RETREAT:        return "retreat";
+        case State::DONE:           return "done";
+        case State::FAIL:           return "fail";
     }
     return "unknown";
+}
+
+void GraspPipeline::set_place_target(float x_mm, float y_mm, float z_mm,
+                                     float roll_deg, float pitch_deg, float yaw_deg)
+{
+    std::lock_guard<std::mutex> lk(mu_);
+    place_x_ = x_mm;
+    place_y_ = y_mm;
+    place_z_ = z_mm;
+    place_roll_  = roll_deg;
+    place_pitch_ = pitch_deg;
+    place_yaw_   = yaw_deg;
+    place_set_ = true;
+    std::fprintf(stderr,
+                 "proc_grasp: place target set -> (%.1f,%.1f,%.1f) rpy=(%.1f,%.1f,%.1f)\n",
+                 x_mm, y_mm, z_mm, roll_deg, pitch_deg, yaw_deg);
 }
 
 bool GraspPipeline::pick_best(const UavCResult &r, UavDetection *out) const
@@ -294,9 +313,62 @@ void GraspPipeline::tick()
                 fail("lift move failed");
                 return;
             }
-            enter(State::RETREAT);
+            // Skip place phase if no place target was set — go straight to retreat.
+            bool has_place;
+            {
+                std::lock_guard<std::mutex> lk(mu_);
+                has_place = place_set_;
+            }
+            enter(has_place ? State::PLACE_APPROACH : State::RETREAT);
             return;
         }
+
+        case State::PLACE_APPROACH: {
+            // Move to above the place target at LIFT height (keep gripper closed).
+            float px, py, pr, pp, pyw;
+            {
+                std::lock_guard<std::mutex> lk(mu_);
+                px = place_x_;
+                py = place_y_;
+                pr = place_roll_;
+                pp = place_pitch_;
+                pyw = place_yaw_;
+            }
+            if (!arm_->move_pose6d(px, py, kLiftZ, pr, pp, pyw)) {
+                fail("place_approach move failed");
+                return;
+            }
+            enter(State::PLACE_DESCEND);
+            return;
+        }
+
+        case State::PLACE_DESCEND: {
+            // Descend to place target pose.
+            float px, py, pz, pr, pp, pyw;
+            {
+                std::lock_guard<std::mutex> lk(mu_);
+                px = place_x_;
+                py = place_y_;
+                pz = place_z_;
+                pr = place_roll_;
+                pp = place_pitch_;
+                pyw = place_yaw_;
+            }
+            if (!arm_->move_pose6d(px, py, pz, pr, pp, pyw, 0.5)) {
+                fail("place_descend move failed");
+                return;
+            }
+            enter(State::PLACE_RELEASE);
+            return;
+        }
+
+        case State::PLACE_RELEASE:
+            if (!arm_->servo_gripper(kGripperOpenDeg)) {
+                fail("place release failed");
+                return;
+            }
+            enter(State::RETREAT);
+            return;
 
         case State::RETREAT: {
             if (!arm_->move_pose6d(0.0, 0.0, kRetreatZ, 180.0, 0.0, 0.0)) {

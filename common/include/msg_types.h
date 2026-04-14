@@ -12,6 +12,8 @@ typedef enum {
     CMD_START_BATTERY_PICK_6D,
     CMD_START_ARM_DEMO,
     CMD_START_ARM_HOME,
+    CMD_START_PICK_PLACE,
+    CMD_START_FACE_TRACK,
     CMD_EMERGENCY_STOP,
     CMD_RESET_FAULT,
     CMD_SHUTDOWN
@@ -23,7 +25,9 @@ typedef enum {
     TASK_BATTERY_PICK_3D,
     TASK_BATTERY_PICK_6D,
     TASK_ARM_DEMO,
-    TASK_ARM_HOME
+    TASK_ARM_HOME,
+    TASK_PICK_PLACE,        /* vision-guided pick + place via proc_grasp */
+    TASK_FACE_TRACK         /* face_tracker.py + arm J1 follow */
 } TaskType;
 
 typedef enum {

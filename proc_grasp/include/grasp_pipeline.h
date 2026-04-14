@@ -17,11 +17,11 @@
 // issued from the tick thread — OK because arm moves are a sync action
 // model anyway and proc_grasp has no other real-time obligations.
 //
-// State flow (compact version of the full 3D/6D FSM; retries/safeguards
-// can be layered on once we have real hardware footage):
+// State flow — pick AND place:
 //
 //   IDLE → CONFIRM → PRE_APPROACH → GRIPPER_OPEN → DESCEND
-//        → GRASP → LIFT → RETREAT → DONE
+//        → GRASP → LIFT → PLACE_APPROACH → PLACE_DESCEND
+//        → PLACE_RELEASE → RETREAT → DONE
 //
 // Any failure transitions to FAIL with a human-readable reason stored
 // for get_status.
@@ -35,6 +35,9 @@ public:
         DESCEND,
         GRASP,
         LIFT,
+        PLACE_APPROACH,
+        PLACE_DESCEND,
+        PLACE_RELEASE,
         RETREAT,
         DONE,
         FAIL
@@ -59,6 +62,10 @@ public:
 
     // Hand-eye setter (thread-safe).
     bool set_hand_eye(const std::array<float, 12> &m);
+
+    // Place-target setter in base frame (mm, deg). Thread-safe.
+    void set_place_target(float x_mm, float y_mm, float z_mm,
+                          float roll_deg, float pitch_deg, float yaw_deg);
 
     // Snapshot current status as a JSON object body (no outer braces
     // trimming needed — caller embeds directly).
@@ -87,6 +94,10 @@ private:
     // Committed target in base frame.
     float tgt_x_ = 0.0F, tgt_y_ = 0.0F, tgt_z_ = 0.0F;
     float tgt_roll_ = 0.0F, tgt_pitch_ = 0.0F, tgt_yaw_ = 0.0F;
+    // Place target in base frame (default = retreat pose).
+    float place_x_ = 0.0F, place_y_ = 0.0F, place_z_ = 280.0F;
+    float place_roll_ = 180.0F, place_pitch_ = 0.0F, place_yaw_ = 0.0F;
+    bool  place_set_ = false;
     HandEye hand_eye_;
 
     // Counters / telemetry
