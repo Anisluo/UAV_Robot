@@ -216,6 +216,17 @@ JSON-RPC 为按行分隔的文本协议，每条请求和响应都以 `\n` 结�
 {"id":12,"method":"npu.set_strategy","strategy_id":0}
 ```
 
+支持的 `strategy_id`：
+
+| id | 名称 | 模型 / 实现 | 说明 |
+|----|------|-------------|------|
+| 0  | default          | `default.rknn`       | 方形电池检测（RKNN） |
+| 1  | battery_v2       | `battery_v2.rknn`    | 电池 V2（RKNN） |
+| 2  | custom           | `custom.rknn`        | 自定义占位（RKNN） |
+| 3  | face             | `face_tracker.py`    | 人脸追踪（Python 旁路） |
+| 4  | battery_cv       | `battery_tracker.py` | 御三电池识别（Python 旁路） |
+| 5  | mavic3_drone     | `mavic3_drone.rknn`  | 御三无人机机身识别（RKNN，单类） |
+
 ### `npu.set_threshold`
 
 ```json

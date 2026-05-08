@@ -23,6 +23,11 @@ struct RawDet {
 // Supported RKNN model formats (auto-detected from n_outputs):
 //   • 3 outputs: [1, 64+nc, 80,80] [1,64+nc,40,40] [1,64+nc,20,20]
 //     (Rockchip model-zoo / export_onnx.py split-head format, recommended)
+//   • 9 outputs: per-stride (dfl, cls, score_sum) triplets
+//       out[0,3,6]: [1,64,H,W]  DFL box regression
+//       out[1,4,7]: [1,nc,H,W]  per-class scores
+//       out[2,5,8]: [1, 1,H,W]  score-sum (ignored — used by kaylorchen for fast filter)
+//     (kaylorchen/rk3588-yolo-demo export convention)
 //   • 1 output:  [1, 4+nc, 8400]
 //     (standard ultralytics onnx → rknn, no head split)
 // ─────────────────────────────────────────────────────────────────────────────
@@ -57,6 +62,13 @@ private:
                        float score_thr,
                        const TensorInput &input,
                        std::vector<RawDet> &out) const;
+
+    // Decode one stride of the 9-output format (DFL and class scores in separate tensors).
+    void decode_head_split(const float *dfl_data, const float *cls_data,
+                           int grid_h, int grid_w,
+                           int stride, int nc, float score_thr,
+                           const TensorInput &input,
+                           std::vector<RawDet> &out) const;
 
     bool     loaded_   = false;
     void    *ctx_      = nullptr;   // rknn_context (void* avoids including rknn_api.h here)

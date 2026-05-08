@@ -76,6 +76,13 @@ bool NpuInfer::load_model(const std::string &model_path)
     if (n_outputs_ == 3) {
         // Split-head format: [1, 64+nc, H, W] → nc = dims[1] - 64
         nc_ = static_cast<int>(out_attr.dims[1]) - DFL_BINS * 4;
+    } else if (n_outputs_ == 9) {
+        // kaylorchen 9-output: out[1] is the first class tensor [1, nc, H, W]
+        rknn_tensor_attr cls_attr{};
+        cls_attr.index = 1;
+        RKNN_CHECK(rknn_query(ctx, RKNN_QUERY_OUTPUT_ATTR,
+                              &cls_attr, sizeof(cls_attr)), false);
+        nc_ = static_cast<int>(cls_attr.dims[1]);
     } else {
         // Single output: [1, 4+nc, 8400] → nc = dims[1] - 4
         nc_ = static_cast<int>(out_attr.dims[1]) - 4;
@@ -150,6 +157,21 @@ bool NpuInfer::infer(const TensorInput &input, std::vector<RawDet> &dets) const
             decode_head(static_cast<const float *>(outputs[i].buf),
                         C, H, W, STRIDES[i], nc_,
                         SCORE_PRE_THR, input, dets);
+        }
+    } else if (n_outputs_ == 9) {
+        // ── 9-output split-per-stride (kaylorchen format) ─────────────
+        //   stride i ∈ {0,1,2} → out[i*3+0]=DFL, out[i*3+1]=cls, out[i*3+2]=score_sum (skip)
+        static const int STRIDES[3] = {8, 16, 32};
+        for (uint32_t i = 0; i < 3; ++i) {
+            rknn_tensor_attr dfl_attr{};
+            dfl_attr.index = i * 3 + 0;
+            rknn_query(ctx, RKNN_QUERY_OUTPUT_ATTR, &dfl_attr, sizeof(dfl_attr));
+            const int H = static_cast<int>(dfl_attr.dims[2]);
+            const int W = static_cast<int>(dfl_attr.dims[3]);
+            decode_head_split(static_cast<const float *>(outputs[i * 3 + 0].buf),
+                              static_cast<const float *>(outputs[i * 3 + 1].buf),
+                              H, W, STRIDES[i], nc_,
+                              SCORE_PRE_THR, input, dets);
         }
     } else {
         // ── 1-output format [1, 4+nc, 8400] ──────────────────────────
@@ -240,6 +262,71 @@ void NpuInfer::decode_head(const float *data,
             const float iy2 = (my2 - input.lb_pad_y) / input.lb_scale;
 
             // Clamp to image bounds
+            const float iw = static_cast<float>(input.orig_width  - 1);
+            const float ih = static_cast<float>(input.orig_height - 1);
+            RawDet d;
+            d.class_id = best_cls;
+            d.score    = best_score;
+            d.x1 = std::max(0.f, std::min(ix1, iw));
+            d.y1 = std::max(0.f, std::min(iy1, ih));
+            d.x2 = std::max(0.f, std::min(ix2, iw));
+            d.y2 = std::max(0.f, std::min(iy2, ih));
+            out.push_back(d);
+        }
+    }
+}
+
+// ─── decode_head_split (9-output format: DFL and cls in separate tensors) ───
+
+void NpuInfer::decode_head_split(const float *dfl_data, const float *cls_data,
+                                  int grid_h, int grid_w,
+                                  int stride, int nc, float score_thr,
+                                  const TensorInput &input,
+                                  std::vector<RawDet> &out) const
+{
+    // Layouts (NCHW):
+    //   dfl_data: [1, 64, grid_h, grid_w]   4 * DFL_BINS channels
+    //   cls_data: [1, nc, grid_h, grid_w]
+    // Class scores are raw logits — apply sigmoid.
+    const int hw = grid_h * grid_w;
+
+    for (int h = 0; h < grid_h; ++h) {
+        for (int w = 0; w < grid_w; ++w) {
+            const int pos = h * grid_w + w;
+
+            int best_cls = 0;
+            float best_score = -1e9f;
+            for (int c = 0; c < nc; ++c) {
+                float s = sigmoid(cls_data[c * hw + pos]);
+                if (s > best_score) { best_score = s; best_cls = c; }
+            }
+            if (best_score < score_thr) continue;
+
+            float reg[4];
+            for (int k = 0; k < 4; ++k) {
+                float bins_buf[DFL_BINS];
+                for (int b = 0; b < DFL_BINS; ++b) {
+                    const int ch = k * DFL_BINS + b;
+                    bins_buf[b] = dfl_data[ch * hw + pos];
+                }
+                reg[k] = dfl_integral(bins_buf, DFL_BINS);
+            }
+
+            const float anchor_x = (static_cast<float>(w) + 0.5f)
+                                    * static_cast<float>(stride);
+            const float anchor_y = (static_cast<float>(h) + 0.5f)
+                                    * static_cast<float>(stride);
+
+            const float mx1 = anchor_x - reg[0] * static_cast<float>(stride);
+            const float my1 = anchor_y - reg[1] * static_cast<float>(stride);
+            const float mx2 = anchor_x + reg[2] * static_cast<float>(stride);
+            const float my2 = anchor_y + reg[3] * static_cast<float>(stride);
+
+            const float ix1 = (mx1 - input.lb_pad_x) / input.lb_scale;
+            const float iy1 = (my1 - input.lb_pad_y) / input.lb_scale;
+            const float ix2 = (mx2 - input.lb_pad_x) / input.lb_scale;
+            const float iy2 = (my2 - input.lb_pad_y) / input.lb_scale;
+
             const float iw = static_cast<float>(input.orig_width  - 1);
             const float ih = static_cast<float>(input.orig_height - 1);
             RawDet d;

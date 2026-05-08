@@ -24,12 +24,13 @@ constexpr const char *kBatteryTriggerFlag = "/tmp/uav_battery_tracker_enabled";
 
 const char *strategy_model_name(int32_t id) {
     switch (id) {
-        case UAV_STRATEGY_BATTERY_V2: return "battery_v2.rknn";
-        case UAV_STRATEGY_CUSTOM:     return "custom.rknn";
-        case UAV_STRATEGY_FACE:       return "";  // handled by face_tracker.py
-        case UAV_STRATEGY_BATTERY_CV: return "";  // handled by battery_tracker.py
+        case UAV_STRATEGY_BATTERY_V2:   return "battery_v2.rknn";
+        case UAV_STRATEGY_CUSTOM:       return "custom.rknn";
+        case UAV_STRATEGY_FACE:         return "";  // handled by face_tracker.py
+        case UAV_STRATEGY_BATTERY_CV:   return "";  // handled by battery_tracker.py
+        case UAV_STRATEGY_MAVIC3_DRONE: return "mavic3_drone.rknn";
         case UAV_STRATEGY_DEFAULT:
-        default:                      return "default.rknn";
+        default:                        return "default.rknn";
     }
 }
 
