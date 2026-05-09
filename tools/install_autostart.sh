@@ -117,6 +117,14 @@ else
     echo "Keeping existing environment file: ${ENV_DST_FILE}"
 fi
 
+# ── Wipe stale build artifacts before rebuild ────────────────────────────
+# Cross-arch leftovers (e.g. x86 .o files copied from a dev machine) cause
+# linker errors like "Relocations in generic ELF (EM: 62)". Always start
+# from a clean slate so the build target's compiler emits everything fresh.
+echo "Cleaning stale build artifacts ..."
+find "${PROJECT_ROOT}" -type d -name build -exec rm -rf {} + 2>/dev/null || true
+find "${PROJECT_ROOT}" -name "*.o" -delete 2>/dev/null || true
+
 for raw_service in "${REQUESTED_SERVICES[@]}"; do
     service=$(normalize_service_name "${raw_service}")
     echo "Building ${service} ..."

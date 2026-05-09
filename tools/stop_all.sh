@@ -86,14 +86,40 @@ systemctl reset-failed "${UNITS[@]}" 2>/dev/null || true
 
 # ── 2. kill any leftover processes (multiple passes) ───────────────────────
 echo "[2/5] Killing leftover processes ..."
+
+# Pass 2a: polite TERM via pkill -f (full command line match).
 for pat in "${PROCESS_PATTERNS[@]}"; do
-    # First a polite TERM, then a forced KILL on the same set.
     pkill -TERM -f "${pat}" 2>/dev/null || true
 done
 sleep 1
+
+# Pass 2b: forced KILL via pkill -f.
 for pat in "${PROCESS_PATTERNS[@]}"; do
     pkill -9 -f "${pat}" 2>/dev/null || true
 done
+
+# Pass 2c: cgroup-based kill via systemd. Catches processes pkill missed
+# because they were started outside the systemd unit's expected pattern
+# but are still tracked in the unit's cgroup.
+for unit in "${UNITS[@]}"; do
+    systemctl kill -s SIGKILL "${unit}" 2>/dev/null || true
+done
+
+# Pass 2d: brute-force ps + kill -9 by binary path. Catches stragglers
+# whose argv0 doesn't match pkill's pattern (e.g. wrapped under bash -c
+# or daemonized at boot outside systemd's view, like the long-running
+# processes that pkill -f sometimes can't reach).
+mapfile -t straggler_pids < <(
+    ps -eo pid,cmd --no-headers 2>/dev/null \
+      | grep -E "uav_robotd|/build/bin/proc_(realsense|npu|gateway|grasp|arm|car|gripper|airport)" \
+      | grep -v grep \
+      | awk '{print $1}'
+)
+if (( ${#straggler_pids[@]} > 0 )); then
+    echo "        kill -9 stragglers: ${straggler_pids[*]}"
+    kill -9 "${straggler_pids[@]}" 2>/dev/null || true
+fi
+sleep 1
 
 # ── 3. remove stale IPC files ─────────────────────────────────────────────
 echo "[3/5] Removing stale IPC sockets ..."
