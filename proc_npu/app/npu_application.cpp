@@ -73,9 +73,16 @@ int NpuApplication::run() {
     std::string pending_model;
 
     ShmReader reader;
-    if (!reader.open_existing(UAV_SHM_RING_NAME)) {
+    std::atomic<bool> shm_attached{reader.open_existing(UAV_SHM_RING_NAME)};
+    if (!shm_attached.load()) {
+        // proc_realsense may not have created the shm ring yet (camera
+        // unplugged at boot). Don't die — keep the ctrl server up so
+        // HostGUI can still set strategy / start / stop. The ingest
+        // thread retries the attach in the background.
+        std::fprintf(stderr,
+                     "proc_npu: shm ring not available yet, will retry "
+                     "in background\n");
         print_status(UAV_PROC_STATE_ERROR, -20);
-        return 1;
     }
 
     CtrlServer ctrl;
@@ -165,7 +172,25 @@ int NpuApplication::run() {
     NpuPipeline pipeline(&infer, &publisher);
 
     std::thread ingest([&]() {
+        auto last_attach_try = std::chrono::steady_clock::now();
+        constexpr auto kAttachRetryPeriod = std::chrono::seconds(2);
         while (running.load()) {
+            if (!shm_attached.load()) {
+                // proc_realsense not up yet — retry attaching every 2s
+                // without spinning. HostGUI ctrl path keeps working.
+                auto now = std::chrono::steady_clock::now();
+                if (now - last_attach_try >= kAttachRetryPeriod) {
+                    last_attach_try = now;
+                    if (reader.open_existing(UAV_SHM_RING_NAME)) {
+                        shm_attached.store(true);
+                        std::fprintf(stderr,
+                                     "proc_npu: shm ring attached\n");
+                        print_status(UAV_PROC_STATE_RUNNING, 0);
+                    }
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                continue;
+            }
             InferenceFrame frame{};
             if (!reader.wait_and_read(frame, 100)) {
                 continue;

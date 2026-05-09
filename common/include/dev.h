@@ -29,6 +29,13 @@ void arm_set_move_rpm(int rpm);
 void arm_set_zero_rpm(int rpm);
 int  arm_get_move_rpm(void);
 int  arm_get_zero_rpm(void);
+/* Joint-output-side speed (deg/s).  proc_arm converts this into a
+ * per-joint motor RPM via each joint's gear ratio at command time, so a
+ * single value yields the same end-effector speed across all joints. */
+void   arm_set_joint_dps(double dps);
+void   arm_set_zero_dps(double dps);
+double arm_get_joint_dps(void);
+double arm_get_zero_dps(void);
 /* Read real encoder positions from motors via CAN (ZDT cmd 0x33).
  * Fills angles[6] in degrees.  Returns number of joints that responded. */
 int  arm_read_motor_angles(double angles[6]);

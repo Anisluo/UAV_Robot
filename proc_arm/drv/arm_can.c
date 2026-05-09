@@ -27,6 +27,12 @@
 
 #define ARM_JOINT_COUNT 6U
 #define ARM_DEFAULT_RPM 300U
+/* Default joint-output speed in deg/s.  When dps mode is active this is
+ * what every joint ends up running at, independent of gear ratio.  60°/s
+ * gives J1 (ratio 25) ≈ 250 motor RPM and J6 (ratio 1) ≈ 10 motor RPM —
+ * comfortable across the whole arm. */
+#define ARM_DEFAULT_JOINT_DPS 60.0
+#define ARM_ZERO_DPS_DEFAULT 5.0
 #define ARM_DEFAULT_ACC 20U
 /* home_mode byte in 0x9A trigger-home command (ZDT step motor protocol):
  *   0 = single-side limit-switch homing
@@ -85,6 +91,11 @@ typedef struct {
     double target_deg[ARM_JOINT_COUNT];
 } ArmPostHomeTargets;
 
+/* Forward declaration: arm_joint_config is defined later but is consulted
+ * earlier by the speed-resolution helpers (zero/move) to look up the
+ * joint's gear ratio. */
+static ArmJointConfig arm_joint_config(size_t joint_index);
+
 static int g_arm_can_fd = -1;
 static char g_arm_can_iface[IF_NAMESIZE] = ARM_CAN_DEFAULT_IFACE;
 
@@ -94,6 +105,14 @@ static char g_arm_can_iface[IF_NAMESIZE] = ARM_CAN_DEFAULT_IFACE;
  * arm.set_speeds RPC whenever the user edits the speed fields. */
 static int g_arm_move_rpm_override = 0;
 static int g_arm_zero_rpm_override = 0;
+
+/* Joint-output-side speed override in degrees/second. Unlike move_rpm
+ * (motor side), this value is uniform across all joints — proc_arm
+ * converts it to a per-joint motor RPM using each joint's gear ratio at
+ * command time. Zero means "no dps override; use motor-rpm path".
+ * Setting joint_dps takes priority over move_rpm. */
+static double g_arm_joint_dps_override = 0.0;
+static double g_arm_zero_dps_override = 0.0;
 
 /* Emergency-stop signaling. The atomic flag can be set from any thread (e.g.
  * proc_arm's watchdog) to interrupt blocking arm_wait_response calls. The
@@ -201,30 +220,96 @@ static double arm_deg_clamp(double value, double min_deg, double max_deg) {
     return value;
 }
 
-static uint16_t arm_get_command_rpm(void) {
+/* Resolve the joint-output speed (deg/s) we should currently honor.
+ * 0 means dps mode is inactive — caller falls back to motor-RPM path. */
+static double arm_get_active_joint_dps(void) {
+    if (g_arm_joint_dps_override > 0.0) {
+        return g_arm_joint_dps_override;
+    }
+    const char *env = getenv("UAV_ARM_JOINT_DPS");
+    if (env != NULL && env[0] != '\0') {
+        double v = atof(env);
+        if (v > 0.0) return v;
+    }
+    /* dps mode is the new default. Returning the compiled default makes
+     * it apply uniformly even without env or HostGUI input. */
+    return ARM_DEFAULT_JOINT_DPS;
+}
+
+/* Convert a joint-output-side speed (deg/s) into the per-joint motor RPM
+ * the ZDT firmware expects, using that joint's gear ratio. */
+static uint16_t arm_motor_rpm_from_dps(double dps, double ratio) {
+    if (ratio <= 0.0) ratio = 1.0;
+    double motor_rpm = dps * ratio / 6.0;  /* dps * ratio * 60s/m / 360deg */
+    if (motor_rpm < 1.0) motor_rpm = 1.0;
+    if (motor_rpm > 3000.0) motor_rpm = 3000.0;
+    return (uint16_t)motor_rpm;
+}
+
+/* Per-joint motor RPM resolution. Order:
+ *   1. dps override / env / default  -> compute from ratio
+ *   2. legacy move_rpm override / env -> uniform motor RPM
+ *
+ * The legacy path is kept so older HostGUI builds (or scripts that send
+ * arm.set_speeds with move_rpm only) continue to work. */
+static uint16_t arm_get_command_rpm_for_ratio(double ratio) {
+    double dps = arm_get_active_joint_dps();
+    if (dps > 0.0) {
+        return arm_motor_rpm_from_dps(dps, ratio);
+    }
     int rpm;
     if (g_arm_move_rpm_override > 0) {
         rpm = g_arm_move_rpm_override;
     } else {
         rpm = arm_getenv_int("UAV_ARM_RPM", ARM_DEFAULT_RPM);
     }
-    if (rpm < 1) {
-        rpm = 1;
-    }
-    if (rpm > 3000) {
-        rpm = 3000;
-    }
+    if (rpm < 1) rpm = 1;
+    if (rpm > 3000) rpm = 3000;
     return (uint16_t)rpm;
 }
 
 void arm_set_move_rpm(int rpm) {
     g_arm_move_rpm_override = (rpm > 0) ? rpm : 0;
+    /* User explicitly chose motor-side RPM — disable dps mode so the
+     * legacy value isn't silently shadowed. */
+    if (rpm > 0) {
+        g_arm_joint_dps_override = 0.0;
+    }
     log_info("core.dev.arm", "arm_set_move_rpm -> %d", g_arm_move_rpm_override);
 }
 
 void arm_set_zero_rpm(int rpm) {
     g_arm_zero_rpm_override = (rpm > 0) ? rpm : 0;
+    if (rpm > 0) {
+        g_arm_zero_dps_override = 0.0;
+    }
     log_info("core.dev.arm", "arm_set_zero_rpm -> %d", g_arm_zero_rpm_override);
+}
+
+void arm_set_joint_dps(double dps) {
+    g_arm_joint_dps_override = (dps > 0.0) ? dps : 0.0;
+    log_info("core.dev.arm", "arm_set_joint_dps -> %.2f", g_arm_joint_dps_override);
+}
+
+void arm_set_zero_dps(double dps) {
+    g_arm_zero_dps_override = (dps > 0.0) ? dps : 0.0;
+    log_info("core.dev.arm", "arm_set_zero_dps -> %.2f", g_arm_zero_dps_override);
+}
+
+double arm_get_joint_dps(void) {
+    return arm_get_active_joint_dps();
+}
+
+double arm_get_zero_dps(void) {
+    if (g_arm_zero_dps_override > 0.0) {
+        return g_arm_zero_dps_override;
+    }
+    const char *env = getenv("UAV_ARM_ZERO_DPS");
+    if (env != NULL && env[0] != '\0') {
+        double v = atof(env);
+        if (v > 0.0) return v;
+    }
+    return ARM_ZERO_DPS_DEFAULT;
 }
 
 int arm_get_move_rpm(void) {
@@ -311,9 +396,26 @@ static ZdtArmZeroParams arm_get_zero_params_for_joint(uint8_t addr) {
 
     params.zero_mode = (uint8_t)arm_getenv_int("UAV_ARM_ZERO_MODE", ARM_ZERO_MODE_DEFAULT);
     params.zero_direction = arm_get_zero_direction_for_joint(addr);
-    /* Honor a runtime override (set via arm_set_zero_rpm) before falling
-     * back to the env var or compiled default. */
-    if (g_arm_zero_rpm_override > 0) {
+    /* Speed resolution mirrors the move-command path:
+     *   1. dps override -> per-joint motor RPM via gear ratio
+     *   2. legacy zero_rpm override / env -> uniform motor RPM */
+    double zero_dps = 0.0;
+    if (g_arm_zero_dps_override > 0.0) {
+        zero_dps = g_arm_zero_dps_override;
+    } else {
+        const char *env = getenv("UAV_ARM_ZERO_DPS");
+        if (env != NULL && env[0] != '\0') {
+            zero_dps = atof(env);
+        }
+        if (zero_dps <= 0.0 && g_arm_zero_rpm_override <= 0
+            && getenv("UAV_ARM_ZERO_SPEED_RPM") == NULL) {
+            zero_dps = ARM_ZERO_DPS_DEFAULT;
+        }
+    }
+    if (zero_dps > 0.0 && addr >= 1U && addr <= ARM_JOINT_COUNT) {
+        const ArmJointConfig cfg = arm_joint_config((size_t)(addr - 1U));
+        params.zero_speed_rpm = arm_motor_rpm_from_dps(zero_dps, cfg.ratio);
+    } else if (g_arm_zero_rpm_override > 0) {
         params.zero_speed_rpm = (uint16_t)g_arm_zero_rpm_override;
     } else {
         params.zero_speed_rpm = (uint16_t)arm_getenv_int("UAV_ARM_ZERO_SPEED_RPM", ARM_ZERO_SPEED_DEFAULT_RPM);
@@ -756,7 +858,7 @@ static bool arm_plan_joint_position(uint8_t addr,
 
     return proto_zdt_arm_encode_position(addr,
                                          ccw,
-                                         arm_get_command_rpm(),
+                                         arm_get_command_rpm_for_ratio(ratio),
                                          arm_get_command_acc(),
                                          (uint32_t)signed_pulses,
                                          true,

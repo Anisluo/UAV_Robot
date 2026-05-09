@@ -267,3 +267,33 @@ int arm_get_zero_rpm(void) {
     }
     return 30;
 }
+
+void arm_set_joint_dps(double dps) {
+    char params[64];
+    snprintf(params, sizeof(params), "{\"joint_dps\":%.2f}", dps);
+    (void)arm_proxy_call("arm.set_speeds", params, NULL, 0);
+}
+
+void arm_set_zero_dps(double dps) {
+    char params[64];
+    snprintf(params, sizeof(params), "{\"zero_dps\":%.2f}", dps);
+    (void)arm_proxy_call("arm.set_speeds", params, NULL, 0);
+}
+
+double arm_get_joint_dps(void) {
+    /* uav_robotd never reads this back today; surface the env default
+     * so callers get something sensible without a round-trip. */
+    const char *e = getenv("UAV_ARM_JOINT_DPS");
+    if (e != NULL && e[0] != '\0') {
+        return atof(e);
+    }
+    return 60.0;
+}
+
+double arm_get_zero_dps(void) {
+    const char *e = getenv("UAV_ARM_ZERO_DPS");
+    if (e != NULL && e[0] != '\0') {
+        return atof(e);
+    }
+    return 5.0;
+}

@@ -77,10 +77,22 @@ int RealsenseApplication::run() {
         return 1;
     }
     capture.set_profile(cfg_w.load(), cfg_h.load(), cfg_fps.load());
-    if (!capture.start()) {
+
+    // Camera may be physically absent at boot. We deliberately do NOT exit
+    // here — the shm ring is already created above, so downstream proc_npu
+    // / proc_gateway can still attach. We keep the ctrl server alive and
+    // retry capture.start() in the main loop. This prevents systemd from
+    // restarting us in a tight loop, which would otherwise tear down the
+    // notify socket that proc_npu has bound to.
+    bool camera_ready = capture.start();
+    if (!camera_ready) {
+        std::fprintf(stderr,
+                     "proc_realsense: camera not available at startup, "
+                     "will keep retrying in background\n");
         print_status(UAV_PROC_STATE_ERROR, -11);
-        return 1;
     }
+    auto last_camera_retry = std::chrono::steady_clock::now();
+    constexpr auto kCameraRetryPeriod = std::chrono::seconds(3);
 
     ctrl.start(UAV_CTRL_PATH_B, [&](int /*id*/, const std::string &method,
                                     const std::string &params) -> std::string {
@@ -136,10 +148,29 @@ int RealsenseApplication::run() {
         return "{\"ok\":false,\"error\":\"unknown method\"}";
     });
 
-    print_status(UAV_PROC_STATE_RUNNING, 0);
+    if (camera_ready) {
+        print_status(UAV_PROC_STATE_RUNNING, 0);
+    }
     while (running.load()) {
         ctrl.poll_once(1);
-        if (!capture_enabled.load()) {
+
+        // Background retry: if the camera isn't open yet (or got stopped by
+        // a profile change that errored out), try to bring it up periodically
+        // without blocking ctrl RPCs. This lets HostGUI keep talking to
+        // proc_realsense even with no physical camera attached.
+        if (!camera_ready && capture_enabled.load()) {
+            auto now = std::chrono::steady_clock::now();
+            if (now - last_camera_retry >= kCameraRetryPeriod) {
+                last_camera_retry = now;
+                if (capture.start()) {
+                    camera_ready = true;
+                    std::fprintf(stderr, "proc_realsense: camera came online\n");
+                    print_status(UAV_PROC_STATE_RUNNING, 0);
+                }
+            }
+        }
+
+        if (!capture_enabled.load() || !camera_ready) {
             std::this_thread::sleep_for(std::chrono::milliseconds(20));
             UavBHeartbeat heartbeat{};
             pipeline.emit_idle_heartbeat(now_ns(), &heartbeat);
@@ -151,7 +182,13 @@ int RealsenseApplication::run() {
 
         CaptureFrame frame{};
         if (!capture.snapshot(frame)) {
+            // Camera disappeared mid-run (USB unplug, sensor fault).
+            // Mark it not-ready and let the retry loop above try to recover
+            // instead of dying — keeps shm and ctrl alive for downstream.
             print_status(UAV_PROC_STATE_ERROR, -12);
+            capture.stop();
+            camera_ready = false;
+            last_camera_retry = std::chrono::steady_clock::now();
             std::this_thread::sleep_for(std::chrono::milliseconds(100));
             continue;
         }

@@ -573,27 +573,45 @@ std::string handle_jsonrpc_request(const char *line) {
         return bool_result(id_fragment, controller.setFreeMode(enable));
     }
     if (std::strcmp(method, "arm.set_speeds") == 0) {
+        // Two speed conventions are accepted:
+        //   joint_dps / zero_dps: joint-output deg/s (uniform across joints,
+        //     converted to per-joint motor RPM via gear ratio at command time)
+        //   move_rpm / zero_rpm:  legacy motor-side RPM (uniform RPM, makes
+        //     low-ratio joints spin much faster than high-ratio ones)
+        // dps takes priority when both are sent in the same call.
         int move_rpm = 0;
         int zero_rpm = 0;
-        const bool has_move = json_get_int(line, "move_rpm", &move_rpm);
-        const bool has_zero = json_get_int(line, "zero_rpm", &zero_rpm);
-        if (has_move) {
+        double joint_dps = 0.0;
+        double zero_dps = 0.0;
+        const bool has_move      = json_get_int(line, "move_rpm",  &move_rpm);
+        const bool has_zero      = json_get_int(line, "zero_rpm",  &zero_rpm);
+        const bool has_joint_dps = json_get_double(line, "joint_dps", &joint_dps);
+        const bool has_zero_dps  = json_get_double(line, "zero_dps",  &zero_dps);
+        if (has_joint_dps) {
+            arm_set_joint_dps(joint_dps);
+        } else if (has_move) {
             arm_set_move_rpm(move_rpm);
         }
-        if (has_zero) {
+        if (has_zero_dps) {
+            arm_set_zero_dps(zero_dps);
+        } else if (has_zero) {
             arm_set_zero_rpm(zero_rpm);
         }
-        char payload[128];
+        char payload[192];
         std::snprintf(payload, sizeof(payload),
-                      "{\"ok\":true,\"move_rpm\":%d,\"zero_rpm\":%d}",
-                      arm_get_move_rpm(), arm_get_zero_rpm());
+                      "{\"ok\":true,\"joint_dps\":%.2f,\"zero_dps\":%.2f,"
+                      "\"move_rpm\":%d,\"zero_rpm\":%d}",
+                      arm_get_joint_dps(), arm_get_zero_dps(),
+                      arm_get_move_rpm(),  arm_get_zero_rpm());
         return make_result(id_fragment, payload);
     }
     if (std::strcmp(method, "arm.get_speeds") == 0) {
-        char payload[128];
+        char payload[192];
         std::snprintf(payload, sizeof(payload),
-                      "{\"ok\":true,\"move_rpm\":%d,\"zero_rpm\":%d}",
-                      arm_get_move_rpm(), arm_get_zero_rpm());
+                      "{\"ok\":true,\"joint_dps\":%.2f,\"zero_dps\":%.2f,"
+                      "\"move_rpm\":%d,\"zero_rpm\":%d}",
+                      arm_get_joint_dps(), arm_get_zero_dps(),
+                      arm_get_move_rpm(),  arm_get_zero_rpm());
         return make_result(id_fragment, payload);
     }
     if (std::strcmp(method, "arm.move_pose") == 0) {
