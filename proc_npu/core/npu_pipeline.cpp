@@ -6,6 +6,16 @@
 
 namespace {
 void print_result(const UavCResult &result) {
+    // Per-frame trace — only emitted when explicitly enabled. journald
+    // can keep up at this rate (5 fps, 30 chars/line) but the cleanup
+    // pass treats every per-iteration printf the same way so the
+    // process can be left running for hours without filling the
+    // journal. Set UAV_NPU_TRACE=1 to re-enable for diagnostics.
+    static const bool s_trace = []() {
+        const char *e = std::getenv("UAV_NPU_TRACE");
+        return e != nullptr && e[0] != '\0' && e[0] != '0';
+    }();
+    if (!s_trace) return;
     std::printf("C_RESULT frame=%llu det=%u\n",
                 static_cast<unsigned long long>(result.frame_id),
                 result.num_detections);

@@ -372,10 +372,16 @@ def main():
                                angles_deg=angles)
         _publish(payload)
 
+        # Heartbeat log throttled to 5 s; faster cadence offers no
+        # diagnostic value once the tracker is known to be healthy and
+        # adds noise that journald has to flush. Enable BATTERY_TRACE=1
+        # to bring back the per-second cadence for debugging.
         if not hasattr(main, "_last_log_t"):
             main._last_log_t = 0.0
+            main._verbose = bool(os.environ.get("BATTERY_TRACE"))
         now = time.time()
-        if now - main._last_log_t > 1.0:
+        log_interval = 1.0 if main._verbose else 5.0
+        if now - main._last_log_t > log_interval:
             n = len(boxes)
             best = f" best_score={boxes[0][4]:.2f}" if boxes else ""
             print(f"[battery_tracker] fid={frame_id} n={n}{best} "

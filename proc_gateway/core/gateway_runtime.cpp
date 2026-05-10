@@ -2332,26 +2332,76 @@ int run_gateway_runtime() {
 
         // ── Read latest frame from shm → encode → push to video clients ──────
         if (video_stream_enabled && shm.is_open() && shm.read_latest(frame) && !vid_clients.empty()) {
+            // Runtime knobs for HostGUI display fps tuning. Detection
+            // still uses the full-resolution shm frame; only the JPEG
+            // we ship over :7002 is shrunk / lower-quality, so visual
+            // quality drops independently of detector accuracy.
+            //   UAV_GATEWAY_JPEG_QUALITY  (10..95, default 80)
+            //   UAV_GATEWAY_VIDEO_SCALE   (1, 2, or 4 — divide W&H by N,
+            //                              default 1 = native resolution)
+            static const int s_jpeg_quality = []() {
+                const char *e = std::getenv("UAV_GATEWAY_JPEG_QUALITY");
+                if (!e || !*e) return 80;
+                int v = std::atoi(e);
+                return (v >= 10 && v <= 95) ? v : 80;
+            }();
+            static const int s_video_scale = []() {
+                const char *e = std::getenv("UAV_GATEWAY_VIDEO_SCALE");
+                if (!e || !*e) return 1;
+                int v = std::atoi(e);
+                return (v == 2 || v == 4) ? v : 1;
+            }();
+
             std::vector<uint8_t> jpeg;
             const int src = g_video_source.load();
+            const uint8_t *src_bgr;
+            uint32_t enc_w, enc_h, enc_stride;
+            static thread_local std::vector<uint8_t> depth_bgr;
+            static thread_local std::vector<uint8_t> scaled_bgr;
             if (src == VIDEO_SRC_DEPTH && !frame.depth.empty()
                 && frame.depth_scale > 0.0F) {
                 // Colorize depth → BGR, then JPEG-encode via the same path
                 // as the RGB stream so :7002 frame format stays uniform.
-                static thread_local std::vector<uint8_t> depth_bgr;
                 colorize_depth(frame.depth.data(),
                                frame.width, frame.height,
                                frame.depth_scale, depth_bgr);
-                jpeg = encoder.encode(depth_bgr.data(),
-                                      frame.width, frame.height,
-                                      frame.width * 3U);
+                src_bgr = depth_bgr.data();
+                enc_w = frame.width;
+                enc_h = frame.height;
+                enc_stride = frame.width * 3U;
             } else {
                 // Default / fallback: colour frame. Also used when the
                 // user selected DEPTH but the current slot doesn't carry
                 // a depth buffer (source ran without depth enabled).
-                jpeg = encoder.encode(
-                    frame.color.data(), frame.width, frame.height, frame.stride);
+                src_bgr = frame.color.data();
+                enc_w = frame.width;
+                enc_h = frame.height;
+                enc_stride = frame.stride;
             }
+
+            if (s_video_scale > 1) {
+                // Cheap nearest-neighbour downscale — faster than libjpeg
+                // resize and good enough for viewing. Detector path is
+                // untouched; this only shrinks the JPEG that goes out.
+                const uint32_t out_w = enc_w / s_video_scale;
+                const uint32_t out_h = enc_h / s_video_scale;
+                scaled_bgr.resize(out_w * out_h * 3U);
+                for (uint32_t y = 0; y < out_h; ++y) {
+                    const uint8_t *src_row = src_bgr + y * s_video_scale * enc_stride;
+                    uint8_t *dst_row = scaled_bgr.data() + y * out_w * 3U;
+                    for (uint32_t x = 0; x < out_w; ++x) {
+                        const uint8_t *p = src_row + x * s_video_scale * 3U;
+                        dst_row[x * 3U + 0] = p[0];
+                        dst_row[x * 3U + 1] = p[1];
+                        dst_row[x * 3U + 2] = p[2];
+                    }
+                }
+                src_bgr = scaled_bgr.data();
+                enc_w = out_w;
+                enc_h = out_h;
+                enc_stride = out_w * 3U;
+            }
+            jpeg = encoder.encode(src_bgr, enc_w, enc_h, enc_stride, s_jpeg_quality);
             if (!jpeg.empty()) {
                 std::vector<int> dead_vid;
                 for (int vfd : vid_clients) {
