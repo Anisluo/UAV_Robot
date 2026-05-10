@@ -179,6 +179,53 @@ def _dark_threshold(v_channel: np.ndarray, percentile: float = 12.0,
     return max(20, min(hard_ceiling, p + 5))
 
 
+def _find_workspace_bbox(hsv: np.ndarray):
+    """Locate the dominant white work-surface (foam plate / desk) and
+    return its bounding rect (x, y, w, h), or None if no plate is
+    confidently visible in the frame.
+
+    Used to anchor the dark-mask search when the operator puts the
+    battery on a clear plate against a noisy background (boxes /
+    cables creep in from the top of the frame and otherwise bridge
+    into the battery silhouette through morphological closing).
+
+    Confidence checks (all must hold) keep this from firing on
+    arbitrary close-up shots where there is no plate in scene:
+      - largest plate-coloured component covers ≥ 25 % of the frame
+      - its bbox sits inside the inner 80 % of the frame both axes
+        (i.e. doesn't itself touch the frame edge — that's a sign
+         we picked up background, not a plate)
+    Otherwise return None and the caller falls back to whole-frame.
+    """
+    v = hsv[..., 2]
+    s = hsv[..., 1]
+    # Use the 75 th-percentile V as a relative "plate-bright" floor
+    # rather than a fixed value — the workspace plate is the brightest
+    # surface in frame but its absolute V varies wildly with overhead
+    # lighting (180 in some captures, 240 in others). Capping at 220
+    # keeps a bright-overlit lab from dragging the threshold above the
+    # actual plate.
+    v_floor = min(220, max(120, int(np.percentile(v, 75))))
+    bright = ((v >= v_floor) & (s <= 50)).astype(np.uint8) * 255
+    # Modest close: enough to merge dark workspace objects (battery,
+    # drone) back into the plate's CC, but not so much that distant
+    # bright background bleeds into it.
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (15, 15))
+    bright = cv2.morphologyEx(bright, cv2.MORPH_CLOSE, kernel, iterations=1)
+    contours, _ = cv2.findContours(bright, cv2.RETR_EXTERNAL,
+                                   cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        return None
+    h_img, w_img = hsv.shape[:2]
+    largest = max(contours, key=cv2.contourArea)
+    if cv2.contourArea(largest) < 0.25 * h_img * w_img:
+        return None
+    x, y, w, h = cv2.boundingRect(largest)
+    if x < 8 or y < 8 or x + w > w_img - 8 or y + h > h_img - 8:
+        return None  # plate touches frame edge — probably bg colour
+    return (x, y, w, h)
+
+
 def _build_mask(hsv: np.ndarray, v_thr: int, k: int) -> np.ndarray:
     v = hsv[..., 2]
     mask = (v < v_thr).astype(np.uint8) * 255
@@ -298,8 +345,17 @@ def _score_candidate(f: dict, frame_area: float) -> tuple[float, bool]:
     #       same shape via the sat / fill / edge fingerprint.
     area_frac = f["area"] / frame_area
     if area_frac < SMALL_AREA_LIMIT:
+        # Strong-shape escape: rectangularity ≥ 0.75 AND solidity
+        # ≥ 0.90. The 0.90 floor is calibrated against an arm-camera
+        # capture where the workspace plate ROI cropped a battery
+        # silhouette down to 2.1 % area, solidity 0.942 — solid enough
+        # to be unambiguously battery-shaped but failing the older
+        # 0.95 floor by a hair. The smooth-block rule below still
+        # rejects the matt-black accessory shapes (which pair high
+        # solidity with low edge density and a colour cast), so this
+        # only widens the gate for real batteries.
         strong_shape = (f["rectangularity"] >= 0.75
-                        and f["solidity"]    >= 0.95)
+                        and f["solidity"]    >= 0.90)
         if not strong_shape and f["bright_count"] < TEXT_COUNT_FOR_SMALL:
             return -1.0, False
 
@@ -370,10 +426,22 @@ def _score_candidate(f: dict, frame_area: float) -> tuple[float, bool]:
 def _find_candidates(bgr: np.ndarray, hsv: np.ndarray, edge_map: np.ndarray,
                      v_thr: int, k: int) -> list[tuple[float, BatteryBox, dict]]:
     mask = _build_mask(hsv, v_thr, k)
-    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL,
-                                   cv2.CHAIN_APPROX_SIMPLE)
     h_img, w_img = bgr.shape[:2]
     frame_area = float(h_img * w_img)
+    plate = _find_workspace_bbox(hsv)
+    # When the plate is found, mask off everything outside it before
+    # contour search. The off-screen background (boxes, cables) lives
+    # *outside* the plate and otherwise gets bridged into in-workspace
+    # contours by morphological closing. Restricting attention to the
+    # plate area is the only fix that handles wide (≥ battery-width)
+    # bridges between the workspace object and ambient junk.
+    if plate is not None:
+        px, py, pw, ph = plate
+        roi = np.zeros_like(mask)
+        roi[py:py + ph, px:px + pw] = 255
+        mask = cv2.bitwise_and(mask, roi)
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL,
+                                   cv2.CHAIN_APPROX_SIMPLE)
     out = []
     for c in contours:
         # Cheap early-reject on bounding-box area before we do heavier work.
