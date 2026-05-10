@@ -62,6 +62,73 @@ static float robust_depth_m(const InferenceFrame &frame,
     return samples[n / 2]; // median
 }
 
+// ── Workspace plate detection (no opencv) ───────────────────────────────────
+// Locate the bright workspace surface (foam plate / desk) so we can clip
+// drone bbox detections to the actual work area and reject phantom
+// "airplane" hits that the COCO model fires on background junk above
+// or beside the plate.
+//
+// We sample a 64×48 grid (every 10th pixel of a 640×480 frame) and
+// return the bbox of the connected "bright + low-saturation" cluster
+// that touches the most samples. Approximates a connected-component
+// scan well enough for a single dominant white surface, with no
+// opencv dependency. Returns false if no convincing plate is visible
+// — caller falls back to the full frame.
+struct PlateBbox {
+    uint32_t x1, y1, x2, y2;
+};
+
+static bool find_plate_bbox(const InferenceFrame &frame, PlateBbox &out)
+{
+    const uint32_t w = frame.slot.width;
+    const uint32_t h = frame.slot.height;
+    if (frame.slot.color_offset >= frame.payload.size()) return false;
+    const uint8_t *bgr = frame.payload.data() + frame.slot.color_offset;
+    const uint32_t stride = frame.slot.stride;
+    if (stride < w * 3U) return false;
+
+    constexpr uint32_t step = 8;          // sample every 8th pixel
+    constexpr uint8_t  v_floor = 165;     // bright enough
+    constexpr uint8_t  s_max = 60;        // close to white (low saturation)
+
+    uint32_t pmin_x = w, pmin_y = h, pmax_x = 0, pmax_y = 0;
+    uint32_t bright_samples = 0;
+    uint32_t total_samples  = 0;
+
+    for (uint32_t y = 0; y < h; y += step) {
+        const uint8_t *row = bgr + static_cast<size_t>(y) * stride;
+        for (uint32_t x = 0; x < w; x += step) {
+            const uint8_t b = row[x * 3 + 0];
+            const uint8_t g = row[x * 3 + 1];
+            const uint8_t r = row[x * 3 + 2];
+            const uint8_t v_max = std::max({b, g, r});
+            const uint8_t v_min = std::min({b, g, r});
+            ++total_samples;
+            if (v_max >= v_floor && static_cast<uint8_t>(v_max - v_min) <= s_max) {
+                ++bright_samples;
+                if (x < pmin_x) pmin_x = x;
+                if (y < pmin_y) pmin_y = y;
+                if (x > pmax_x) pmax_x = x;
+                if (y > pmax_y) pmax_y = y;
+            }
+        }
+    }
+
+    // Need a substantial bright cluster — > 25 % of samples — and a
+    // plate that doesn't pin against every frame edge (that would
+    // mean we picked up the bg colour).
+    if (bright_samples * 4U < total_samples) return false;
+    if (pmax_x <= pmin_x || pmax_y <= pmin_y) return false;
+    if (pmin_x < step && pmin_y < step
+        && pmax_x + step >= w && pmax_y + step >= h) return false;
+
+    out.x1 = pmin_x;
+    out.y1 = pmin_y;
+    out.x2 = std::min(w, pmax_x + step);
+    out.y2 = std::min(h, pmax_y + step);
+    return true;
+}
+
 // ── Main postprocess ──────────────────────────────────────────────────────────
 
 UavCResult Postprocess::run(const InferenceFrame &frame,
@@ -156,6 +223,22 @@ UavCResult Postprocess::run(const InferenceFrame &frame,
         grouped.push_back(out);
     }
 
+    // ── Workspace plate + depth gates ────────────────────────────────────
+    // Constraint #1 (geometric): clip drone bbox to the white-plate
+    // region. The COCO model often expands "airplane" detections off
+    // the plate into the floor / cardboard background — those have
+    // nothing useful to grasp, so chop them. If less than half the
+    // bbox area survives the clip, drop the detection entirely.
+    // Constraint #2 (depth): the workspace sits at ~0.3–1.0 m from
+    // the arm camera. RKNN bboxes whose centre depth lies outside
+    // [0.20, 1.50] m are background hallucinations — discard.
+    PlateBbox plate{};
+    const bool have_plate = find_plate_bbox(frame, plate);
+    constexpr int32_t plate_pad = 30;          // px slack above the plate so
+                                                // a standing drone fits in
+    constexpr float depth_min_workspace_m = 0.20f;
+    constexpr float depth_max_workspace_m = 1.50f;
+
     for (const Merged &g : grouped) {
         if (out.num_detections >= UAV_MAX_DETECTIONS) break;
         // mavic3_drone.rknn ships as a generic COCO YOLOv8 (nc=80), so
@@ -165,22 +248,53 @@ UavCResult Postprocess::run(const InferenceFrame &frame,
         // future strategy needs other classes, drop this guard.
         if (g.class_id != 4) continue;
 
+        // Apply plate clip (drone class only — keep face / battery
+        // pass-throughs untouched).
+        float cx1 = g.x1, cy1 = g.y1, cx2 = g.x2, cy2 = g.y2;
+        if (have_plate) {
+            const float px1 = static_cast<float>(plate.x1) - plate_pad;
+            const float py1 = static_cast<float>(plate.y1) - plate_pad;
+            const float px2 = static_cast<float>(plate.x2) + plate_pad;
+            const float py2 = static_cast<float>(plate.y2) + plate_pad;
+            const float orig_area = (g.x2 - g.x1) * (g.y2 - g.y1);
+            cx1 = std::max(g.x1, px1);
+            cy1 = std::max(g.y1, py1);
+            cx2 = std::min(g.x2, px2);
+            cy2 = std::min(g.y2, py2);
+            const float clip_area = std::max(0.0f, cx2 - cx1)
+                                  * std::max(0.0f, cy2 - cy1);
+            if (orig_area <= 0.0f || clip_area / orig_area < 0.50f) {
+                // Mostly outside the plate — almost certainly a
+                // phantom airplane detection on background junk.
+                continue;
+            }
+        }
+
         UavDetection det{};
         det.class_id = g.class_id;
         det.score    = g.score;
-        det.x1       = g.x1;
-        det.y1       = g.y1;
-        det.x2       = g.x2;
-        det.y2       = g.y2;
+        det.x1       = cx1;
+        det.y1       = cy1;
+        det.x2       = cx2;
+        det.y2       = cy2;
         det.has_xyz  = 0;
 
         // ── 3-D pose from RealSense depth ─────────────────────────────────
-        const float cx_px = (g.x1 + g.x2) * 0.5f;
-        const float cy_px = (g.y1 + g.y2) * 0.5f;
+        const float cx_px = (cx1 + cx2) * 0.5f;
+        const float cy_px = (cy1 + cy2) * 0.5f;
         const uint32_t px = static_cast<uint32_t>(cx_px + 0.5f);
         const uint32_t py = static_cast<uint32_t>(cy_px + 0.5f);
 
         const float depth_m = robust_depth_m(frame, px, py);
+        // Depth gate: drop detections sitting on the wall / outside
+        // the grasp working volume. Only enforced when depth is valid
+        // — a drone shrouded in propellers can read 0 depth at the
+        // bbox centre, in which case we trust the geometric checks.
+        if (depth_m > 0.0f
+            && (depth_m < depth_min_workspace_m
+             || depth_m > depth_max_workspace_m)) {
+            continue;
+        }
         if (depth_m > 0.0f) {
             const float fx = frame.slot.fx;
             const float fy = frame.slot.fy;
