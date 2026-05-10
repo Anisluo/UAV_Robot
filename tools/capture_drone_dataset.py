@@ -3,9 +3,14 @@
 
 Reads color frames from the proc_realsense shared-memory ring, saves
 every Nth frame to a directory, and auto-bootstraps a YOLO-format
-label by querying the gateway for the current NPU detection of
-class_id == 4 (COCO airplane). Auto-labels are noisy; the operator
-should open them in labelImg/CVAT and fix mistakes before training.
+label by combining:
+  • the gateway's current class=4 detection (post anchor-union, so
+    the bbox already covers the whole airframe)
+  • the white-plate ROI from battery_detect.py (so the bbox can't
+    extend past the workspace into off-screen junk)
+The operator should still open the result in labelImg / CVAT and
+fix mistakes before training, but the bootstrap saves >80 % of the
+click work.
 
 Usage:
     python3 capture_drone_dataset.py                        # default 200 frames
@@ -32,6 +37,24 @@ import cv2  # noqa: E402
 # Reuse the shm reader from battery_tracker so we don't redefine the
 # slot layout in two places.
 import battery_tracker  # noqa: E402
+import battery_detect   # noqa: E402  # for _find_workspace_bbox
+
+
+def _intersect_with_plate(bbox, plate, w_img, h_img):
+    """Clip auto-label bbox to plate ROI ± 30 px. Returns None if the
+    overlap is too thin to be useful (plate detection probably wrong)."""
+    if plate is None or bbox is None:
+        return bbox
+    px, py, pw, ph = plate
+    pad = 30
+    px1 = max(0, px - pad);  py1 = max(0, py - pad)
+    px2 = min(w_img, px + pw + pad);  py2 = min(h_img, py + ph + pad)
+    bx1, by1, bx2, by2, sc = bbox
+    cx1 = max(bx1, px1);  cy1 = max(by1, py1)
+    cx2 = min(bx2, px2);  cy2 = min(by2, py2)
+    if cx2 - cx1 < 30 or cy2 - cy1 < 30:
+        return None  # bbox barely overlaps plate
+    return (cx1, cy1, cx2, cy2, sc)
 
 
 def query_npu_drone(host="127.0.0.1", port=7001, score_min=0.40):
@@ -142,13 +165,20 @@ def main():
         if seen_fid % args.interval != 0:
             continue
 
-        # Light auto-label: pull current NPU detection. Multiple frames
-        # share one detection because NPU runs at ~5 fps, so this isn't
-        # perfect — operator must hand-correct in labelImg/CVAT before
-        # training. The auto-labels just save 80 % of the click work.
+        # Light auto-label: pull current NPU detection (already
+        # anchor-union-merged in postprocess.cpp), then clip it to the
+        # white-plate ROI so off-screen junk doesn't bleed into the
+        # box. NPU runs at ~5 fps so consecutive saved frames share a
+        # detection — bbox jitter is small but real, hand-review is
+        # still recommended.
         bbox = None
         if not args.no_auto_label:
             bbox = query_npu_drone(score_min=args.score_min)
+            if bbox is not None:
+                hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
+                plate = battery_detect._find_workspace_bbox(hsv)
+                bbox = _intersect_with_plate(bbox, plate,
+                                             bgr.shape[1], bgr.shape[0])
             if bbox is not None:
                 auto_labelled += 1
 
