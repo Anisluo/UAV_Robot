@@ -1520,7 +1520,20 @@ static void handle_rpc(int fd, const std::string &line,
 
     char resp[8192];
 
-    fprintf(stderr, "proc_gateway: RPC fd=%d recv: %s\n", fd, line.c_str());
+    // Per-RPC trace logs — fine for one-off diagnostics, but at
+    // HostGUI's 30 Hz poll rate (npu.get_detections + arm.get_angles
+    // alternating, each response ~700 chars) journald falls behind
+    // and the gateway main loop stalls, dragging the JPEG video push
+    // from ~30 fps to <1 fps. Gate behind UAV_GATEWAY_RPC_LOG so a
+    // dev can flip it on when needed (`UAV_GATEWAY_RPC_LOG=1` in
+    // /etc/default/uav_robot) without paying the cost in normal use.
+    static const bool s_rpc_trace = []() {
+        const char *e = std::getenv("UAV_GATEWAY_RPC_LOG");
+        return e != nullptr && e[0] != '\0' && e[0] != '0';
+    }();
+    if (s_rpc_trace) {
+        fprintf(stderr, "proc_gateway: RPC fd=%d recv: %s\n", fd, line.c_str());
+    }
 
     if (method == "system.ping") {
         uint64_t uptime = now_ms() - start_ms;
@@ -2087,7 +2100,9 @@ static void handle_rpc(int fd, const std::string &line,
                  "{\"id\":%d,\"result\":{\"ok\":true}}\n", id);
     }
 
-    fprintf(stderr, "proc_gateway: RPC fd=%d resp: %s", fd, resp);
+    if (s_rpc_trace) {
+        fprintf(stderr, "proc_gateway: RPC fd=%d resp: %s", fd, resp);
+    }
     write_all(fd, resp, strlen(resp));
 }
 

@@ -177,5 +177,18 @@ bool ShmReader::wait_and_read(InferenceFrame &frame, int timeout_ms) {
     }
     if (best_fid <= last_frame_id_) return false;
     last_frame_id_ = best_fid;
-    return claim_ready_slot(best_idx, frame);
+    // Non-destructive read: copy the slot's payload while it is still
+    // READY, but do not flip the state machine to READING / FREE.
+    // proc_gateway also consumes from this ring (and is the high-rate
+    // reader feeding HostGUI's video stream); if NPU claimed every
+    // slot, gateway would see them all as FREE and the JPEG push fps
+    // would collapse from ~30 to <2. proc_realsense's writer reuses
+    // any READY slot whose frame_id is the oldest, so leaving slots
+    // marked READY is safe — the ring buffer continues to cycle.
+    if (best_idx >= ring_->slot_count) return false;
+    FrameSlot *slot = &ring_->slots[best_idx];
+    frame.slot = *slot;
+    const uint8_t *src = shm_ring_slot_payload_const(ring_, best_idx);
+    frame.payload.assign(src, src + slot->payload_size);
+    return true;
 }
