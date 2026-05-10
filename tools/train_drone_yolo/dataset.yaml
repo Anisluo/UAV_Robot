@@ -1,0 +1,10 @@
+# YOLOv8 dataset config for the Mavic 3 drone single-class detector.
+# Path is relative to this file once the dataset is laid out as
+# documented in README.md.
+
+path: ../drone_dataset
+train: images/train
+val:   images/val
+
+names:
+  0: drone

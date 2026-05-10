@@ -10,3 +10,10 @@ build/
 *.log
 proc_arm.zip
 .vscode/
+
+# Captured drone training datasets — too large + binary, rsync between
+# the rk3588 and the training PC instead of committing.
+drone_dataset/
+runs/
+*.pt
+*.onnx
