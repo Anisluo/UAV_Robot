@@ -72,32 +72,88 @@ UavCResult Postprocess::run(const InferenceFrame &frame,
     out.frame_id       = frame.slot.frame_id;
     out.num_detections = 0;
 
-    // ── Per-class top-1 ──────────────────────────────────────────────────
-    // The COCO-pretrained YOLOv8 used as mavic3_drone.rknn emits many
-    // candidate boxes per scene; an earlier union-merge variant gave
-    // one bbox per class but the bbox grew to the full frame because
-    // unrelated detections got swept in. Keep only the single highest-
-    // score box per class — at most one airplane (drone) bbox per
-    // frame, and the bbox is whatever the strongest detection picked.
+    // ── Anchor-based per-class union ─────────────────────────────────────
+    // The COCO-pretrained mavic3_drone.rknn fires multiple class=4
+    // boxes on a single drone (body / propeller / arm) that survive
+    // NMS at IoU 0.45. We need ALL of those merged into one bbox
+    // covering the whole airframe, but mustn't sweep in stray
+    // background "airplane" hits at the edges of the frame.
+    // Algorithm:
+    //   1. Find anchor = highest-score detection per class.
+    //   2. Union the anchor with same-class detections whose IoU
+    //      against the anchor's *original* bbox is ≥ kAnchorIou.
+    //   3. Cap the resulting bbox at kMaxAreaFrac of the frame to
+    //      keep cumulative drift in check.
+    // Detections that don't IoU with the anchor are treated as a
+    // separate object and dropped (no second cluster — the per-class
+    // top-1 filter then keeps just the anchor cluster's bbox).
     struct Merged {
         int   class_id;
         float score;
         float x1, y1, x2, y2;
     };
-    std::vector<Merged> grouped;
+    constexpr float kAnchorIou     = 0.30F;
+    constexpr float kMaxAreaFrac   = 0.45F;
+    const float frame_max_area = static_cast<float>(frame.slot.width)
+                               * static_cast<float>(frame.slot.height)
+                               * kMaxAreaFrac;
+    auto box_area_xyxy = [](float x1, float y1, float x2, float y2) {
+        return std::max(0.0f, x2 - x1) * std::max(0.0f, y2 - y1);
+    };
+    auto box_iou = [&](float ax1, float ay1, float ax2, float ay2,
+                       float bx1, float by1, float bx2, float by2) {
+        const float ix1 = std::max(ax1, bx1);
+        const float iy1 = std::max(ay1, by1);
+        const float ix2 = std::min(ax2, bx2);
+        const float iy2 = std::min(ay2, by2);
+        const float inter = std::max(0.0f, ix2 - ix1)
+                          * std::max(0.0f, iy2 - iy1);
+        if (inter <= 0.0f) return 0.0f;
+        return inter / (box_area_xyxy(ax1, ay1, ax2, ay2)
+                       + box_area_xyxy(bx1, by1, bx2, by2)
+                       - inter + 1e-6f);
+    };
+
+    // First pass: pick the anchor (highest score) per class.
+    std::vector<Merged> anchors;
     for (const RawDet &d : raw) {
         if (d.score < threshold) continue;
-        Merged *slot = nullptr;
-        for (auto &m : grouped) {
-            if (m.class_id == d.class_id) { slot = &m; break; }
+        Merged *cur = nullptr;
+        for (auto &m : anchors) {
+            if (m.class_id == d.class_id) { cur = &m; break; }
         }
-        if (slot == nullptr) {
-            grouped.push_back({d.class_id, d.score, d.x1, d.y1, d.x2, d.y2});
-        } else if (d.score > slot->score) {
-            slot->score = d.score;
-            slot->x1 = d.x1; slot->y1 = d.y1;
-            slot->x2 = d.x2; slot->y2 = d.y2;
+        if (cur == nullptr) {
+            anchors.push_back({d.class_id, d.score, d.x1, d.y1, d.x2, d.y2});
+        } else if (d.score > cur->score) {
+            *cur = {d.class_id, d.score, d.x1, d.y1, d.x2, d.y2};
         }
+    }
+
+    // Second pass: union each anchor with same-class detections whose
+    // bbox overlaps the *anchor* (not the running union — stops drift).
+    std::vector<Merged> grouped;
+    grouped.reserve(anchors.size());
+    for (const Merged &a : anchors) {
+        Merged out{a};  // copy of anchor; we'll grow it
+        for (const RawDet &d : raw) {
+            if (d.score < threshold) continue;
+            if (d.class_id != a.class_id) continue;
+            // Skip the anchor itself (matched by score+bbox identity).
+            if (d.score == a.score
+                && d.x1 == a.x1 && d.y1 == a.y1
+                && d.x2 == a.x2 && d.y2 == a.y2) continue;
+            if (box_iou(d.x1, d.y1, d.x2, d.y2,
+                        a.x1, a.y1, a.x2, a.y2) < kAnchorIou) continue;
+            // Tentative new bbox after union — accept only if under cap.
+            const float nx1 = std::min(out.x1, d.x1);
+            const float ny1 = std::min(out.y1, d.y1);
+            const float nx2 = std::max(out.x2, d.x2);
+            const float ny2 = std::max(out.y2, d.y2);
+            if (box_area_xyxy(nx1, ny1, nx2, ny2) > frame_max_area) continue;
+            out.x1 = nx1; out.y1 = ny1; out.x2 = nx2; out.y2 = ny2;
+            // Anchor's score is already the max for this class.
+        }
+        grouped.push_back(out);
     }
 
     for (const Merged &g : grouped) {
