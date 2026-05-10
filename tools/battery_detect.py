@@ -129,7 +129,17 @@ TEXT_S_CEIL      = 80      # S ceiling so colour reflections don't count
 # direction. Standalone tripod base measured 1 bright px in the same
 # frame, so 5 is a clean separator.
 TEXT_COUNT_FOR_SMALL = 5
-SMALL_AREA_LIMIT = 0.06    # below this, text confirmation is required
+# Below this fraction the contour needs *some* extra signal (printed
+# text or very strong shape) on top of basic area/aspect/rect filters.
+# Empirical workspace data:
+#   real battery silhouettes — all ≥ 4.5 % across viewing angles, with
+#                              the smallest sample (back face, far)
+#                              measuring 4.6 %.
+#   standalone tripod base   — ~ 3 %.
+# 4 % cleanly separates the two: real batteries skip the gate entirely,
+# the lone base is still small-enough to be required to bring text or
+# strong-shape evidence (and fails both).
+SMALL_AREA_LIMIT = 0.04
 
 # ── Smooth-block rejection ───────────────────────────────────────────────
 # A smooth flat black accessory next to the battery (e.g. drone arm
@@ -172,17 +182,29 @@ def _dark_threshold(v_channel: np.ndarray, percentile: float = 12.0,
 def _build_mask(hsv: np.ndarray, v_thr: int, k: int) -> np.ndarray:
     v = hsv[..., 2]
     mask = (v < v_thr).astype(np.uint8) * 255
+
+    # Zero the top / bottom border bands of the dark mask. Off-screen
+    # cables, equipment boxes, floor seams etc. leak into the frame's
+    # edge strips, and morphological closing then bridges them to the
+    # battery silhouette in the workspace. The merged contour ends up
+    # touching y=0 / y=h-1, the edge-touch reject drops it, and the
+    # battery becomes invisible. A workspace battery is always ≥ ~30
+    # px in from the top of the frame on this rig, so erasing the band
+    # is a clean fix; the wider 5x5 open below is no longer enough on
+    # its own when the bridge is 10–15 px wide.
+    h_img = mask.shape[0]
+    edge_band = max(20, h_img // 16)
+    mask[:edge_band, :] = 0
+    mask[h_img - edge_band:, :] = 0
+
     close_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (k, k))
     # Closing fills the battery's label cutouts and contact seams.
     mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, close_kernel, iterations=2)
     # Use a *larger* open kernel than the close kernel so any thin
-    # bridges the close just bridged — typically the battery silhouette
-    # touching off-screen equipment / cables at the top edge of the
-    # frame — get split apart again. Kernel (k+2)² removes connections
-    # ≤ ⌊(k+2)/2⌋ ≈ 2 px while only nibbling 2 px off the battery body
-    # (insignificant against a 100×150 px silhouette). Without this the
-    # battery contour would touch y=0 and the edge-touch reject would
-    # drop it.
+    # bridges the close just bridged get split apart again. Kernel
+    # (k+2)² removes connections ≤ ⌊(k+2)/2⌋ ≈ 2 px while only
+    # nibbling 2 px off the battery body (insignificant against a
+    # 100×150 px silhouette).
     open_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (k + 2, k + 2))
     mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN,  open_kernel, iterations=1)
     return mask
