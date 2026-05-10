@@ -257,13 +257,21 @@ def _score_candidate(f: dict, frame_area: float) -> tuple[float, bool]:
     if f["fill"]   < FILL_MIN:                 return -1.0, False
 
     # Small-area gate: if the contour is below SMALL_AREA_LIMIT we need
-    # printed text / metal contacts inside to confirm it's a battery and
-    # not the standalone tripod base, drone arm cap, or random dark blob.
-    # Big contours skip this — large dark batteries seen from the back
-    # face have legitimately empty interiors.
+    # *some* extra signal to confirm it's a battery and not the
+    # standalone tripod base, drone arm cap, or random dark blob.
+    # Two ways to pass:
+    #   (a) printed text / metal contacts inside (bright pixel count), or
+    #   (b) very strong rectangle-and-solidity shape — this catches the
+    #       Mavic 3 battery laid on its side (long thin profile, no
+    #       label face visible) which has bright_count = 0 but
+    #       rectangularity ≥ 0.75 and solidity ≥ 0.95. The smooth-block
+    #       rule below still rejects featureless distractors with the
+    #       same shape via the sat / fill / edge fingerprint.
     area_frac = f["area"] / frame_area
     if area_frac < SMALL_AREA_LIMIT:
-        if f["bright_count"] < TEXT_COUNT_FOR_SMALL:
+        strong_shape = (f["rectangularity"] >= 0.75
+                        and f["solidity"]    >= 0.95)
+        if not strong_shape and f["bright_count"] < TEXT_COUNT_FOR_SMALL:
             return -1.0, False
 
     is_end_view = f["aspect"] < ASPECT_MIN_SIDE

@@ -74,12 +74,16 @@ void print_heartbeat(const UavCHeartbeat &hb) {
 int NpuApplication::run() {
     std::atomic<bool> running{true};
     std::atomic<bool> infer_enabled{true};
-    // 0.45 default — measured class=4 (airplane) score for an actual
-    // Mavic 3 in the camera was ~0.50, so the threshold needs to sit
-    // a touch below that to catch the drone reliably. With the
-    // class-4-only filter in postprocess any background hits that
-    // sneak above 0.45 in other classes are dropped anyway.
-    std::atomic<float> threshold{0.45F};
+    // 0.52 default — the COCO-pretrained mavic3_drone.rknn produces
+    // ~0.50 score "airplane" hits on an *empty* workbench (the white
+    // plate + a dark elongated object reads as a tiny plane on a
+    // runway). 0.45 caught those phantom UAVs after the real drone
+    // was removed; 0.52 is high enough to suppress them while still
+    // accepting the real Mavic 3 (which scored 0.51–0.58 in the live
+    // arm-camera tests). The 600 ms hold + EMA in npu_pipeline keeps
+    // the bbox stable across short drop-outs even at this stricter
+    // threshold.
+    std::atomic<float> threshold{0.52F};
     std::atomic<uint32_t> rate_fps{30U};
     std::mutex model_mu;
     std::string pending_model;
