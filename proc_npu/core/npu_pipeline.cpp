@@ -63,12 +63,20 @@ bool NpuPipeline::process_frame(const InferenceFrame &frame,
 
     UavCResult result = postprocess_.run(frame, raw, threshold);
 
-    // ── Temporal smoothing ───────────────────────────────────────────────
-    // EMA-blend overlapping detections against the sticky cache, then
-    // either accept the new result (and refresh the hold timer) or
-    // replay the sticky one if we're still inside the hold window.
+    // ── Temporal smoothing + 2-frame consensus ───────────────────────────
+    // Three states for the detection lifecycle:
+    //   (a) STEADY  — sticky_valid_ is true; EMA-blend incoming, refresh
+    //                 hold, fall back to sticky on empty frames.
+    //   (b) WARMUP  — pending_valid_ is true (one prior non-empty frame
+    //                 not yet shown). Need a second consecutive matching
+    //                 detection to promote into STEADY and start
+    //                 publishing. A single-frame phantom never reaches
+    //                 STEADY.
+    //   (c) IDLE    — neither cache holds anything; every empty frame
+    //                 just re-publishes empty.
     if (result.num_detections > 0) {
         if (sticky_valid_) {
+            // STEADY: EMA-blend bbox vs sticky, then refresh hold.
             for (uint32_t i = 0; i < result.num_detections; ++i) {
                 UavDetection &cur = result.detections[i];
                 for (uint32_t j = 0; j < sticky_.num_detections; ++j) {
@@ -80,19 +88,61 @@ bool NpuPipeline::process_frame(const InferenceFrame &frame,
                     break;
                 }
             }
+            sticky_ = result;
+            sticky_until_ns_ = now_ns + kStickyHoldNs;
+        } else if (pending_valid_) {
+            // WARMUP → STEADY: confirm second consecutive frame.
+            // Require a tighter IoU (kIouConfirm 0.40) than the EMA
+            // snap threshold so a wandering "full-frame airplane"
+            // phantom whose bbox jitters across the workspace doesn't
+            // ride one through. The real drone, even at 5 fps, keeps
+            // bbox overlap well above 0.4 between adjacent frames.
+            constexpr float kIouConfirm = 0.40F;
+            bool confirmed = false;
+            for (uint32_t i = 0; i < result.num_detections && !confirmed; ++i) {
+                const UavDetection &cur = result.detections[i];
+                for (uint32_t j = 0; j < pending_.num_detections; ++j) {
+                    const UavDetection &prev = pending_.detections[j];
+                    if (prev.class_id != cur.class_id) continue;
+                    if (det_iou(prev, cur) >= kIouConfirm) {
+                        confirmed = true;
+                        break;
+                    }
+                }
+            }
+            if (confirmed) {
+                sticky_ = result;
+                sticky_valid_ = true;
+                sticky_until_ns_ = now_ns + kStickyHoldNs;
+                pending_valid_ = false;
+            } else {
+                // Different bbox / class — reset pending to current.
+                pending_ = result;
+            }
+        } else {
+            // IDLE → WARMUP: stash, do not publish yet.
+            pending_ = result;
+            pending_valid_ = true;
         }
-        sticky_ = result;
-        sticky_valid_ = true;
-        sticky_until_ns_ = now_ns + kStickyHoldNs;
-    } else if (sticky_valid_ && now_ns < sticky_until_ns_) {
-        // Re-publish the previous result with its real frame_id but
-        // updated to the current frame so downstream depth lookups
-        // line up with the live image.
+    } else {
+        // Empty frame: the stream broke; drop pending warmup state and
+        // either fall back to sticky (if hold not yet expired) or emit
+        // empty.
+        pending_valid_ = false;
+        if (sticky_valid_ && now_ns < sticky_until_ns_) {
+            result = sticky_;
+            result.frame_id = frame.slot.frame_id;
+        } else {
+            sticky_valid_ = false;
+        }
+    }
+
+    // While in WARMUP we still hold the sticky cache visible if its
+    // own timer hasn't expired (smooth coverage during a brief miss
+    // before the next confirmation arrives).
+    if (result.num_detections == 0 && sticky_valid_ && now_ns < sticky_until_ns_) {
         result = sticky_;
         result.frame_id = frame.slot.frame_id;
-    } else {
-        // Hold expired — let the empty result through and reset cache.
-        sticky_valid_ = false;
     }
 
     print_result(result);

@@ -37,12 +37,22 @@ private:
     UavCResult sticky_{};
     bool       sticky_valid_{false};
     uint64_t   sticky_until_ns_{0};
-    static constexpr uint64_t kStickyHoldNs = 600ULL * 1000ULL * 1000ULL;
+    static constexpr uint64_t kStickyHoldNs = 800ULL * 1000ULL * 1000ULL;
     // 0.3 ⇒ 70 % previous, 30 % current — bbox keeps up with motion
     // but doesn't snap on every frame. Tested with the COCO-pretrained
     // mavic3_drone.rknn whose raw bbox jumps ~150 px between frames.
     static constexpr float    kEmaAlpha     = 0.3F;
     static constexpr float    kIouSnap      = 0.20F;
+
+    // Two-frame consensus before the first publish. The model produces
+    // ~0.50 score "airplane" hits sporadically on the empty workbench;
+    // a single frame can therefore not be trusted, but the real drone
+    // generates such hits *every* frame. Holding the first detection
+    // off-screen until a second consecutive matching frame arrives
+    // filters single-frame phantoms cleanly while still letting an
+    // actual drone show up within ~200 ms.
+    UavCResult pending_{};
+    bool       pending_valid_{false};
 };
 
 #endif
