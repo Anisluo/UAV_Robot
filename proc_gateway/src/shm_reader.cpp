@@ -102,6 +102,17 @@ bool ShmReader::read_latest(GatewayFrame &out) {
     }
 
     if (best_idx == N)                return false;   // no READY slot
+
+    // Auto-recover when the writer (proc_realsense) restarts: it
+    // resets its `next_frame_id_` to 1 while we still hold a stale
+    // last_frame_id_ in the millions, which would freeze the stream
+    // forever (best_fid <= last_frame_id_). If frame_id has gone
+    // *backward* by more than the ring depth, the writer must have
+    // restarted — clear our cursor so we accept the fresh sequence.
+    constexpr uint64_t kBackwardSlack = 1000;
+    if (best_fid + kBackwardSlack < last_frame_id_) {
+        last_frame_id_ = 0;
+    }
     if (best_fid <= last_frame_id_)   return false;   // nothing new
 
     FrameSlot *slot = &ring_->slots[best_idx];

@@ -31,6 +31,7 @@ private:
     int notify_fd_;
     size_t map_size_;
     ShmRing *ring_;
+    uint64_t last_frame_id_{0};
 };
 
 #endif

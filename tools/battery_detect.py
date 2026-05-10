@@ -54,16 +54,45 @@ BatteryBox = Tuple[int, int, int, int, float]   # x1, y1, x2, y2, score
 
 
 # ── Geometry thresholds ──────────────────────────────────────────────────
-MIN_AREA_FRAC    = 0.004    # at least 0.4 % of frame
+# 2 % is the absolute minimum: anything smaller is too low-resolution
+# for shape features to be meaningful. Between 2 % and SMALL_AREA_LIMIT
+# (~6 %) we additionally require text/contact bright pixels inside the
+# contour — that gate replaces the older blanket 4 % floor and lets
+# small-but-real batteries through while still rejecting the standalone
+# tripod base (3 % area, 0 bright pixels because it's just black plastic).
+MIN_AREA_FRAC    = 0.020
 MAX_AREA_FRAC    = 0.60     # at most 60 % of frame
-ASPECT_MIN_SIDE  = 1.8      # elongated-view cut-off
+ASPECT_MIN_SIDE  = 1.3      # elongated-view cut-off — the bare battery on
+                            # its tripod lands at ~1.79, but when the
+                            # morphology mask merges battery body + stand
+                            # into one blob (top-down view) the compound
+                            # shape comes through at aspect ~1.38. Both
+                            # labelled end-view samples sit below 1.30, so
+                            # 1.3 keeps the end-view path for those without
+                            # forcing the merged-assembly into its stricter
+                            # rect/solidity gates.
 ASPECT_MIN_END   = 1.0      # end-view cut-off (accept near-square)
-ASPECT_MAX       = 4.5      # aluminium bars / pencils exceed this
-RECT_MIN         = 0.60     # side-view rectangularity floor
+ASPECT_MAX       = 3.5      # narrow tools / wall edges exceed this; battery
+                            # in any real orientation stays under ~3.
+RECT_MIN         = 0.50     # side-view rectangularity floor — Mavic 3
+                            # battery laid on its side / tilted toward the
+                            # camera renders as a trapezoidal silhouette
+                            # with rect ≈ 0.53 (clean front-view labelled
+                            # samples are all ≥ 0.69, so dropping to 0.50
+                            # picks up the tilted view without conflict).
 RECT_MIN_END     = 0.78     # end-view rectangularity floor (stricter)
 FILL_MIN         = 0.35     # axis-bbox fill ratio
-SOLIDITY_MIN     = 0.80     # side-view solidity floor
+SOLIDITY_MIN     = 0.72     # side-view solidity floor — same reason as
+                            # above; a leaning battery produces concave
+                            # extrusions (visible label / contact lip /
+                            # shadow lobe) that drag solidity to ~0.76.
+                            # Labelled training samples sit ≥ 0.84, so
+                            # 0.72 is the largest cushion that never lets
+                            # a labelled positive be rejected.
 SOLIDITY_MIN_END = 0.90     # end-view solidity floor (stricter)
+# Reject contours pinned against the frame border — almost always
+# off-screen equipment leaking in at the edge, never the battery.
+EDGE_TOUCH_PX    = 2
 
 # ── Content thresholds ───────────────────────────────────────────────────
 # Saturation: battery is black, so mean S ≤ ~40 even on tinted shots.
@@ -74,13 +103,56 @@ SAT_MEAN_MAX     = 80
 # grille). Smooth shadows sit near 0. Use a very soft floor so low-res
 # camera frames still pass, but penalise in score.
 EDGE_DENS_FLOOR  = 0.005
-EDGE_DENS_TARGET = 0.05
+EDGE_DENS_TARGET = 0.06
 # V inside the candidate blob — battery stays genuinely dark even after
 # morphology; dimly-lit wall/cloth regions creep higher.
 V_MEAN_MAX       = 70
 
+# ── Inside-bright (printed text / metal contacts) ────────────────────────
+# Mavic 3 batteries carry crisp white printing (model number, capacity,
+# warning icons) and a metal terminal grille on one face. Both render as
+# bright low-saturation pixels *inside* the otherwise-dark contour. A
+# featureless black block (drone arm cap, foam edge, shadow) has none.
+# We use this as
+#   1. a confirmation signal — small contours are only kept when bright
+#      content is present, so the standalone tripod base / random dark
+#      blob can no longer pass on shape alone, and
+#   2. a pose hint — PCA of the bright pixels gives the long-axis angle
+#      of the printed face, useful for orienting the gripper.
+TEXT_V_FLOOR     = 120     # V floor for "bright" inside the contour
+TEXT_S_CEIL      = 80      # S ceiling so colour reflections don't count
+# Use an absolute pixel count (not a fraction) for the small-area gate:
+# at the arm camera's working distance, the contact circles read as ~10
+# bright px regardless of how big the battery silhouette is. A fractional
+# threshold would scale with contour area and reject distant batteries
+# that have *more* fractional brightness than nearby ones — the wrong
+# direction. Standalone tripod base measured 1 bright px in the same
+# frame, so 5 is a clean separator.
+TEXT_COUNT_FOR_SMALL = 5
+SMALL_AREA_LIMIT = 0.06    # below this, text confirmation is required
+
+# ── Smooth-block rejection ───────────────────────────────────────────────
+# A smooth flat black accessory next to the battery (e.g. drone arm
+# cap, stand, propeller cover) presents as: very high solidity, very
+# rectangular, low edge density (no terminals or labels), partial fill,
+# and slight colour cast (mean_sat above the battery's neutral black).
+# These four together never appear in the labelled battery_data set —
+# any one battery image that matches three of them still fails on at
+# least one — so requiring all four cleanly excludes only the
+# distractor. See _full_survey.py for the data this is calibrated on.
+SMOOTH_BLOCK_SOLIDITY = 0.97
+SMOOTH_BLOCK_EDGE     = 0.035
+SMOOTH_BLOCK_FILL     = 0.70
+SMOOTH_BLOCK_SAT      = 55
+
 # ── Score gate ───────────────────────────────────────────────────────────
-SCORE_MIN        = 0.42
+# Lowered together with the rect/solidity floors above. A clean battery
+# on a tripod scores 0.55–0.70; a tilted/side-laid battery slips into
+# the 0.40–0.45 range because rect/solidity carry less weight on it.
+# The hard-reject rules (smooth-block + edge-touching + min area)
+# already filter the bulk of dark-shape noise, so the score gate can
+# be looser without flooding HostGUI with phantoms.
+SCORE_MIN        = 0.38
 
 
 # ── Adaptive dark threshold ──────────────────────────────────────────────
@@ -136,6 +208,30 @@ def _contour_features(contour: np.ndarray,
     mean_v   = float(vch.mean()) if vch.size else 255.0
     edge_density = float((edges_in > 0).sum()) / max(1.0, area)
 
+    # Inside-bright pixels (printed text + metal contacts). PCA of
+    # their positions gives the printed-face long axis when present.
+    V_full = hsv[..., 2]
+    S_full = hsv[..., 1]
+    bright_mask = (V_full >= TEXT_V_FLOOR) & (S_full <= TEXT_S_CEIL) & (roi_mask > 0)
+    ys_b, xs_b = np.where(bright_mask)
+    bright_count = int(xs_b.size)
+    bright_frac  = bright_count / max(1.0, area)
+
+    text_angle_deg = None
+    text_dispersion = 0.0
+    if bright_count >= 8:
+        pts = np.column_stack([xs_b, ys_b]).astype(np.float64)
+        mean = pts.mean(axis=0)
+        cov  = np.cov((pts - mean).T)
+        eigvals, eigvecs = np.linalg.eigh(cov)
+        idx = int(np.argmax(eigvals))
+        major = eigvecs[:, idx]
+        text_angle_deg = float(np.degrees(np.arctan2(major[1], major[0])))
+        # dispersion = sqrt(major eigenvalue) ≈ pixels span along axis;
+        # high dispersion = text spread along a real long axis (good),
+        # low dispersion = a single specular dot (ignore).
+        text_dispersion = float(np.sqrt(max(eigvals[idx], 0.0)))
+
     return dict(
         area=area, bbox=(x, y, bw, bh), hull_area=hull_area,
         long_side=long_side, short_side=short_side, aspect=aspect,
@@ -144,6 +240,10 @@ def _contour_features(contour: np.ndarray,
         rectangularity=area / max(1.0, long_side * short_side),
         fill=area / max(1.0, bw * bh),
         solidity=area / max(1.0, hull_area),
+        bright_count=bright_count,
+        bright_frac=bright_frac,
+        text_angle_deg=text_angle_deg,
+        text_dispersion=text_dispersion,
     )
 
 
@@ -155,6 +255,16 @@ def _score_candidate(f: dict, frame_area: float) -> tuple[float, bool]:
     if f["aspect"] > ASPECT_MAX:               return -1.0, False
     if f["aspect"] < ASPECT_MIN_END:           return -1.0, False
     if f["fill"]   < FILL_MIN:                 return -1.0, False
+
+    # Small-area gate: if the contour is below SMALL_AREA_LIMIT we need
+    # printed text / metal contacts inside to confirm it's a battery and
+    # not the standalone tripod base, drone arm cap, or random dark blob.
+    # Big contours skip this — large dark batteries seen from the back
+    # face have legitimately empty interiors.
+    area_frac = f["area"] / frame_area
+    if area_frac < SMALL_AREA_LIMIT:
+        if f["bright_count"] < TEXT_COUNT_FOR_SMALL:
+            return -1.0, False
 
     is_end_view = f["aspect"] < ASPECT_MIN_SIDE
     if is_end_view:
@@ -168,24 +278,50 @@ def _score_candidate(f: dict, frame_area: float) -> tuple[float, bool]:
     if f["mean_sat"] > SAT_MEAN_MAX: return -1.0, False
     if f["mean_v"]   > V_MEAN_MAX:   return -1.0, False
 
+    # Hard reject: smooth flat distractor (no internal texture, partial
+    # fill, slight colour cast). All four conditions together never
+    # appear on a real battery in battery_data; isolating this signature
+    # keeps the smooth-block negative from competing with the real
+    # battery on close scoring matches.
+    if (f["solidity"]     > SMOOTH_BLOCK_SOLIDITY
+            and f["edge_density"] < SMOOTH_BLOCK_EDGE
+            and f["fill"]         < SMOOTH_BLOCK_FILL
+            and f["mean_sat"]     > SMOOTH_BLOCK_SAT):
+        return -1.0, False
+
     # Score components — all normalised to [0, 1], then weighted.
-    size_score   = min(1.0, f["area"] / (0.25 * frame_area))
+    # Saturate size_score at 10 % of frame: real batteries in the
+    # working range fall between ~5 % and ~18 %, so 10 % is the
+    # natural midpoint where the score should already be near full.
+    # The old 0.25 ceiling capped most real batteries at size_score
+    # ≤ 0.4, leaving the tilted/laid-over case (5 % area, low rect/
+    # solidity) at total score 0.37 — just below the gate.
+    size_score   = min(1.0, f["area"] / (0.10 * frame_area))
     aspect_norm  = min(1.0, max(0.0,
                        (f["aspect"] - ASPECT_MIN_END)
                        / (3.0 - ASPECT_MIN_END)))
     sat_score    = max(0.0, 1.0 - f["mean_sat"] / SAT_MEAN_MAX)
     # Edge density shaped as a soft ramp so an image-pyramid level with
     # few captured details doesn't zero the score, but a truly smooth
-    # shadow still loses out.
+    # shadow still loses out. Weight bumped to 0.20 to widen the gap
+    # between the textured battery and a smooth black accessory: in
+    # debug capture the battery sat at edge=0.054 and the distractor
+    # block at 0.029, so this is the most-discriminative signal we have.
     edge_score = min(1.0, f["edge_density"] / EDGE_DENS_TARGET)
     edge_pass  = f["edge_density"] >= EDGE_DENS_FLOOR
 
-    score = (0.28 * f["rectangularity"]
-             + 0.18 * f["solidity"]
-             + 0.18 * size_score
-             + 0.12 * aspect_norm
-             + 0.12 * sat_score
-             + 0.12 * edge_score)
+    # Text-content bonus: bright printing inside the contour is a
+    # battery-specific positive signal — small bonus, capped at 0.10
+    # so a textureless-but-clean shape can still pass on its own.
+    text_bonus = min(0.10, f["bright_frac"] * 8.0)
+
+    score = (0.25 * f["rectangularity"]
+             + 0.16 * f["solidity"]
+             + 0.16 * size_score
+             + 0.10 * aspect_norm
+             + 0.13 * sat_score
+             + 0.20 * edge_score
+             + text_bonus)
     if not edge_pass:
         score *= 0.75       # soft penalty; still allow if everything else is strong
     if is_end_view:
@@ -199,12 +335,23 @@ def _find_candidates(bgr: np.ndarray, hsv: np.ndarray, edge_map: np.ndarray,
     mask = _build_mask(hsv, v_thr, k)
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL,
                                    cv2.CHAIN_APPROX_SIMPLE)
-    frame_area = float(bgr.shape[0] * bgr.shape[1])
+    h_img, w_img = bgr.shape[:2]
+    frame_area = float(h_img * w_img)
     out = []
     for c in contours:
         # Cheap early-reject on bounding-box area before we do heavier work.
         xa, ya, wa, ha = cv2.boundingRect(c)
         if wa * ha < MIN_AREA_FRAC * frame_area: continue
+
+        # Drop blobs pinned against the frame edge — they're equipment
+        # bleeding in from off-screen, not the battery sitting on the
+        # workspace. (See debug capture: a corner contour at (0,0,193,44)
+        # was scoring just above the real battery centred at ~(265,84).)
+        if (xa <= EDGE_TOUCH_PX
+                or ya <= EDGE_TOUCH_PX
+                or xa + wa >= w_img - EDGE_TOUCH_PX
+                or ya + ha >= h_img - EDGE_TOUCH_PX):
+            continue
 
         feats = _contour_features(c, hsv, edge_map)
         score, is_end = _score_candidate(feats, frame_area)

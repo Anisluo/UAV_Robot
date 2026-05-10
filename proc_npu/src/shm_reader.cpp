@@ -133,12 +133,49 @@ bool ShmReader::claim_ready_slot(uint32_t slot_idx, InferenceFrame &frame) {
 }
 
 bool ShmReader::wait_and_read(InferenceFrame &frame, int timeout_ms) {
-    if (notify_fd_ < 0 || ring_ == nullptr) {
+    if (ring_ == nullptr) {
         return false;
     }
-    UavFrameReadyPayload notify{};
-    if (!read_one_notify(notify, timeout_ms)) {
-        return false;
+
+    // proc_realsense's writer sends a bare 8-byte "frame ready" signal
+    // (no UavIpcHeader / no slot id), so the original read_one_notify
+    // path size-mismatched and rejected every notification — leaving
+    // NPU stuck in the stub while real frames flowed past. Drain any
+    // pending wake-ups (size-agnostic) just to clear the socket queue,
+    // then scan the ring directly for the newest READY slot, the same
+    // way proc_gateway's reader does.
+    if (notify_fd_ >= 0) {
+        pollfd pfd{};
+        pfd.fd = notify_fd_;
+        pfd.events = POLLIN;
+        if (poll(&pfd, 1, timeout_ms) > 0 && (pfd.revents & POLLIN)) {
+            uint8_t scratch[64];
+            while (recv(notify_fd_, scratch, sizeof(scratch), MSG_DONTWAIT) > 0) {
+                // discard payload regardless of format / size
+            }
+        } else {
+            // No fresh notification within timeout — but a slot may
+            // still be READY from before. Fall through and scan once.
+        }
     }
-    return claim_ready_slot(notify.slot_id, frame);
+
+    const uint32_t N = ring_->slot_count;
+    uint64_t best_fid = 0;
+    uint32_t best_idx = N;
+    for (uint32_t i = 0; i < N; ++i) {
+        if (load_state(&ring_->slots[i].state) != UAV_SLOT_READY) continue;
+        const uint64_t fid = ring_->slots[i].frame_id;
+        if (fid > best_fid) { best_fid = fid; best_idx = i; }
+    }
+    if (best_idx == N) return false;
+
+    // Auto-recover when proc_realsense restarts and frame_id resets:
+    // accept the new sequence instead of holding onto a stale cursor.
+    constexpr uint64_t kBackwardSlack = 1000;
+    if (best_fid + kBackwardSlack < last_frame_id_) {
+        last_frame_id_ = 0;
+    }
+    if (best_fid <= last_frame_id_) return false;
+    last_frame_id_ = best_fid;
+    return claim_ready_slot(best_idx, frame);
 }

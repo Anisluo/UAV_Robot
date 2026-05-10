@@ -29,6 +29,7 @@ public:
     void set_profile(uint32_t width, uint32_t height, uint32_t fps);
     void set_exposure(int32_t exposure_us);
     bool snapshot(CaptureFrame &frame);
+    bool depth_enabled() const { return depth_enabled_; }
 
 private:
     bool apply_profile(bool enable_depth);

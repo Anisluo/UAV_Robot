@@ -22,15 +22,22 @@ namespace {
 constexpr const char *kFaceTriggerFlag    = "/tmp/uav_face_tracker_enabled";
 constexpr const char *kBatteryTriggerFlag = "/tmp/uav_battery_tracker_enabled";
 
+// Resolve model file with absolute path. The systemd unit sets
+// WorkingDirectory=/home/ubuntu/UAV_Robot, but `bash -lc` in the
+// ExecStart line was observed to leave the inference thread's
+// std::ifstream unable to open the relative path "mavic3_drone.rknn"
+// even after the sub-process's CWD reads back as /home/ubuntu/UAV_Robot.
+// Hardcoding the prefix sidesteps the question entirely and matches the
+// known deployment layout. Override at runtime with UAV_NPU_MODEL_DIR.
 const char *strategy_model_name(int32_t id) {
     switch (id) {
-        case UAV_STRATEGY_BATTERY_V2:   return "battery_v2.rknn";
-        case UAV_STRATEGY_CUSTOM:       return "custom.rknn";
+        case UAV_STRATEGY_BATTERY_V2:   return "/home/ubuntu/UAV_Robot/battery_v2.rknn";
+        case UAV_STRATEGY_CUSTOM:       return "/home/ubuntu/UAV_Robot/custom.rknn";
         case UAV_STRATEGY_FACE:         return "";  // handled by face_tracker.py
         case UAV_STRATEGY_BATTERY_CV:   return "";  // handled by battery_tracker.py
-        case UAV_STRATEGY_MAVIC3_DRONE: return "mavic3_drone.rknn";
+        case UAV_STRATEGY_MAVIC3_DRONE: return "/home/ubuntu/UAV_Robot/mavic3_drone.rknn";
         case UAV_STRATEGY_DEFAULT:
-        default:                        return "default.rknn";
+        default:                        return "/home/ubuntu/UAV_Robot/default.rknn";
     }
 }
 
@@ -67,22 +74,20 @@ void print_heartbeat(const UavCHeartbeat &hb) {
 int NpuApplication::run() {
     std::atomic<bool> running{true};
     std::atomic<bool> infer_enabled{true};
-    std::atomic<float> threshold{0.5F};
+    // 0.45 default — measured class=4 (airplane) score for an actual
+    // Mavic 3 in the camera was ~0.50, so the threshold needs to sit
+    // a touch below that to catch the drone reliably. With the
+    // class-4-only filter in postprocess any background hits that
+    // sneak above 0.45 in other classes are dropped anyway.
+    std::atomic<float> threshold{0.45F};
     std::atomic<uint32_t> rate_fps{30U};
     std::mutex model_mu;
     std::string pending_model;
 
     ShmReader reader;
-    std::atomic<bool> shm_attached{reader.open_existing(UAV_SHM_RING_NAME)};
-    if (!shm_attached.load()) {
-        // proc_realsense may not have created the shm ring yet (camera
-        // unplugged at boot). Don't die — keep the ctrl server up so
-        // HostGUI can still set strategy / start / stop. The ingest
-        // thread retries the attach in the background.
-        std::fprintf(stderr,
-                     "proc_npu: shm ring not available yet, will retry "
-                     "in background\n");
+    if (!reader.open_existing(UAV_SHM_RING_NAME)) {
         print_status(UAV_PROC_STATE_ERROR, -20);
+        return 1;
     }
 
     CtrlServer ctrl;
@@ -149,8 +154,14 @@ int NpuApplication::run() {
             // Toggle the face_tracker.py sidecar via a trigger flag file.
             set_trigger_flag(kFaceTriggerFlag,
                              strategy_id == UAV_STRATEGY_FACE);
+            // Battery CV runs alongside the drone NPU model: the user
+            // wants the gripper to see batteries AND drones at once,
+            // so leave battery_tracker.py active for both BATTERY_CV
+            // and MAVIC3_DRONE strategies. Gateway merges the two
+            // detection streams by class.
             set_trigger_flag(kBatteryTriggerFlag,
-                             strategy_id == UAV_STRATEGY_BATTERY_CV);
+                             strategy_id == UAV_STRATEGY_BATTERY_CV
+                          || strategy_id == UAV_STRATEGY_MAVIC3_DRONE);
             {
                 std::lock_guard<std::mutex> lk(model_mu);
                 pending_model = name;
@@ -172,25 +183,7 @@ int NpuApplication::run() {
     NpuPipeline pipeline(&infer, &publisher);
 
     std::thread ingest([&]() {
-        auto last_attach_try = std::chrono::steady_clock::now();
-        constexpr auto kAttachRetryPeriod = std::chrono::seconds(2);
         while (running.load()) {
-            if (!shm_attached.load()) {
-                // proc_realsense not up yet — retry attaching every 2s
-                // without spinning. HostGUI ctrl path keeps working.
-                auto now = std::chrono::steady_clock::now();
-                if (now - last_attach_try >= kAttachRetryPeriod) {
-                    last_attach_try = now;
-                    if (reader.open_existing(UAV_SHM_RING_NAME)) {
-                        shm_attached.store(true);
-                        std::fprintf(stderr,
-                                     "proc_npu: shm ring attached\n");
-                        print_status(UAV_PROC_STATE_RUNNING, 0);
-                    }
-                }
-                std::this_thread::sleep_for(std::chrono::milliseconds(100));
-                continue;
-            }
             InferenceFrame frame{};
             if (!reader.wait_and_read(frame, 100)) {
                 continue;

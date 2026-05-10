@@ -50,13 +50,39 @@
 // ─── NPU result receiver ─────────────────────────────────────────────────────
 // Binds a Unix SOCK_DGRAM to UAV_NPU_RESULT_GW_PATH so proc_npu can push results.
 
+// Two parallel detection sources can publish into the gateway:
+//   battery_tracker.py (class_id == 200, always)  ← Python CV sidecar
+//   proc_npu / mavic3_drone.rknn (class_id < 200) ← RKNN inference
+// Naively keeping a single "latest" cache means the slower source's
+// detections get clobbered by every packet from the faster one, so the
+// HostGUI sees only one of them at a time. Maintain a slot per source
+// (keyed by class_id == 200) and merge on `npu.get_detections`.
 struct NpuResultStore {
-    std::mutex      mu;
-    UavCResult      latest{};
-    bool            has_result{false};
+    std::mutex             mu;
+    UavCResult             battery{};        // class_id == 200 packets
+    UavCResult             other{};          // everything else (drone / face / …)
+    // Atomic timestamps so the get_detections handler can re-check
+    // freshness *outside* the mutex critical section. With plain
+    // uint64_t I observed the optimiser caching the loaded value of
+    // until_ns across calls, returning empty even when drain had
+    // refreshed the slot mere milliseconds earlier — release/acquire
+    // semantics on these atomics fix the visibility.
+    std::atomic<uint64_t>  battery_until_ns{0};
+    std::atomic<uint64_t>  other_until_ns{0};
 };
 
 static NpuResultStore g_npu_result;
+
+static uint64_t now_ns_steady() {
+    using namespace std::chrono;
+    return duration_cast<nanoseconds>(steady_clock::now().time_since_epoch()).count();
+}
+
+// Caches stay valid for this long after the last *non-empty* packet
+// from each source. battery_tracker.py keeps its own 600 ms hold
+// internally, so 1.5 s is comfortably longer than that without making
+// stale boxes hang on screen for noticeable time.
+static constexpr uint64_t kCacheValidNs = 1500ULL * 1000ULL * 1000ULL;
 
 // ─── Video source selection (declared here so the RPC handler further
 //     down can see it; implementation colorize_depth() lives near the
@@ -82,15 +108,27 @@ static int open_npu_result_socket() {
     return fd;
 }
 
-// Drain all pending datagrams from the npu result socket, cache the latest.
+// Drain all pending datagrams from the npu result socket, route by class.
+// battery_tracker.py emits a packet every frame (incl. empty when no
+// battery), but an empty packet carries no class info — so we can't
+// tell which source it came from. Skip empties: a source that goes
+// quiet simply lets its cache age out via kCacheValidNs.
 static void drain_npu_results(int fd) {
     if (fd < 0) return;
     UavCResult r{};
     ssize_t n;
     while ((n = ::recv(fd, &r, sizeof(r), MSG_DONTWAIT)) == static_cast<ssize_t>(sizeof(r))) {
+        if (r.num_detections == 0) continue;
+        const bool is_battery = (r.detections[0].class_id == 200);
+        const uint64_t deadline = now_ns_steady() + kCacheValidNs;
         std::lock_guard<std::mutex> lk(g_npu_result.mu);
-        g_npu_result.latest = r;
-        g_npu_result.has_result = true;
+        if (is_battery) {
+            g_npu_result.battery = r;
+            g_npu_result.battery_until_ns.store(deadline, std::memory_order_release);
+        } else {
+            g_npu_result.other = r;
+            g_npu_result.other_until_ns.store(deadline, std::memory_order_release);
+        }
     }
 }
 
@@ -1545,27 +1583,55 @@ static void handle_rpc(int fd, const std::string &line,
                  "{\"id\":%d,\"result\":{\"ok\":true}}\n", id);
 
     } else if (method == "npu.get_detections") {
-        UavCResult r{};
-        bool has = false;
+        // Snapshot both sources under the lock, then merge their
+        // detection lists so HostGUI sees drone + battery in one
+        // response. Per-source timeout (kCacheValidNs) silently drops
+        // a slot once the producer has stopped sending non-empty
+        // packets, keeping the GUI from holding stale boxes forever.
+        UavCResult bat{}, oth{};
+        bool has_bat = false, has_oth = false;
         {
             std::lock_guard<std::mutex> lk(g_npu_result.mu);
-            r   = g_npu_result.latest;
-            has = g_npu_result.has_result;
+            const uint64_t now = now_ns_steady();
+            if (g_npu_result.battery_until_ns.load(std::memory_order_acquire) > now) {
+                bat = g_npu_result.battery; has_bat = true;
+            }
+            if (g_npu_result.other_until_ns.load(std::memory_order_acquire) > now) {
+                oth = g_npu_result.other;   has_oth = true;
+            }
         }
-        if (!has) {
+        const uint32_t total = (has_bat ? bat.num_detections : 0)
+                             + (has_oth ? oth.num_detections : 0);
+        const uint64_t fid = std::max(has_bat ? bat.frame_id : 0,
+                                      has_oth ? oth.frame_id : 0);
+        if (total == 0) {
             snprintf(resp, sizeof(resp),
                      "{\"id\":%d,\"result\":{\"frame_id\":0,\"num_detections\":0,"
                      "\"detections\":[]}}\n", id);
         } else {
-            // Build detections JSON array
             char dets_buf[6144];
             int  pos = 0;
             dets_buf[pos++] = '[';
-            for (uint32_t i = 0; i < r.num_detections && i < UAV_MAX_DETECTIONS; ++i) {
-                if (i > 0) dets_buf[pos++] = ',';
+            uint32_t emitted = 0;
+            auto emit = [&](const UavDetection &d) {
+                if (emitted >= UAV_MAX_DETECTIONS) return;
+                if (emitted > 0) dets_buf[pos++] = ',';
                 pos += fmt_detection(dets_buf + pos,
                                      (int)(sizeof(dets_buf) - (size_t)pos),
-                                     r.detections[i]);
+                                     d);
+                emitted++;
+            };
+            if (has_oth) {
+                for (uint32_t i = 0; i < oth.num_detections
+                                   && i < UAV_MAX_DETECTIONS; ++i) {
+                    emit(oth.detections[i]);
+                }
+            }
+            if (has_bat) {
+                for (uint32_t i = 0; i < bat.num_detections
+                                   && i < UAV_MAX_DETECTIONS; ++i) {
+                    emit(bat.detections[i]);
+                }
             }
             dets_buf[pos++] = ']';
             dets_buf[pos]   = '\0';
@@ -1573,8 +1639,8 @@ static void handle_rpc(int fd, const std::string &line,
                      "{\"id\":%d,\"result\":{\"frame_id\":%llu,"
                      "\"num_detections\":%u,\"detections\":%s}}\n",
                      id,
-                     (unsigned long long)r.frame_id,
-                     r.num_detections,
+                     (unsigned long long)fid,
+                     emitted,
                      dets_buf);
         }
 

@@ -75,8 +75,16 @@ CRESULT_SIZE = struct.calcsize(CRESULT_FMT)
 BATTERY_CLASS_ID = 200   # distinct from face=100 and YOLO classes 0..79
 
 
-def _pack_result(frame_id, boxes, w, h, fx, fy, cx, cy, depth_lookup):
-    """boxes: list of (x1, y1, x2, y2, score). Returns packed UavCResult."""
+def _pack_result(frame_id, boxes, w, h, fx, fy, cx, cy, depth_lookup,
+                 angles_deg=None):
+    """boxes: list of (x1, y1, x2, y2, score). Returns packed UavCResult.
+
+    angles_deg, if provided, is a list parallel to boxes giving the
+    text-axis (printed-face long-axis) angle in degrees per detection,
+    or None for "no usable text axis on this frame". When present, the
+    angle is written into the yaw_deg slot and has_rpy is set so HostGUI
+    can draw an orientation arrow / proc_grasp can rotate the gripper.
+    """
     values = [frame_id, min(len(boxes), MAX_DETS)]
     for i in range(MAX_DETS):
         if i < len(boxes):
@@ -91,13 +99,19 @@ def _pack_result(frame_id, boxes, w, h, fx, fy, cx, cy, depth_lookup):
                 y_mm = (cy_px - cy) / fy * z_mm
             else:
                 x_mm = y_mm = 0.0
+            yaw_deg = 0.0
+            has_rpy = 0
+            if angles_deg is not None and i < len(angles_deg) \
+                    and angles_deg[i] is not None:
+                yaw_deg = float(angles_deg[i])
+                has_rpy = 1
             values += [
                 BATTERY_CLASS_ID,
                 float(sc),
                 x1, y1, x2, y2,
                 x_mm, y_mm, z_mm,
-                0.0, 0.0, 0.0,
-                has_xyz, 0, 0, 0,
+                0.0, 0.0, yaw_deg,
+                has_xyz, has_rpy, 0, 0,
             ]
         else:
             values += [0,
@@ -249,6 +263,7 @@ def main():
     last_published_fid = 0
     HOLD_MS = 600          # hold longer than face_tracker — batteries rarely
     held_boxes = []        # drop out for a frame or two under normal lighting.
+    held_angles = []       # parallel to held_boxes — text-axis angles per box
     held_until_ms = 0.0
     smoothed_box = None    # EMA'd bbox across frames for stable overlay
 
@@ -285,8 +300,27 @@ def main():
             continue
         last_published_fid = frame_id
 
-        raw_boxes = battery_detect.detect(bgr)
+        dbg = {}
+        raw_boxes = battery_detect.detect(bgr, debug=dbg)
         h, w = bgr.shape[:2]
+
+        # Pull the printed-face long-axis angle out of the candidate
+        # debug record (one entry parallel to raw_boxes). Only kept when
+        # the contour had ≥ 8 bright pixels with enough spread — sparse
+        # specular dots produce nonsense angles, so detect() leaves it
+        # None there.
+        raw_angles = []
+        cands = dbg.get("candidates", [])
+        for i in range(len(raw_boxes)):
+            ang = None
+            if i < len(cands):
+                feats = cands[i].get("feats", {})
+                disp = feats.get("text_dispersion", 0.0) or 0.0
+                # Require ≥ 4 px spread along the major axis — below
+                # that PCA latched onto a single specular dot.
+                if disp >= 4.0:
+                    ang = feats.get("text_angle_deg")
+            raw_angles.append(ang)
 
         # Depth-gate each raw detection: reject anything whose depth
         # reading is outside the grasp-useful range (sensor floor is
@@ -294,7 +328,8 @@ def main():
         # tracker from publishing a "battery" box that actually lies on
         # a distant wall or reads sensor-near-field garbage.
         filtered = []
-        for (x1, y1, x2, y2, sc) in raw_boxes:
+        filtered_angles = []
+        for (x1, y1, x2, y2, sc), ang in zip(raw_boxes, raw_angles):
             cx = int((x1 + x2) * 0.5)
             cy = int((y1 + y2) * 0.5)
             z = _sample_depth_mm(cx, cy, w, h,
@@ -302,6 +337,7 @@ def main():
             if z > 0.0 and (z < DEPTH_MIN_MM or z > DEPTH_MAX_MM):
                 continue
             filtered.append((x1, y1, x2, y2, sc))
+            filtered_angles.append(ang)
 
         # Temporal EMA: if a new detection overlaps the previous one,
         # smooth positions to kill per-frame jitter. No overlap ⇒ snap
@@ -309,15 +345,19 @@ def main():
         if filtered:
             smoothed_box = _ema_box(smoothed_box, filtered[0])
             boxes = [smoothed_box] + filtered[1:]
+            angles = filtered_angles
         else:
             boxes = []
+            angles = []
 
         now_ms = time.time() * 1000.0
         if boxes:
             held_boxes = list(boxes)
+            held_angles = list(angles)
             held_until_ms = now_ms + HOLD_MS
         elif now_ms < held_until_ms:
             boxes = list(held_boxes)
+            angles = list(held_angles)
         else:
             smoothed_box = None    # stale enough to forget
 
@@ -328,7 +368,8 @@ def main():
         payload = _pack_result(frame_id, boxes, w, h,
                                intr["fx"], intr["fy"],
                                intr["cx"], intr["cy"],
-                               depth_lookup)
+                               depth_lookup,
+                               angles_deg=angles)
         _publish(payload)
 
         if not hasattr(main, "_last_log_t"):

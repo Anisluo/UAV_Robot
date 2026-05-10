@@ -72,22 +72,55 @@ UavCResult Postprocess::run(const InferenceFrame &frame,
     out.frame_id       = frame.slot.frame_id;
     out.num_detections = 0;
 
+    // ── Per-class top-1 ──────────────────────────────────────────────────
+    // The COCO-pretrained YOLOv8 used as mavic3_drone.rknn emits many
+    // candidate boxes per scene; an earlier union-merge variant gave
+    // one bbox per class but the bbox grew to the full frame because
+    // unrelated detections got swept in. Keep only the single highest-
+    // score box per class — at most one airplane (drone) bbox per
+    // frame, and the bbox is whatever the strongest detection picked.
+    struct Merged {
+        int   class_id;
+        float score;
+        float x1, y1, x2, y2;
+    };
+    std::vector<Merged> grouped;
     for (const RawDet &d : raw) {
-        if (out.num_detections >= UAV_MAX_DETECTIONS) break;
         if (d.score < threshold) continue;
+        Merged *slot = nullptr;
+        for (auto &m : grouped) {
+            if (m.class_id == d.class_id) { slot = &m; break; }
+        }
+        if (slot == nullptr) {
+            grouped.push_back({d.class_id, d.score, d.x1, d.y1, d.x2, d.y2});
+        } else if (d.score > slot->score) {
+            slot->score = d.score;
+            slot->x1 = d.x1; slot->y1 = d.y1;
+            slot->x2 = d.x2; slot->y2 = d.y2;
+        }
+    }
+
+    for (const Merged &g : grouped) {
+        if (out.num_detections >= UAV_MAX_DETECTIONS) break;
+        // mavic3_drone.rknn ships as a generic COCO YOLOv8 (nc=80), so
+        // a static workspace lights up many classes (tv, keyboard, …).
+        // For drone detection we only care about COCO class 4
+        // (airplane) — everything else is noise on this scene. If a
+        // future strategy needs other classes, drop this guard.
+        if (g.class_id != 4) continue;
 
         UavDetection det{};
-        det.class_id = d.class_id;
-        det.score    = d.score;
-        det.x1       = d.x1;
-        det.y1       = d.y1;
-        det.x2       = d.x2;
-        det.y2       = d.y2;
+        det.class_id = g.class_id;
+        det.score    = g.score;
+        det.x1       = g.x1;
+        det.y1       = g.y1;
+        det.x2       = g.x2;
+        det.y2       = g.y2;
         det.has_xyz  = 0;
 
         // ── 3-D pose from RealSense depth ─────────────────────────────────
-        const float cx_px = (d.x1 + d.x2) * 0.5f;
-        const float cy_px = (d.y1 + d.y2) * 0.5f;
+        const float cx_px = (g.x1 + g.x2) * 0.5f;
+        const float cy_px = (g.y1 + g.y2) * 0.5f;
         const uint32_t px = static_cast<uint32_t>(cx_px + 0.5f);
         const uint32_t py = static_cast<uint32_t>(cy_px + 0.5f);
 
