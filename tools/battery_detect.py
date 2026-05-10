@@ -172,12 +172,19 @@ def _dark_threshold(v_channel: np.ndarray, percentile: float = 12.0,
 def _build_mask(hsv: np.ndarray, v_thr: int, k: int) -> np.ndarray:
     v = hsv[..., 2]
     mask = (v < v_thr).astype(np.uint8) * 255
-    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (k, k))
-    # Close fills the label cut-outs / seams; open kills background
-    # speckle. One iteration of open is enough — heavier open eats
-    # into the real battery silhouette at camera resolution.
-    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=2)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN,  kernel, iterations=1)
+    close_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (k, k))
+    # Closing fills the battery's label cutouts and contact seams.
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, close_kernel, iterations=2)
+    # Use a *larger* open kernel than the close kernel so any thin
+    # bridges the close just bridged — typically the battery silhouette
+    # touching off-screen equipment / cables at the top edge of the
+    # frame — get split apart again. Kernel (k+2)² removes connections
+    # ≤ ⌊(k+2)/2⌋ ≈ 2 px while only nibbling 2 px off the battery body
+    # (insignificant against a 100×150 px silhouette). Without this the
+    # battery contour would touch y=0 and the edge-touch reject would
+    # drop it.
+    open_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (k + 2, k + 2))
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN,  open_kernel, iterations=1)
     return mask
 
 
