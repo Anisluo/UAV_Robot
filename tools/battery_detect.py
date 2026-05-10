@@ -423,6 +423,38 @@ def _score_candidate(f: dict, frame_area: float) -> tuple[float, bool]:
     return score, is_end_view
 
 
+def _expand_top_to_dim(hsv: np.ndarray,
+                       x1: int, y1: int, x2: int,
+                       max_extend: int = 18,
+                       v_dim: int = 130) -> int:
+    """Walk upward from a contour's top edge, extending it across rows
+    where the bbox-column median V is still relatively dim. The dark
+    mask uses V<80 to chase pure black; battery metal contacts and
+    seam highlights typically sit at V≈90–130 and get cut off — this
+    recovers them so the bbox encloses the whole battery, not just
+    its body. Capped at max_extend px so it can't run into off-plate
+    background junk that may be sitting just above the workspace.
+    """
+    if y1 <= 0:
+        return y1
+    v = hsv[..., 2]
+    x1c = max(0, x1)
+    x2c = min(v.shape[1], x2)
+    if x2c <= x1c:
+        return y1
+    new_y1 = y1
+    for offset in range(1, max_extend + 1):
+        cand = y1 - offset
+        if cand < 0:
+            break
+        row = v[cand, x1c:x2c]
+        if int(np.median(row)) < v_dim:
+            new_y1 = cand
+        else:
+            break
+    return new_y1
+
+
 def _find_candidates(bgr: np.ndarray, hsv: np.ndarray, edge_map: np.ndarray,
                      v_thr: int, k: int) -> list[tuple[float, BatteryBox, dict]]:
     mask = _build_mask(hsv, v_thr, k)
@@ -437,8 +469,17 @@ def _find_candidates(bgr: np.ndarray, hsv: np.ndarray, edge_map: np.ndarray,
     # bridges between the workspace object and ambient junk.
     if plate is not None:
         px, py, pw, ph = plate
+        # Pad the ROI vertically so a battery standing on the plate
+        # whose top juts above the plate's bright edge still gets its
+        # full silhouette captured. Without padding, the bbox stops at
+        # the plate top and HostGUI shows the battery cut off at the
+        # midline. Background junk usually sits well above 30 px clear
+        # of the plate so this padding doesn't reintroduce bridges.
+        pad_top = 30
+        py2 = max(0, py - pad_top)
+        ph2 = ph + (py - py2)
         roi = np.zeros_like(mask)
-        roi[py:py + ph, px:px + pw] = 255
+        roi[py2:py2 + ph2, px:px + pw] = 255
         mask = cv2.bitwise_and(mask, roi)
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL,
                                    cv2.CHAIN_APPROX_SIMPLE)
@@ -462,7 +503,14 @@ def _find_candidates(bgr: np.ndarray, hsv: np.ndarray, edge_map: np.ndarray,
         score, is_end = _score_candidate(feats, frame_area)
         if score < SCORE_MIN: continue
         x, y, bw, bh = feats["bbox"]
-        out.append((score, (x, y, x + bw, y + bh, score), feats))
+        # Extend top of the bbox to cover battery sections (metal
+        # contacts, label highlights) whose V is too bright for the
+        # 0.05–0.10 V_FLOOR strict mask. Limited to the height of
+        # the bbox itself so a sea of darkness above can't pull the
+        # bbox into off-screen junk.
+        x2 = x + bw
+        y_top = _expand_top_to_dim(hsv, x, y, x2, max_extend=min(20, bh // 4))
+        out.append((score, (x, y_top, x2, y + bh, score), feats))
     return out
 
 
