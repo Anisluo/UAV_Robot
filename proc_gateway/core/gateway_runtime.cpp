@@ -137,8 +137,26 @@ static void drain_npu_results(int fd) {
 // must be forwarded to proc_arm so they share one CAN socket, avoiding
 // ACK-frame races when both processes are bound to the same interface.
 static const char *proc_arm_sock_path() {
-    const char *e = std::getenv("UAV_PROC_ARM_SOCK");
-    return (e && e[0] != '\0') ? e : "/tmp/uav_proc_arm.sock";
+    // gen-2 routing: if UAV_ARM_BACKEND=piper, or proc_piper's socket
+    // exists, point arm.* (and piper.*) forwards at it. Else fall back
+    // to the legacy proc_arm socket. proc_piper's RPC accepts the same
+    // arm.* method names, so callers don't notice.
+    const char *forced = std::getenv("UAV_PROC_ARM_SOCK");
+    if (forced && forced[0] != '\0') return forced;
+
+    const char *piper_env = std::getenv("UAV_PROC_PIPER_SOCK");
+    const char *piper_sock = (piper_env && piper_env[0] != '\0')
+                                 ? piper_env
+                                 : "/tmp/uav_proc_piper.sock";
+
+    const char *backend = std::getenv("UAV_ARM_BACKEND");
+    if (backend && std::strcmp(backend, "piper") == 0) return piper_sock;
+
+    // Probe: if proc_piper's socket is reachable, use it.
+    struct stat st{};
+    if (stat(piper_sock, &st) == 0) return piper_sock;
+
+    return "/tmp/uav_proc_arm.sock";
 }
 
 // Sends one JSON-RPC request to proc_arm and returns the parsed "ok" field.
@@ -240,6 +258,47 @@ static std::string proc_arm_call_result(const char *method, const char *params_j
     const char *pos = std::strstr(buf, tag);
     if (!pos) return {};
     return std::string(pos + std::strlen(tag));
+}
+
+// Transparent pass-through to the arm backend's Unix socket. Sends the
+// full original request line and copies the reply back verbatim, so any
+// arm.* / piper.* method that gateway doesn't handle explicitly reaches
+// proc_piper (gen-2) or proc_arm (gen-1) without us having to learn its
+// param/return schema first.
+static bool proc_arm_passthrough(const char *original_line,
+                                  char *resp, size_t resp_sz) {
+    int fd = ::socket(AF_UNIX, SOCK_STREAM, 0);
+    if (fd < 0) return false;
+    struct timeval tv{}; tv.tv_sec = 5; tv.tv_usec = 0;
+    ::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    ::setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+    sockaddr_un addr{}; addr.sun_family = AF_UNIX;
+    std::strncpy(addr.sun_path, proc_arm_sock_path(), sizeof(addr.sun_path) - 1);
+    if (::connect(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) < 0) {
+        ::close(fd);
+        return false;
+    }
+    const size_t line_len = std::strlen(original_line);
+    if (::write(fd, original_line, line_len) != (ssize_t)line_len) {
+        ::close(fd); return false;
+    }
+    if (line_len == 0 || original_line[line_len - 1] != '\n') {
+        ::write(fd, "\n", 1);
+    }
+    char buf[4096] = {};
+    int total = 0;
+    while (total < (int)sizeof(buf) - 1) {
+        ssize_t n = ::read(fd, buf + total, sizeof(buf) - 1 - (size_t)total);
+        if (n <= 0) break;
+        total += (int)n;
+        if (std::memchr(buf, '\n', (size_t)total)) break;
+    }
+    ::close(fd);
+    if (total <= 0) return false;
+    // Copy verbatim; proc_piper's reply id matches what the client sent
+    // because we forwarded the original line unchanged.
+    snprintf(resp, resp_sz, "%.*s", total, buf);
+    return true;
 }
 
 // ─── proc_npu JSON-RPC forwarding (Unix stream socket) ─────────────────────
@@ -1933,7 +1992,11 @@ static void handle_rpc(int fd, const std::string &line,
                  id, ok ? "true" : "false", joint);
 
     } else if (method == "arm.move_joint") {
+        // Accept either "joint" or "joint_index" — HostGUI / PiperWidget
+        // uses joint_index, legacy callers use joint. Both pass through to
+        // proc_piper / proc_arm.
         int joint = json_int(s, "joint", -1);
+        if (joint < 0) joint = json_int(s, "joint_index", -1);
         double target_deg = json_double(s, "target_deg", 0.0);
         char params_json[128];
         std::snprintf(params_json, sizeof(params_json),
@@ -2121,8 +2184,18 @@ static void handle_rpc(int fd, const std::string &line,
         snprintf(resp, sizeof(resp),
                  "{\"id\":%d,\"result\":%s}\n", id, status.c_str());
 
+    } else if (std::strncmp(method.c_str(), "arm.", 4) == 0 ||
+               std::strncmp(method.c_str(), "piper.", 6) == 0) {
+        // Transparent forward to the configured arm backend (proc_arm or
+        // proc_piper). Covers arm.get_pose, arm.move_pose6d, all the
+        // piper.* extensions, etc. — methods gateway doesn't decode itself.
+        if (!proc_arm_passthrough(line.c_str(), resp, sizeof(resp))) {
+            snprintf(resp, sizeof(resp),
+                     "{\"id\":%d,\"result\":{\"ok\":false,\"error\":\"arm backend unavailable\"}}\n",
+                     id);
+        }
     } else {
-        // Stub for arm/ugv/airport/gripper – acknowledge without hardware action
+        // Stub for ugv/airport/gripper unknowns – acknowledge without action
         snprintf(resp, sizeof(resp),
                  "{\"id\":%d,\"result\":{\"ok\":true}}\n", id);
     }

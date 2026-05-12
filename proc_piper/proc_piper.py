@@ -524,7 +524,11 @@ class RpcServer:
                     line, buf = buf.split(b"\n", 1)
                     if not line.strip(): continue
                     resp = self._dispatch(line.decode("utf-8", errors="replace"))
-                    conn.sendall((json.dumps(resp) + "\n").encode("utf-8"))
+                    # Compact form (no whitespace) matches proc_arm's output,
+                    # so gateway's strstr-based "\"result\":" parser sees the
+                    # value char immediately after the colon (e.g. '[' for
+                    # arrays). Whitespace there breaks the parser.
+                    conn.sendall((json.dumps(resp, separators=(",", ":")) + "\n").encode("utf-8"))
         except Exception as e:
             log("ERROR", f"client: {e}")
         finally:
