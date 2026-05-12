@@ -589,7 +589,17 @@ class RpcServer:
             "piper.handshake":              lambda **kw: c.m_piper_handshake(),
             "piper.park_zero":              lambda **kw: c.m_piper_park_zero(),
             "piper.get_status":             lambda **kw: c.m_piper_get_status(),
-            "piper.set_gripper_angle":      lambda angle_mm=0.0, effort_mNm=1000.0, **_: c.m_piper_set_gripper_angle(angle_mm, effort_mNm),
+            # Accept both the canonical "angle_mm"/"effort_mNm" names AND the
+            # legacy "angle"/"force_pct" names TeachWidget v1 emitted. With
+            # the legacy names, value is interpreted as mm (treat the stored
+            # 0-80 number as a mm target) and force_pct 0-100 maps to
+            # 0-2000 mN·m.
+            "piper.set_gripper_angle":      lambda angle_mm=None, effort_mNm=None,
+                                                   angle=None, force_pct=None, **_:
+                c.m_piper_set_gripper_angle(
+                    angle_mm if angle_mm is not None else (angle if angle is not None else 0.0),
+                    effort_mNm if effort_mNm is not None else (
+                        float(force_pct) * 20.0 if force_pct is not None else 1000.0)),
             "piper.move_cartesian":         lambda **kw: c.m_piper_move_cartesian(**_filter_kw(kw, ("X_mm","Y_mm","Z_mm","RX_deg","RY_deg","RZ_deg","mode"))),
         }
 
