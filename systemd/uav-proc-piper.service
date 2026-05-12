@@ -1,0 +1,19 @@
+[Unit]
+Description=UAV Robot Piper Arm Process (gen-2)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=@PROJECT_ROOT@
+EnvironmentFile=-/etc/default/uav_robot
+# Bring up can_piper before proc_piper if udev hasn't already; idempotent.
+ExecStartPre=-/bin/bash -lc 'test -L /sys/class/net/can_piper || @PROJECT_ROOT@/piper/scripts/piper_up.sh'
+ExecStart=/usr/bin/python3 @PROJECT_ROOT@/proc_piper/proc_piper.py ${UAV_PROC_PIPER_ARGS:-}
+Restart=on-failure
+RestartSec=2
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

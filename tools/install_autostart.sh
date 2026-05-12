@@ -8,20 +8,37 @@ SYSTEMD_DST_DIR="/etc/systemd/system"
 ENV_DST_FILE="/etc/default/uav_robot"
 PACKAGES_DIR="${PROJECT_ROOT}/packages"
 
-DEFAULT_SERVICES="uav_robotd,proc_realsense,proc_npu,proc_gateway,proc_car,proc_gripper,proc_arm,proc_airport,proc_grasp,battery_tracker,face_tracker"
-SERVICES="${DEFAULT_SERVICES}"
+# Arm backend choice. "piper" = gen-2 (proc_piper drives AgileX Piper).
+#                     "legacy" = gen-1 (proc_arm + proc_gripper drive ZDT arm).
+# Override via --backend flag or UAV_ARM_BACKEND env var.
+BACKEND="${UAV_ARM_BACKEND:-piper}"
+
+# Shared services (backend-independent)
+SHARED_SERVICES="uav_robotd,proc_realsense,proc_npu,proc_gateway,proc_car,proc_airport,proc_grasp,battery_tracker,face_tracker"
+
+# Backend-dependent arm services
+ARM_SERVICES_PIPER="proc_piper"
+ARM_SERVICES_LEGACY="proc_gripper,proc_arm"
+
+# DEFAULT_SERVICES is the union of shared + backend's arm slice, computed below.
+SERVICES=""
 ORIGINAL_ARGS=("$@")
 
 usage() {
     cat <<'EOF'
 Usage:
-  sudo ./tools/install_autostart.sh [--services name1,name2,...] [--skip-deps]
+  sudo ./tools/install_autostart.sh [--services name1,name2,...] [--backend piper|legacy] [--skip-deps]
 
 Options:
-  --services   Comma-separated service list. Available values:
-               uav_robotd, proc_realsense, proc_npu, proc_gateway,
-               proc_car, proc_gripper, proc_arm, proc_airport, proc_grasp,
-               battery_tracker, face_tracker
+  --backend    Arm backend: 'piper' (gen-2 default) or 'legacy' (gen-1).
+               'piper'  → starts proc_piper (Python, AgileX Piper SDK).
+               'legacy' → starts proc_arm + proc_gripper (ZDT CAN + servo UART).
+               Can also be set via UAV_ARM_BACKEND env var.
+  --services   Comma-separated service list (overrides backend's defaults).
+               Available values:
+                 uav_robotd, proc_realsense, proc_npu, proc_gateway,
+                 proc_car, proc_piper, proc_gripper, proc_arm,
+                 proc_airport, proc_grasp, battery_tracker, face_tracker
   --skip-deps  Skip system dependency setup (librknnrt.so, udev rules,
                cv2/numpy pip install). Useful for incremental rebuilds.
   -h, --help   Show this help message.
@@ -42,10 +59,16 @@ if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
 fi
 
 SKIP_DEPS=0
+USER_SET_SERVICES=0
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --services)
             SERVICES="${2:-}"
+            USER_SET_SERVICES=1
+            shift 2
+            ;;
+        --backend)
+            BACKEND="${2:-}"
             shift 2
             ;;
         --skip-deps)
@@ -63,6 +86,43 @@ while [[ $# -gt 0 ]]; do
             ;;
     esac
 done
+
+# Validate backend choice
+case "${BACKEND}" in
+    piper|legacy) ;;
+    *) echo "Unknown --backend: ${BACKEND} (expected piper|legacy)" >&2; exit 1 ;;
+esac
+
+# Compute DEFAULT_SERVICES from backend (unless --services overrode it)
+if [[ ${USER_SET_SERVICES} -eq 0 ]]; then
+    case "${BACKEND}" in
+        piper)  SERVICES="${SHARED_SERVICES},${ARM_SERVICES_PIPER}" ;;
+        legacy) SERVICES="${SHARED_SERVICES},${ARM_SERVICES_LEGACY}" ;;
+    esac
+fi
+echo "Arm backend: ${BACKEND}"
+
+# Disable services from the *opposite* backend so they don't fight us
+# (only when --services was NOT user-provided, since the user might want
+# to mix-and-match explicitly).
+if [[ ${USER_SET_SERVICES} -eq 0 ]]; then
+    case "${BACKEND}" in
+        piper)
+            for stale in uav-proc-arm.service uav-proc-gripper.service; do
+                if systemctl is-enabled --quiet "${stale}" 2>/dev/null; then
+                    echo "Disabling legacy ${stale}"
+                    systemctl disable --now "${stale}" 2>/dev/null || true
+                fi
+            done
+            ;;
+        legacy)
+            if systemctl is-enabled --quiet uav-proc-piper.service 2>/dev/null; then
+                echo "Disabling gen-2 uav-proc-piper.service"
+                systemctl disable --now uav-proc-piper.service 2>/dev/null || true
+            fi
+            ;;
+    esac
+fi
 
 if [[ ${EUID} -ne 0 ]]; then
     exec sudo "$0" "${ORIGINAL_ARGS[@]}"
@@ -82,6 +142,7 @@ declare -A BUILD_COMMANDS=(
     [proc_car]="make -C proc_car"
     [proc_gripper]="make -C proc_gripper"
     [proc_arm]="make -C proc_arm"
+    [proc_piper]=""
     [proc_airport]="make -C proc_airport"
     [proc_grasp]="make -C proc_grasp"
     [battery_tracker]=""
@@ -96,6 +157,7 @@ declare -A UNIT_NAMES=(
     [proc_car]="uav-proc-car.service"
     [proc_gripper]="uav-proc-gripper.service"
     [proc_arm]="uav-proc-arm.service"
+    [proc_piper]="uav-proc-piper.service"
     [proc_airport]="uav-proc-airport.service"
     [proc_grasp]="uav-proc-grasp.service"
     [battery_tracker]="uav-battery-tracker.service"
@@ -108,7 +170,7 @@ normalize_service_name() {
     local name
     name=$(echo "$1" | tr -d '[:space:]')
     case "${name}" in
-        uav_robotd|proc_realsense|proc_npu|proc_gateway|proc_car|proc_gripper|proc_arm|proc_airport|proc_grasp|battery_tracker|face_tracker)
+        uav_robotd|proc_realsense|proc_npu|proc_gateway|proc_car|proc_gripper|proc_arm|proc_piper|proc_airport|proc_grasp|battery_tracker|face_tracker)
             printf '%s\n' "${name}"
             ;;
         *)
