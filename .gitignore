@@ -9,6 +9,7 @@ build/
 *.exe
 *.log
 proc_arm.zip
+packages.zip
 .vscode/
 
 # Captured drone training datasets — too large + binary, rsync between

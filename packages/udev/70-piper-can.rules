@@ -1,0 +1,9 @@
+# Rename the candleLight USB-CAN adapter feeding the AgileX Piper arm to a
+# stable name (can_piper) so proc_piper.py doesn't have to guess which canX
+# it landed on. The candleLight firmware identifies as 1d50:606f and binds
+# to gs_usb; ATTRS bubbles up from the parent USB device to the CAN netdev.
+#
+# Bringing the link up at 1Mbps is intentionally NOT done here — udev runs
+# RUN+= in a constrained env where `ip link set ... type can` is racy. The
+# service uses ExecStartPre=piper_up.sh which is more reliable.
+SUBSYSTEM=="net", ACTION=="add", ATTRS{idVendor}=="1d50", ATTRS{idProduct}=="606f", NAME="can_piper"

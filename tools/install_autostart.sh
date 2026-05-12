@@ -44,12 +44,20 @@ Options:
   -h, --help   Show this help message.
 
 What this script does (one-shot deploy):
-  1. Install librealsense2 udev rules from packages/udev/*.rules (if present)
+  1. Install udev rules from packages/udev/*.rules (librealsense + can_piper)
   2. Upgrade /usr/lib/librknnrt.so from packages/librknnrt.so (if present and newer)
-  3. Install Python deps cv2 + numpy from packages/*.whl (if present)
-  4. Wipe stale build/ + *.o (kills cross-arch x86 leftovers)
-  5. Build each C++ service (Python sidecars skip this step)
-  6. Render + install + enable + restart each systemd unit
+  3. Install gs_usb.ko from packages/gs_usb.ko (USB-CAN driver for Piper)
+  4. Install Python deps cv2 + numpy from packages/*.whl (if present)
+  5. Install piper_sdk + python-can (when --backend piper, from wheels or pip)
+  6. Wipe stale build/ + *.o (kills cross-arch x86 leftovers)
+  7. Build each C++ service (Python sidecars skip this step)
+  8. Render + install + enable + restart each systemd unit
+
+Site-deploy checklist (one-key on fresh RK3588):
+  - Copy the whole UAV_Robot/ tree to /opt/uav_robot (or anywhere)
+  - Drop the kernel-matched gs_usb.ko into packages/ if you have it
+  - Drop piper_sdk-*.whl + python_can-*.whl into packages/ for offline install
+  - sudo ./tools/install_autostart.sh         (defaults: backend=piper)
 EOF
 }
 
@@ -240,6 +248,76 @@ if [[ ${SKIP_DEPS} -eq 0 ]]; then
             echo "Python deps cv2 + numpy already present."
         fi
     fi
+
+    # ── Step 2b: gs_usb.ko (USB-CAN driver for candleLight / Piper) ────
+    # Pre-built against the running kernel; only copy if absent or if the
+    # bundled file differs from the installed one. depmod regenerates the
+    # module index so `modprobe gs_usb` works on next boot.
+    if [[ -f "${PACKAGES_DIR}/gs_usb.ko" ]]; then
+        KREL=$(uname -r)
+        KMOD_DIR="/lib/modules/${KREL}/extra"
+        DST_KO="${KMOD_DIR}/gs_usb.ko"
+        SRC_SIZE=$(stat -c%s "${PACKAGES_DIR}/gs_usb.ko")
+        DST_SIZE=$(stat -c%s "${DST_KO}" 2>/dev/null || echo 0)
+        if [[ "${SRC_SIZE}" != "${DST_SIZE}" ]]; then
+            echo "Installing gs_usb.ko -> ${DST_KO}"
+            mkdir -p "${KMOD_DIR}"
+            install -m 0644 "${PACKAGES_DIR}/gs_usb.ko" "${DST_KO}"
+            depmod -a "${KREL}" 2>/dev/null || depmod -a 2>/dev/null || true
+        else
+            echo "gs_usb.ko already at bundled version (${KREL})."
+        fi
+        # Auto-load at boot so the Piper CAN adapter comes up before
+        # uav-proc-piper.service even on a cold reboot.
+        if [[ ! -f /etc/modules-load.d/gs_usb.conf ]]; then
+            echo gs_usb > /etc/modules-load.d/gs_usb.conf
+            echo "Wrote /etc/modules-load.d/gs_usb.conf"
+        fi
+        modprobe gs_usb 2>/dev/null || true
+    else
+        echo "gs_usb.ko not bundled (packages/gs_usb.ko missing) — skipping."
+        echo "  → Piper backend will only work if the kernel already ships gs_usb,"
+        echo "    or if you load it manually before starting uav-proc-piper.service."
+    fi
+
+    # ── Step 2c: piper_sdk + python-can (only for the gen-2 backend) ───
+    # proc_piper.py needs piper_sdk's C_PiperInterface_V2. Prefer offline
+    # wheels in packages/ so air-gapped sites work; fall back to public
+    # PyPI if network is reachable.
+    NEEDS_PIPER_SDK=0
+    if [[ "${BACKEND}" == "piper" ]]; then
+        NEEDS_PIPER_SDK=1
+    elif [[ ",${SERVICES}," == *,proc_piper,* ]]; then
+        NEEDS_PIPER_SDK=1
+    fi
+    if [[ ${NEEDS_PIPER_SDK} -eq 1 ]]; then
+        if python3 -c "import piper_sdk, can" 2>/dev/null; then
+            echo "piper_sdk + python-can already present."
+        else
+            echo "Installing piper_sdk + python-can ..."
+            INSTALLED=0
+            if compgen -G "${PACKAGES_DIR}/piper_sdk*.whl" > /dev/null \
+               || compgen -G "${PACKAGES_DIR}/python_can*.whl" > /dev/null; then
+                if pip3 install --no-index --find-links="${PACKAGES_DIR}" \
+                    piper_sdk python-can 2>&1 | tail -5; then
+                    INSTALLED=1
+                fi
+            fi
+            if [[ ${INSTALLED} -eq 0 ]]; then
+                echo "  offline wheels missing — falling back to online pip ..."
+                pip3 install piper_sdk python-can 2>&1 | tail -5 || \
+                    echo "  WARN: piper_sdk install failed (offline + online both unavailable). proc_piper will not start." >&2
+            fi
+        fi
+    fi
+fi
+
+# ── Step 2d: make shipped helper scripts executable ──────────────────────
+# Files copied from a Windows checkout often arrive without the +x bit.
+# This is a no-op when the bit is already set.
+chmod +x "${PROJECT_ROOT}/tools/install_autostart.sh" 2>/dev/null || true
+if [[ -f "${PROJECT_ROOT}/piper/scripts/piper_up.sh" ]]; then
+    chmod +x "${PROJECT_ROOT}/piper/scripts/piper_up.sh" 2>/dev/null || true
 fi
 
 # ── Step 3: wipe stale build artifacts ───────────────────────────────────
