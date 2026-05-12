@@ -464,6 +464,10 @@ class RpcServer:
             "arm.move_xyz_rotation":        lambda **kw: c.m_arm_move_pose6d(**_filter_kw(kw, ("x_mm","y_mm","z_mm","roll_deg","pitch_deg","yaw_deg","speed_ratio","rotation_order"))),
             "arm.move_linear_xyz_rotation": lambda **kw: c.m_arm_move_pose6d(mode="L", **_filter_kw(kw, ("x_mm","y_mm","z_mm","roll_deg","pitch_deg","yaw_deg","rotation_order"))),
             "arm.get_motor_angles":         lambda **kw: c.m_arm_get_motor_angles(),
+            # HostGUI uses the shorter "arm.get_angles" name; wraps to match
+            # the get_angles reply shape proc_arm produces ({"angles":[...]})
+            "arm.get_angles":               lambda **kw: {"angles": c.m_arm_get_motor_angles()},
+            "arm.set_joints":               lambda **kw: c.m_arm_move_joints(_extract_joints(kw), kw.get("speed_ratio", 1.0)),
             "arm.set_current_zero":         lambda joint_index=None, joint=None, **_: c.m_arm_set_current_zero(joint_index or joint or 1),
             "arm.reset_current_zero":       lambda joint_index=None, joint=None, **_: c.m_arm_reset_current_zero(joint_index or joint or 1),
             "arm.get_pose":                 lambda rotation_order="zyx", **_: c.m_arm_get_pose(rotation_order),

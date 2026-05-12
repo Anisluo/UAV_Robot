@@ -1541,6 +1541,33 @@ static void handle_rpc(int fd, const std::string &line,
                  "{\"id\":%d,\"result\":{\"pong\":true,\"uptime_ms\":%llu}}\n",
                  id, (unsigned long long)uptime);
 
+    } else if (method == "system.get_backend") {
+        // Reports which arm backend is live. HostGUI uses this on
+        // connect to decide whether to show PiperWidget (gen-2) or
+        // legacy ArmWidget. Detection order:
+        //   1. UAV_ARM_BACKEND env var ('piper' | 'legacy') wins.
+        //   2. Else probe the proc_piper Unix socket — present ⇒ piper.
+        //   3. Otherwise legacy.
+        const char *backend_env = std::getenv("UAV_ARM_BACKEND");
+        const char *piper_sock  = std::getenv("UAV_PROC_PIPER_SOCK");
+        if (piper_sock == nullptr || piper_sock[0] == '\0') piper_sock = "/tmp/uav_proc_piper.sock";
+
+        const char *backend = "legacy";
+        const char *model   = "ZDT Emm V5 (gen-1)";
+        if (backend_env != nullptr && backend_env[0] != '\0') {
+            backend = backend_env;
+            if (std::strcmp(backend, "piper") == 0) model = "AgileX Piper 6-DOF";
+        } else {
+            struct stat st{};
+            if (stat(piper_sock, &st) == 0) {
+                backend = "piper";
+                model   = "AgileX Piper 6-DOF";
+            }
+        }
+        snprintf(resp, sizeof(resp),
+                 "{\"id\":%d,\"result\":{\"backend\":\"%s\",\"model\":\"%s\"}}\n",
+                 id, backend, model);
+
     } else if (method == "camera.set_profile") {
         int w   = json_int(s, "width",  640);
         int h   = json_int(s, "height", 480);
