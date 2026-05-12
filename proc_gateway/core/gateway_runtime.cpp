@@ -2009,21 +2009,55 @@ static void handle_rpc(int fd, const std::string &line,
                  id, ok ? "true" : "false", joint, target_deg);
 
     } else if (method == "arm.move_joints") {
-        // Forward to proc_arm. The remote API expects an "arm.set_joints"
-        // method or a 6-element array; use the per-joint format that proc_arm
-        // already handles via arm.move_joints / arm.set_joints.
-        double j[6] = {
-            json_double(s, "j1_deg", 0.0),
-            json_double(s, "j2_deg", 0.0),
-            json_double(s, "j3_deg", 0.0),
-            json_double(s, "j4_deg", 0.0),
-            json_double(s, "j5_deg", 0.0),
-            json_double(s, "j6_deg", 0.0)
-        };
-        char params_json[256];
+        // Accept three input shapes, in priority order:
+        //   1. "joints":  [j1, j2, j3, j4, j5, j6]      ← TeachWidget
+        //   2. "angles":  [j1, j2, j3, j4, j5, j6]      ← PiperWidget
+        //   3. "j1_deg":N, "j2_deg":N, …                ← legacy / direct
+        // Whichever yields six numbers wins. Before the array shapes were
+        // recognised, gateway silently dropped them and forwarded six zeros
+        // to proc_piper, which made the arm go home regardless of intent.
+        double j[6] = {0, 0, 0, 0, 0, 0};
+        bool   filled = false;
+
+        // Try array shapes first. json_int/json_double tools key on
+        // "name":..., so for arrays we have to grep manually.
+        for (const char *key : {"\"joints\"", "\"angles\""}) {
+            const char *p = std::strstr(s, key);
+            if (!p) continue;
+            p = std::strchr(p, '[');
+            if (!p) continue;
+            ++p;
+            int idx = 0;
+            for (; idx < 6; ++idx) {
+                while (*p == ' ' || *p == '\t' || *p == ',' || *p == '\n') ++p;
+                if (*p == ']' || *p == '\0') break;
+                char *end = nullptr;
+                double v = std::strtod(p, &end);
+                if (end == p) break;
+                j[idx] = v;
+                p = end;
+            }
+            if (idx == 6) { filled = true; break; }
+        }
+        // Fallback to per-joint keys if no array was present.
+        if (!filled) {
+            j[0] = json_double(s, "j1_deg", 0.0);
+            j[1] = json_double(s, "j2_deg", 0.0);
+            j[2] = json_double(s, "j3_deg", 0.0);
+            j[3] = json_double(s, "j4_deg", 0.0);
+            j[4] = json_double(s, "j5_deg", 0.0);
+            j[5] = json_double(s, "j6_deg", 0.0);
+        }
+        // Forward in the array form proc_piper natively understands. We
+        // include both "joints" (which proc_piper's _extract_joints prefers)
+        // and per-joint keys (in case the backend is still the legacy
+        // proc_arm which decodes those instead).
+        char params_json[384];
         std::snprintf(params_json, sizeof(params_json),
-                      "{\"j1_deg\":%.4f,\"j2_deg\":%.4f,\"j3_deg\":%.4f,"
+                      "{\"joints\":[%.4f,%.4f,%.4f,%.4f,%.4f,%.4f],"
+                      "\"j1_deg\":%.4f,\"j2_deg\":%.4f,\"j3_deg\":%.4f,"
                       "\"j4_deg\":%.4f,\"j5_deg\":%.4f,\"j6_deg\":%.4f}",
+                      j[0], j[1], j[2], j[3], j[4], j[5],
                       j[0], j[1], j[2], j[3], j[4], j[5]);
         bool ok = proc_arm_call("arm.move_joints", params_json);
         snprintf(resp, sizeof(resp),
