@@ -108,6 +108,13 @@ class PiperController:
             "heartbeat_alive": False, "speed_pct": speed,
         }
         self._cache_skip_counter = 0
+        # Auto-recovery: count consecutive cache snapshots where ctrl_mode
+        # is NOT CAN_CTRL(1). When the operator triggers the physical
+        # drag-teach button on the arm body and then exits, ctrl_mode
+        # gets stuck oscillating STANDBY↔CAN_CTRL forever — our heartbeat
+        # alone can't pull it back without EmergencyStop(0x02) first.
+        self._nonctrl_streak    = 0
+        self._last_recovery_t   = 0.0
 
         # Lifecycle
         self.connected = False
@@ -135,15 +142,10 @@ class PiperController:
         j = self.p.GetArmJointMsgs().joint_state
         self.target_joints = [j.joint_1, j.joint_2, j.joint_3, j.joint_4, j.joint_5, j.joint_6]
 
-        # V1.8-2 firmware handshake: MasterSlave → STANDBY → CAN_CTRL → Enable
-        log("INFO", "handshake: MasterSlave(0xFC)")
-        self.p.MasterSlaveConfig(0xFC, 0, 0, 0); time.sleep(0.3)
-        log("INFO", "handshake: STANDBY")
-        self.p.MotionCtrl_2(0x00, 0x00, 0, 0x00); time.sleep(0.3)
-        log("INFO", "handshake: CAN_CTRL")
-        self.p.MotionCtrl_2(0x01, MODE_J, self.speed, 0x00); time.sleep(0.3)
-        log("INFO", "handshake: EnableArm")
-        self.p.EnableArm(7, 0x02); time.sleep(0.3)
+        # V1.8-2 firmware handshake. Sequence verified to also recover from
+        # the post-teach "stuck oscillating STANDBY/CAN_CTRL" state, so it's
+        # safe to reuse for both startup and runtime recovery.
+        self._do_full_handshake()
         self.connected = True
         log("INFO", "handshake complete")
 
@@ -177,6 +179,29 @@ class PiperController:
             self._hb_thread.join(timeout=1.0)
         self.heartbeat_alive = False
         log("INFO", "shutdown complete (arm idle at zero, still energised)")
+
+    def _do_full_handshake(self) -> None:
+        """Drive Piper into a stable CAN_CTRL state.
+
+        Used both on startup and on runtime recovery (when ctrl_mode falls
+        out of CAN_CTRL — typically because the operator triggered the
+        physical drag-teach button on the arm body, then exited teach).
+
+        Without EmergencyStop(0x02) "Resume" at the start, a post-teach
+        arm keeps oscillating STANDBY ↔ CAN_CTRL even with continuous
+        heartbeat. The Resume command clears an internal "abnormal" flag
+        the firmware sets when teach mode terminates, and is the cure.
+        """
+        log("INFO", "handshake: EmergencyStop(0x02) — resume from any halt/teach")
+        self.p.EmergencyStop(0x02); time.sleep(0.3)
+        log("INFO", "handshake: MasterSlaveConfig(0xFC)")
+        self.p.MasterSlaveConfig(0xFC, 0, 0, 0); time.sleep(0.3)
+        log("INFO", "handshake: STANDBY")
+        self.p.MotionCtrl_2(0x00, 0x00, 0, 0x00); time.sleep(0.3)
+        log("INFO", "handshake: CAN_CTRL")
+        self.p.MotionCtrl_2(0x01, MODE_J, self.speed, 0x00); time.sleep(0.3)
+        log("INFO", "handshake: EnableArm")
+        self.p.EnableArm(7, 0x02); time.sleep(0.3)
 
     # ── heartbeat thread ───────────────────────────────────────────────
     def _heartbeat_loop(self) -> None:
@@ -216,6 +241,7 @@ class PiperController:
                         js = self.p.GetArmJointMsgs().joint_state
                         ep = self.p.GetArmEndPoseMsgs().end_pose
                         sa = self.p.GetArmStatus().arm_status
+                        cur_ctrl = int(sa.ctrl_mode)
                         with self._cache_lock:
                             self._cache_joints = [js.joint_1, js.joint_2, js.joint_3,
                                                   js.joint_4, js.joint_5, js.joint_6]
@@ -223,7 +249,7 @@ class PiperController:
                                                   ep.RX_axis, ep.RY_axis, ep.RZ_axis]
                             self._cache_status = {
                                 "ok": True,
-                                "ctrl_mode":     int(sa.ctrl_mode),
+                                "ctrl_mode":     cur_ctrl,
                                 "arm_status":    int(sa.arm_status),
                                 "mode_feed":     int(sa.mode_feed),
                                 "teach_status":  int(sa.teach_status),
@@ -232,6 +258,27 @@ class PiperController:
                                 "heartbeat_alive": True,
                                 "speed_pct":     speed,
                             }
+                        # Auto-recovery: if ctrl_mode has been != CAN_CTRL(1)
+                        # for several cache cycles (each = 2× heartbeat ≈ 20 ms),
+                        # run the full EmergencyStop+STANDBY+CAN_CTRL sequence.
+                        # This catches the post-teach STANDBY↔CAN_CTRL oscillation
+                        # that the operator was hitting after exiting drag-teach.
+                        if cur_ctrl != 1:
+                            self._nonctrl_streak += 1
+                        else:
+                            self._nonctrl_streak = 0
+                        now_t = time.monotonic()
+                        if (self._nonctrl_streak >= 5 and
+                            now_t - self._last_recovery_t > 2.0):
+                            log("WARN",
+                                f"ctrl_mode={cur_ctrl} (not CAN_CTRL) for "
+                                f"{self._nonctrl_streak} snapshots → auto-recovery")
+                            try:
+                                self._do_full_handshake()
+                            except Exception as e:
+                                log("ERROR", f"recovery handshake failed: {e}")
+                            self._last_recovery_t = now_t
+                            self._nonctrl_streak  = 0
                     except Exception:
                         pass   # don't kill the loop on a transient read miss
             except Exception as e:
@@ -462,13 +509,11 @@ class PiperController:
         return self.m_arm_home()
 
     def m_piper_handshake(self) -> Dict[str, Any]:
-        """Force re-do the STANDBY→CAN_CTRL handshake. Useful if the arm
-        somehow fell out of CAN_CTRL mode."""
+        """Force re-do the full handshake (Resume → MasterSlave → STANDBY
+        → CAN_CTRL → Enable). The Resume step matters — without it, a
+        post-teach arm oscillates STANDBY↔CAN_CTRL and won't latch."""
         try:
-            self.p.MasterSlaveConfig(0xFC, 0, 0, 0); time.sleep(0.2)
-            self.p.MotionCtrl_2(0x00, 0x00, 0, 0x00); time.sleep(0.2)
-            self.p.MotionCtrl_2(0x01, MODE_J, self.speed, 0x00); time.sleep(0.2)
-            self.p.EnableArm(7, 0x02)
+            self._do_full_handshake()
             return {"ok": True}
         except Exception as e:
             return {"ok": False, "error": str(e)}
