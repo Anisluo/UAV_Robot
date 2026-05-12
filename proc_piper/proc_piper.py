@@ -31,8 +31,13 @@ except ImportError:
 
 # ─── constants ───────────────────────────────────────────────────────────
 F      = 1000.0          # SDK unit factor (0.001° / 0.001mm / 0.001 N·m / μm)
-HZ     = 200             # heartbeat target frequency
-PERIOD = 1.0 / HZ        # 5 ms
+# 100Hz heartbeat = 10 ms worst-case slider→motion latency. Was 200Hz, but
+# 200Hz × 5 CAN frames per cycle saturated Python's GIL and stalled the RPC
+# handlers (6–9 ms median). At 100Hz, with the cache layer added below and
+# GripperCtrl skipped when unchanged, we send 2–3 frames/cycle and the
+# RX-parser thread still gets ~70 % of one core (its own CPU cost, not ours).
+HZ     = 100
+PERIOD = 1.0 / HZ        # 10 ms
 
 # Piper hardware joint limits (deg). Used to clamp user inputs and to
 # return sane "not reachable" errors before the firmware does.
@@ -81,6 +86,28 @@ class PiperController:
         self.target_cart:  Optional[List[int]] = None   # [X,Y,Z,RX,RY,RZ] in 0.001 mm/deg, None ⇒ use joints
         self.gripper_target_um = 0      # μm (0.001 mm)
         self.gripper_effort    = 1000   # mN·m
+        # Gripper "dirty" tracking: at 50Hz heartbeat, repeatedly sending the
+        # same GripperCtrl 50×/s saturates GIL for no benefit (Piper holds the
+        # commanded position itself). Only send when the target changes — and
+        # re-send every ~1 s as a safety heartbeat in case a frame was lost.
+        self._gripper_dirty       = True
+        self._gripper_last_send_t = 0.0
+
+        # Feedback cache, populated by heartbeat. RPC handlers return these
+        # instead of calling SDK getters, so they don't contend for the SDK's
+        # internal mutex with the RX-parser thread.
+        # Cache refresh runs every other heartbeat cycle (≈50 Hz) regardless
+        # of HZ — refreshing 100 ×/s was pushing the SDK's RX thread to 90 %
+        # CPU because every refresh acquires the SDK mutex 3 times.
+        self._cache_lock = threading.Lock()
+        self._cache_joints: List[int]   = [0]*6           # 0.001°
+        self._cache_pose:   List[int]   = [0]*6           # 0.001 mm/deg
+        self._cache_status: Dict[str, Any] = {
+            "ok": True, "ctrl_mode": 0, "arm_status": 0, "mode_feed": 0,
+            "teach_status": 0, "motion_status": 0, "error_code": 0,
+            "heartbeat_alive": False, "speed_pct": speed,
+        }
+        self._cache_skip_counter = 0
 
         # Lifecycle
         self.connected = False
@@ -163,33 +190,65 @@ class PiperController:
                     c = list(self.target_cart) if self.target_cart else None
                     g_um = self.gripper_target_um
                     g_eff = self.gripper_effort
-                # Always send mode + target each cycle
+                    g_dirty = self._gripper_dirty
+                    self._gripper_dirty = False
+                # Always send mode + target each cycle — Piper firmware needs
+                # this to keep CAN_CTRL latched.
                 self.p.MotionCtrl_2(0x01, mode, speed, 0x00)
                 if c is not None and mode in (MODE_P, MODE_L, MODE_C):
                     self.p.EndPoseCtrl(*c)
                 else:
                     self.p.JointCtrl(*j)
-                # Gripper independent of arm mode
-                self.p.GripperCtrl(int(g_um), int(g_eff), 0x01, 0)
+                # Gripper: only send when the target changed, or as a 1Hz
+                # safety re-send in case a frame got lost.
+                now = time.monotonic()
+                if g_dirty or (now - self._gripper_last_send_t) > 1.0:
+                    self.p.GripperCtrl(int(g_um), int(g_eff), 0x01, 0)
+                    self._gripper_last_send_t = now
+
+                # Refresh feedback cache every other heartbeat cycle (≈ HZ/2)
+                # to keep RX-thread CPU sane while still feeding HostGUI a
+                # ≤20 ms-stale snapshot.
+                self._cache_skip_counter += 1
+                if self._cache_skip_counter >= 2:
+                    self._cache_skip_counter = 0
+                    try:
+                        js = self.p.GetArmJointMsgs().joint_state
+                        ep = self.p.GetArmEndPoseMsgs().end_pose
+                        sa = self.p.GetArmStatus().arm_status
+                        with self._cache_lock:
+                            self._cache_joints = [js.joint_1, js.joint_2, js.joint_3,
+                                                  js.joint_4, js.joint_5, js.joint_6]
+                            self._cache_pose   = [ep.X_axis, ep.Y_axis, ep.Z_axis,
+                                                  ep.RX_axis, ep.RY_axis, ep.RZ_axis]
+                            self._cache_status = {
+                                "ok": True,
+                                "ctrl_mode":     int(sa.ctrl_mode),
+                                "arm_status":    int(sa.arm_status),
+                                "mode_feed":     int(sa.mode_feed),
+                                "teach_status":  int(sa.teach_status),
+                                "motion_status": int(sa.motion_status),
+                                "error_code":    int(getattr(sa, "err_code", 0)),
+                                "heartbeat_alive": True,
+                                "speed_pct":     speed,
+                            }
+                    except Exception:
+                        pass   # don't kill the loop on a transient read miss
             except Exception as e:
                 log("ERROR", f"heartbeat: {e}")
             time.sleep(PERIOD)
         self.heartbeat_alive = False
 
     # ── helpers ────────────────────────────────────────────────────────
+    # Cache-backed readers — never call SDK getters, so RPC handlers don't
+    # contend with the heartbeat / RX-parser threads for SDK locks.
     def _read_joints(self) -> Optional[List[int]]:
-        try:
-            j = self.p.GetArmJointMsgs().joint_state
-            return [j.joint_1, j.joint_2, j.joint_3, j.joint_4, j.joint_5, j.joint_6]
-        except Exception:
-            return None
+        with self._cache_lock:
+            return list(self._cache_joints)
 
     def _read_pose(self) -> Optional[List[int]]:
-        try:
-            e = self.p.GetArmEndPoseMsgs().end_pose
-            return [e.X_axis, e.Y_axis, e.Z_axis, e.RX_axis, e.RY_axis, e.RZ_axis]
-        except Exception:
-            return None
+        with self._cache_lock:
+            return list(self._cache_pose)
 
     def _clamp_joint(self, joint_idx: int, deg: float) -> float:
         lo, hi = JOINT_LIMITS_DEG[joint_idx]
@@ -360,14 +419,19 @@ class PiperController:
         """Binary open/close. open=True → max, False → 0mm."""
         target_um = int(GRIPPER_MAX_MM * 1000) if open else int(GRIPPER_MIN_MM * 1000)
         with self.lock:
+            if self.gripper_target_um != target_um:
+                self._gripper_dirty = True
             self.gripper_target_um = target_um
         return {"ok": True}
 
     def m_arm_servo_gripper(self, angle_deg: int) -> Dict[str, Any]:
         """Legacy proc_arm servo-gripper: 0-90 deg → 0-MAX mm linearly."""
         mm = max(0.0, min(90.0, float(angle_deg))) / 90.0 * GRIPPER_MAX_MM
+        target_um = int(mm * 1000)
         with self.lock:
-            self.gripper_target_um = int(mm * 1000)
+            if self.gripper_target_um != target_um:
+                self._gripper_dirty = True
+            self.gripper_target_um = target_um
         return {"ok": True, "eta_s": 1.0}
 
     # ── piper.* extras ─────────────────────────────────────────────────
@@ -375,24 +439,24 @@ class PiperController:
                                    effort_mNm: float = 1000.0) -> Dict[str, Any]:
         """Continuous gripper: angle in mm [0, 80], effort in mN·m."""
         mm = max(GRIPPER_MIN_MM, min(GRIPPER_MAX_MM, angle_mm))
+        target_um = int(mm * 1000)
+        new_eff = int(effort_mNm)
         with self.lock:
-            self.gripper_target_um = int(mm * 1000)
-            self.gripper_effort = int(effort_mNm)
+            if target_um != self.gripper_target_um or new_eff != self.gripper_effort:
+                self._gripper_dirty = True
+            self.gripper_target_um = target_um
+            self.gripper_effort = new_eff
         return {"ok": True, "angle_mm": mm}
 
     def m_piper_get_status(self) -> Dict[str, Any]:
-        s = self.p.GetArmStatus().arm_status
-        return {
-            "ok": True,
-            "ctrl_mode":     int(s.ctrl_mode),
-            "arm_status":    int(s.arm_status),
-            "mode_feed":     int(s.mode_feed),
-            "teach_status":  int(s.teach_status),
-            "motion_status": int(s.motion_status),
-            "error_code":    int(getattr(s, "err_code", 0)),
-            "heartbeat_alive": self.heartbeat_alive,
-            "speed_pct":     self.speed,
-        }
+        # Snapshot from cache (refreshed at 50Hz by heartbeat). Reading SDK
+        # directly here was contending for the SDK mutex and adding 5 ms
+        # latency per call.
+        with self._cache_lock:
+            out = dict(self._cache_status)
+        out["heartbeat_alive"] = self.heartbeat_alive
+        out["speed_pct"]       = self.speed
+        return out
 
     def m_piper_park_zero(self) -> Dict[str, Any]:
         return self.m_arm_home()
