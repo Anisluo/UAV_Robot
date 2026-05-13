@@ -330,35 +330,39 @@ class PiperController:
                             # so motor torque stays smooth.
                             if was_teaching and len(self._cache_joints) == 6:
                                 # SAFETY-CRITICAL: TEACHING has gravity-comp.
-                                # The arm holds itself up because firmware
-                                # applies just enough torque to counter
-                                # gravity while remaining compliant to
-                                # operator force. The previous "auto re-
-                                # engage" sent EmergencyStop+MotionCtrl_2+
-                                # EnableArm with 50ms sleeps between, and
-                                # the operator reported the arm dropping
-                                # mid-air during the sleeps. NOT acceptable.
+                                # When firmware exits TEACHING, that comp
+                                # turns off. If the firmware doesn't have a
+                                # JointCtrl target queued at that moment,
+                                # motors go limp and the arm drops.
                                 #
-                                # The safe path is to send NO explicit
-                                # control commands here at all. We only:
-                                #   1. snapshot the dragged pose into
-                                #      target_joints
-                                #   2. flip _teach_active = False
-                                # The heartbeat's next ~10ms tick then
-                                # naturally fires MotionCtrl_2(CAN_CTRL,…)
-                                # + JointCtrl(snap) together as one batch.
-                                # Firmware transitions to CAN_CTRL with an
-                                # immediate target → no torque gap, no drop.
-                                # No sleeps in this critical section.
+                                # Just clearing _teach_active and letting
+                                # the next 10ms heartbeat tick send the
+                                # combo wasn't tight enough — there's still
+                                # a ~10ms window where firmware has no
+                                # target.
+                                #
+                                # Send JointCtrl(snap) and MotionCtrl_2
+                                # (CAN_CTRL) BACK-TO-BACK right here, with
+                                # NO sleeps between them. JointCtrl seeds
+                                # the target while firmware is still in
+                                # TEACHING; the very next frame switches
+                                # mode → motors latch onto the queued
+                                # target immediately. Microseconds, not
+                                # milliseconds.
                                 snap = list(self._cache_joints)
                                 with self.lock:
                                     self.target_joints = snap
                                     self.target_cart   = None
                                     self.move_mode     = MODE_J
-                                log("INFO",
-                                    f"physical teach release: held at "
-                                    f"current pose {snap} "
-                                    f"(heartbeat resumes next tick, no manual cmds)")
+                                try:
+                                    self.p.JointCtrl(*snap)
+                                    self.p.MotionCtrl_2(0x01, MODE_J, self.speed, 0x00)
+                                    log("INFO",
+                                        f"physical teach release: held at "
+                                        f"current pose {snap} "
+                                        f"(JointCtrl+CAN_CTRL back-to-back)")
+                                except Exception as e:
+                                    log("ERROR", f"teach release re-engage failed: {e}")
                             self._teach_active = False
                             if cur_ctrl != 1:
                                 self._nonctrl_streak += 1
