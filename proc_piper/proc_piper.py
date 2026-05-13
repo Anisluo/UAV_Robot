@@ -294,30 +294,59 @@ class PiperController:
                         # so we hit this branch primarily for the physical
                         # button workflow. Track back into _teach_active so
                         # the heartbeat above stops fighting the operator.
-                        teach_engaged = int(sa.teach_status) != 0 or cur_ctrl == 2
+                        # "Engaged" = operator is ACTIVELY dragging. This is
+                        # signalled by teach_status != 0 (firmware reports
+                        # recording in progress). We deliberately do NOT
+                        # gate on ctrl_mode == 2 here: on Piper V1.8-2 the
+                        # firmware leaves ctrl_mode stuck at 2 even after
+                        # the operator releases the physical button, so
+                        # gating on it would keep the heartbeat muted
+                        # forever and the operator would have to manually
+                        # press 使能 to leave TEACHING. Using teach_status
+                        # alone gives us a clean 1→0 falling edge the
+                        # moment the operator stops dragging.
+                        teach_engaged = int(sa.teach_status) != 0
                         was_teaching  = self._teach_active
                         if teach_engaged:
                             self._teach_active = True
                             self._nonctrl_streak = 0
                         else:
-                            # Transition teach → not-teach: the operator
-                            # just released the physical button (or the
-                            # software exit path ran). Snapshot the live
-                            # joint angles into target_joints so that when
-                            # heartbeat resumes JointCtrl on the next tick
-                            # it commands "stay where you are" rather than
-                            # snapping back to the pre-teach pose. Without
-                            # this, releasing the physical button causes a
-                            # visible yank-back.
-                            if was_teaching and len(self._cache_joints) == 6:
-                                snap = list(self._cache_joints)
-                                with self.lock:
-                                    self.target_joints = snap
-                                    self.target_cart   = None
-                                    self.move_mode     = MODE_J
-                                log("INFO",
-                                    f"physical teach release: held at "
-                                    f"current pose {snap}")
+                            # Falling edge: snapshot live pose into the
+                            # heartbeat target so the resumed JointCtrl
+                            # commands "stay where you are" rather than
+                            # the pre-teach pose, AND actively pull
+                            # firmware out of TEACHING. Just resuming
+                            # MotionCtrl_2(CAN_CTRL,…) from the heartbeat
+                            # is not enough — V1.8-2 firmware will sit
+                            # in ctrl_mode=2 until an explicit re-engage.
+                            # We send the smallest sequence that does it
+                            # WITHOUT a STANDBY blip:
+                            #   EmergencyStop(0x02) "resume"
+                            #   MotionCtrl_2(CAN_CTRL, MOVE_J, speed, 0)
+                            #   EnableArm(7, 0x02)
+                            # No MasterSlaveConfig, no STANDBY transit,
+                            # so motor torque stays smooth.
+                            if was_teaching:
+                                if len(self._cache_joints) == 6:
+                                    snap = list(self._cache_joints)
+                                    with self.lock:
+                                        self.target_joints = snap
+                                        self.target_cart   = None
+                                        self.move_mode     = MODE_J
+                                    log("INFO",
+                                        f"physical teach release: held at "
+                                        f"current pose {snap}")
+                                try:
+                                    self.p.EmergencyStop(0x02)
+                                    time.sleep(0.05)
+                                    self.p.MotionCtrl_2(0x01, MODE_J, self.speed, 0x00)
+                                    time.sleep(0.05)
+                                    self.p.EnableArm(7, 0x02)
+                                    log("INFO",
+                                        "teach release: soft re-engage sent "
+                                        "(EmergencyStop+CAN_CTRL+EnableArm, no STANDBY)")
+                                except Exception as e:
+                                    log("ERROR", f"teach release re-engage failed: {e}")
                             self._teach_active = False
                             if cur_ctrl != 1:
                                 self._nonctrl_streak += 1
