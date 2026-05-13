@@ -73,20 +73,40 @@ bool NpuPipeline::process_frame(const InferenceFrame &frame,
 
     UavCResult result = postprocess_.run(frame, raw, threshold);
 
-    // ── Temporal smoothing + 2-frame consensus ───────────────────────────
-    // Three states for the detection lifecycle:
-    //   (a) STEADY  — sticky_valid_ is true; EMA-blend incoming, refresh
-    //                 hold, fall back to sticky on empty frames.
-    //   (b) WARMUP  — pending_valid_ is true (one prior non-empty frame
-    //                 not yet shown). Need a second consecutive matching
-    //                 detection to promote into STEADY and start
-    //                 publishing. A single-frame phantom never reaches
-    //                 STEADY.
-    //   (c) IDLE    — neither cache holds anything; every empty frame
-    //                 just re-publishes empty.
+    // ── PRESENT/ABSENT state machine (Schmitt-trigger hysteresis) ────────
+    // The user needs a clean binary platform state, not just per-frame
+    // boxes. The COCO model flicks single-frame "airplane" phantoms on
+    // background junk and conversely drops the real drone for one frame
+    // every couple of seconds, so we use asymmetric counters:
+    //
+    //   ABSENT  state — empty published frames. To leave: need
+    //                   kEnterFrames consecutive hits that IoU-match the
+    //                   prior hit (same drone, not a moving phantom).
+    //   PRESENT state — sticky bbox published. To leave: need kExitFrames
+    //                   consecutive empty frames. Any hit mid-exit
+    //                   resets exit_count_ — drone re-found.
+    //
+    // The bbox itself is EMA-blended while PRESENT so it tracks motion
+    // without snapping on every frame.
+    constexpr float kIouConfirm = 0.40F;
+
+    auto detections_match = [&](const UavCResult &a, const UavCResult &b) {
+        for (uint32_t i = 0; i < a.num_detections; ++i) {
+            for (uint32_t j = 0; j < b.num_detections; ++j) {
+                if (a.detections[i].class_id != b.detections[j].class_id) continue;
+                if (det_iou(a.detections[i], b.detections[j]) >= kIouConfirm) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    };
+
     if (result.num_detections > 0) {
-        if (sticky_valid_) {
-            // STEADY: EMA-blend bbox vs sticky, then refresh hold.
+        // Hit this frame.
+        exit_count_ = 0;
+        if (present_) {
+            // PRESENT: EMA-blend bbox with sticky to kill jitter.
             for (uint32_t i = 0; i < result.num_detections; ++i) {
                 UavDetection &cur = result.detections[i];
                 for (uint32_t j = 0; j < sticky_.num_detections; ++j) {
@@ -99,60 +119,46 @@ bool NpuPipeline::process_frame(const InferenceFrame &frame,
                 }
             }
             sticky_ = result;
-            sticky_until_ns_ = now_ns + kStickyHoldNs;
-        } else if (pending_valid_) {
-            // WARMUP → STEADY: confirm second consecutive frame.
-            // Require a tighter IoU (kIouConfirm 0.40) than the EMA
-            // snap threshold so a wandering "full-frame airplane"
-            // phantom whose bbox jitters across the workspace doesn't
-            // ride one through. The real drone, even at 5 fps, keeps
-            // bbox overlap well above 0.4 between adjacent frames.
-            constexpr float kIouConfirm = 0.40F;
-            bool confirmed = false;
-            for (uint32_t i = 0; i < result.num_detections && !confirmed; ++i) {
-                const UavDetection &cur = result.detections[i];
-                for (uint32_t j = 0; j < pending_.num_detections; ++j) {
-                    const UavDetection &prev = pending_.detections[j];
-                    if (prev.class_id != cur.class_id) continue;
-                    if (det_iou(prev, cur) >= kIouConfirm) {
-                        confirmed = true;
-                        break;
-                    }
-                }
-            }
-            if (confirmed) {
-                sticky_ = result;
-                sticky_valid_ = true;
-                sticky_until_ns_ = now_ns + kStickyHoldNs;
-                pending_valid_ = false;
-            } else {
-                // Different bbox / class — reset pending to current.
-                pending_ = result;
-            }
         } else {
-            // IDLE → WARMUP: stash, do not publish yet.
-            pending_ = result;
+            // ABSENT: count consecutive matching hits.
+            if (pending_valid_ && detections_match(result, pending_)) {
+                ++enter_count_;
+            } else {
+                enter_count_ = 1;       // first hit (or hit moved too much)
+            }
+            pending_       = result;
             pending_valid_ = true;
+            if (enter_count_ >= kEnterFrames) {
+                // Promote to PRESENT.
+                sticky_           = result;
+                sticky_valid_     = true;
+                present_          = true;
+                enter_count_      = 0;
+                pending_valid_    = false;
+                std::printf("C_PRESENCE drone=1\n");
+                std::fflush(stdout);
+            }
         }
     } else {
-        // Empty frame: the stream broke; drop pending warmup state and
-        // either fall back to sticky (if hold not yet expired) or emit
-        // empty.
+        // Empty frame.
+        enter_count_   = 0;
         pending_valid_ = false;
-        if (sticky_valid_ && now_ns < sticky_until_ns_) {
-            result = sticky_;
-            result.frame_id = frame.slot.frame_id;
-        } else {
-            sticky_valid_ = false;
+        if (present_) {
+            ++exit_count_;
+            // Keep showing the sticky bbox until we confirm absence.
+            if (exit_count_ < kExitFrames && sticky_valid_) {
+                result = sticky_;
+                result.frame_id = frame.slot.frame_id;
+            } else {
+                // PRESENT → ABSENT transition.
+                present_       = false;
+                sticky_valid_  = false;
+                exit_count_    = 0;
+                std::printf("C_PRESENCE drone=0\n");
+                std::fflush(stdout);
+            }
         }
-    }
-
-    // While in WARMUP we still hold the sticky cache visible if its
-    // own timer hasn't expired (smooth coverage during a brief miss
-    // before the next confirmation arrives).
-    if (result.num_detections == 0 && sticky_valid_ && now_ns < sticky_until_ns_) {
-        result = sticky_;
-        result.frame_id = frame.slot.frame_id;
+        // else: stay ABSENT, emit empty result.
     }
 
     print_result(result);

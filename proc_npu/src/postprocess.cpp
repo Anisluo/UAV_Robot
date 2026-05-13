@@ -239,6 +239,18 @@ UavCResult Postprocess::run(const InferenceFrame &frame,
     constexpr float depth_min_workspace_m = 0.20f;
     constexpr float depth_max_workspace_m = 1.50f;
 
+    // ── Geometric sanity gates (cheap, no opencv) ────────────────────────
+    // The COCO model emits two common false-positive shapes on cardboard /
+    // table edges and the white plate's rim:
+    //   (1) very-elongated "airplane runway" boxes (h/w < 0.3 or > 3.0)
+    //   (2) tiny boxes (< 60 px on either side) far from the camera
+    // Real drones at the working distance occupy roughly 80..500 px and
+    // have aspect ratios between 0.4 and 2.5 regardless of top-down vs
+    // side-view orientation.
+    constexpr float kMinSidePx    = 60.0f;
+    constexpr float kMinAspect    = 0.40f;
+    constexpr float kMaxAspect    = 2.50f;
+
     for (const Merged &g : grouped) {
         if (out.num_detections >= UAV_MAX_DETECTIONS) break;
         // mavic3_drone.rknn ships as a generic COCO YOLOv8 (nc=80), so
@@ -247,6 +259,12 @@ UavCResult Postprocess::run(const InferenceFrame &frame,
         // (airplane) — everything else is noise on this scene. If a
         // future strategy needs other classes, drop this guard.
         if (g.class_id != 4) continue;
+
+        const float bw = g.x2 - g.x1;
+        const float bh = g.y2 - g.y1;
+        if (bw < kMinSidePx || bh < kMinSidePx) continue;
+        const float aspect = bh / std::max(1.0f, bw);
+        if (aspect < kMinAspect || aspect > kMaxAspect) continue;
 
         // Apply plate clip (drone class only — keep face / battery
         // pass-throughs untouched).

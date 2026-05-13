@@ -28,31 +28,38 @@ private:
     Preprocess preprocess_;
     Postprocess postprocess_;
 
-    // Temporal smoothing for the published result. The COCO-pretrained
-    // mavic3_drone.rknn produces class=4 hits right at the score gate
-    // (0.45–0.52), so single-frame drop-outs make the HostGUI bbox
-    // flicker. Hold the last non-empty result for kStickyHoldNs after
-    // detection drops, and EMA-smooth bbox between overlapping
-    // consecutive detections to kill jitter.
+    // PRESENT-state cache. Updated every frame while present_=true so
+    // the bbox shown in HostGUI follows the drone. EMA-blended against
+    // the incoming detection to kill the ~150 px frame-to-frame jitter
+    // of the COCO-pretrained model.
     UavCResult sticky_{};
     bool       sticky_valid_{false};
-    uint64_t   sticky_until_ns_{0};
-    static constexpr uint64_t kStickyHoldNs = 800ULL * 1000ULL * 1000ULL;
     // 0.3 ⇒ 70 % previous, 30 % current — bbox keeps up with motion
-    // but doesn't snap on every frame. Tested with the COCO-pretrained
-    // mavic3_drone.rknn whose raw bbox jumps ~150 px between frames.
+    // but doesn't snap on every frame.
     static constexpr float    kEmaAlpha     = 0.3F;
     static constexpr float    kIouSnap      = 0.20F;
 
-    // Two-frame consensus before the first publish. The model produces
-    // ~0.50 score "airplane" hits sporadically on the empty workbench;
-    // a single frame can therefore not be trusted, but the real drone
-    // generates such hits *every* frame. Holding the first detection
-    // off-screen until a second consecutive matching frame arrives
-    // filters single-frame phantoms cleanly while still letting an
-    // actual drone show up within ~200 ms.
+    // Schmitt-trigger PRESENT/ABSENT machine. The COCO-pretrained
+    // mavic3_drone.rknn produces ~0.50 score "airplane" phantoms on the
+    // empty workbench every few frames, and conversely drops the real
+    // drone for one frame here and there. To get a clean binary "drone
+    // on platform yes/no", we use asymmetric hysteresis:
+    //
+    //   ABSENT → PRESENT: need kEnterFrames consecutive matching hits
+    //                     (same class, IoU ≥ kIouConfirm between frames)
+    //   PRESENT → ABSENT: need kExitFrames consecutive empty frames
+    //
+    // Single-frame phantoms never reach PRESENT; single-frame drops
+    // never lose PRESENT. The bbox shown during PRESENT comes from
+    // sticky_ (EMA-blended). Both counters reset on contradicting
+    // evidence (an empty frame mid-enter, or a hit mid-exit).
     UavCResult pending_{};
     bool       pending_valid_{false};
+    int        enter_count_{0};   // consecutive matching detection frames
+    int        exit_count_{0};    // consecutive empty frames while PRESENT
+    bool       present_{false};   // exported state — fires C_PRESENCE on edge
+    static constexpr int kEnterFrames = 3;
+    static constexpr int kExitFrames  = 5;
 };
 
 #endif
