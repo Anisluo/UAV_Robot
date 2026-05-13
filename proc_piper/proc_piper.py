@@ -332,62 +332,39 @@ class PiperController:
                             self._teach_active = True
                             self._nonctrl_streak = 0
                         elif ts == 2:                        # released, still in TEACHING
+                            # SAFETY: do NOT auto-exit TEACHING here.
+                            # We tried, but our detection window is too
+                            # slow — by the time we see teach_status=2,
+                            # the firmware has ALREADY dropped gravity-
+                            # comp (operator confirmed visible drop).
+                            # Even EmergencyStop(0x01) comes too late to
+                            # brake what's already free-falling.
+                            #
+                            # Correct workflow: operator calls
+                            # piper.safe_teach_exit RPC (HostGUI button)
+                            # BEFORE pressing the physical button to
+                            # exit. The RPC runs the braking sequence
+                            # while firmware is still in TEACHING with
+                            # gravity-comp engaged → safe transition.
+                            #
+                            # All we do on the 1→2 edge: snapshot the
+                            # dragged pose so when the operator does
+                            # exit (either via safe_teach_exit or via
+                            # 使能 with hand support), the resumed
+                            # heartbeat holds at the dragged pose.
                             if was_teaching and len(self._cache_joints) == 6:
-                                # SAFE auto-exit sequence (operator-
-                                # validated): the missing piece in all
-                                # our previous attempts was the leading
-                                # EmergencyStop(0x01) "快速急停". That
-                                # command applies controlled braking
-                                # torque to the motors — the arm settles
-                                # in place instead of free-falling when
-                                # gravity-comp ends. Without it, the
-                                # firmware just drops torque and the arm
-                                # falls.
-                                #
-                                # The full safe sequence is:
-                                #   EmergencyStop(0x01)  → braked halt
-                                #   sleep ~300 ms        → let motors settle
-                                #   EmergencyStop(0x02)  → resume from halt
-                                #   MotionCtrl_2(CAN_CTRL,…)
-                                #   EnableArm(7, 0x02)
-                                # which is what the operator does manually
-                                # via 急停 → 恢复 → 使能. Snapshot pose
-                                # first so the heartbeat's resumed
-                                # JointCtrl tells the arm to hold here.
                                 snap = list(self._cache_joints)
                                 with self.lock:
                                     self.target_joints = snap
                                     self.target_cart   = None
                                     self.move_mode     = MODE_J
                                 log("INFO",
-                                    f"physical teach release: pose {snap}; "
-                                    f"running safe auto-exit "
-                                    f"(EStop+settle+resume+CAN_CTRL+enable)")
-                                try:
-                                    # Step 1: braked halt
-                                    self.p.EmergencyStop(0x01)
-                                    time.sleep(0.3)
-                                    # Step 2: resume from halt
-                                    self.p.EmergencyStop(0x02)
-                                    time.sleep(0.1)
-                                    # Step 3: latch CAN_CTRL with MOVE_J
-                                    self.p.MotionCtrl_2(0x01, MODE_J, self.speed, 0x00)
-                                    time.sleep(0.1)
-                                    # Step 4: ensure motors enabled
-                                    self.p.EnableArm(7, 0x02)
-                                    log("INFO", "teach safe-exit completed; heartbeat resumes")
-                                    self._teach_active = False  # let heartbeat take over
-                                    self._nonctrl_streak = 0
-                                except Exception as e:
-                                    log("ERROR", f"teach safe-exit failed: {e}; "
-                                                 f"staying in TEACHING — use 使能 manually")
-                                    self._teach_active = True   # keep muted, operator's call
-                                    self._nonctrl_streak = 0
-                            else:
-                                # No fresh snapshot (cache hasn't filled
-                                # yet) — too risky to auto-exit blind.
-                                self._teach_active = True
-                                self._nonctrl_streak = 0
+                                    f"teach button-release detected (ts=2): "
+                                    f"pose snapshotted {snap}. STAYING in "
+                                    f"TEACHING — use piper.safe_teach_exit "
+                                    f"RPC or 使能 to leave safely.")
+                            self._teach_active = True        # keep heartbeat muted
+                            self._nonctrl_streak = 0
                         else:                                # ts == 0, idle
                             self._teach_active = False
                             if cur_ctrl != 1:
@@ -664,6 +641,60 @@ class PiperController:
     def m_piper_park_zero(self) -> Dict[str, Any]:
         return self.m_arm_home()
 
+    def m_piper_safe_teach_exit(self) -> Dict[str, Any]:
+        """Safely exit drag-teach mode WITHOUT dropping the arm.
+
+        Sequence — replicates the operator-validated manual workflow
+        (急停 → 恢复 → 使能) under one RPC. Must be called while the
+        firmware is STILL in TEACHING (gravity-comp engaged). Pressing
+        the physical button to exit before calling this RPC is unsafe
+        because the firmware drops torque the instant the button is
+        released — our heartbeat cache refresh detects that ~20 ms
+        later, which is too slow to brake.
+
+        Steps:
+          1. snapshot live joints into target_joints (so the resumed
+             heartbeat holds where the operator dragged it)
+          2. EmergencyStop(0x01) 快速急停 — controlled braking, motors
+             apply enough torque to settle in place instead of free-
+             falling
+          3. sleep 0.3 s — let motors settle
+          4. EmergencyStop(0x02) 恢复 — release halt
+          5. MotionCtrl_2(0x01, MOVE_J, speed, 0) — CAN_CTRL latch
+          6. EnableArm(7, 0x02) — belt-and-suspenders motor enable
+          7. clear _teach_active so heartbeat takes over with snapshot
+        """
+        try:
+            # 1. snapshot pose
+            with self._cache_lock:
+                snap = list(self._cache_joints)
+            if len(snap) != 6:
+                return {"ok": False, "error": "cache empty; cannot snapshot"}
+            with self.lock:
+                self.target_joints = snap
+                self.target_cart   = None
+                self.move_mode     = MODE_J
+            log("INFO", f"safe_teach_exit: snapshot {snap}, beginning sequence")
+            # 2. braked halt
+            self.p.EmergencyStop(0x01)
+            time.sleep(0.3)
+            # 3. resume from halt
+            self.p.EmergencyStop(0x02)
+            time.sleep(0.1)
+            # 4. CAN_CTRL
+            self.p.MotionCtrl_2(0x01, MODE_J, self.speed, 0x00)
+            time.sleep(0.1)
+            # 5. enable
+            self.p.EnableArm(7, 0x02)
+            # 6. let heartbeat take over
+            self._teach_active = False
+            self._nonctrl_streak = 0
+            log("INFO", "safe_teach_exit: completed, heartbeat resumes")
+            return {"ok": True, "snap": snap}
+        except Exception as e:
+            log("ERROR", f"safe_teach_exit failed: {e}")
+            return {"ok": False, "error": str(e)}
+
     def m_piper_handshake(self) -> Dict[str, Any]:
         """Force re-do the full handshake (Resume → MasterSlave → STANDBY
         → CAN_CTRL → Enable). The Resume step matters — without it, a
@@ -745,6 +776,8 @@ class RpcServer:
 
             # piper.* extras
             "piper.handshake":              lambda **kw: c.m_piper_handshake(),
+            "piper.safe_teach_exit":        lambda **kw: c.m_piper_safe_teach_exit(),
+            "arm.safe_teach_exit":          lambda **kw: c.m_piper_safe_teach_exit(),
             "piper.park_zero":              lambda **kw: c.m_piper_park_zero(),
             "piper.get_status":             lambda **kw: c.m_piper_get_status(),
             # Accept both the canonical "angle_mm"/"effort_mNm" names AND the
