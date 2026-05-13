@@ -55,10 +55,15 @@ private:
     // evidence (an empty frame mid-enter, or a hit mid-exit).
     UavCResult pending_{};
     bool       pending_valid_{false};
-    int        enter_count_{0};   // consecutive matching detection frames
-    int        exit_count_{0};    // consecutive empty frames while PRESENT
-    bool       present_{false};   // exported state — fires C_PRESENCE on edge
-    static constexpr int kEnterFrames = 3;
+    int        enter_count_{0};   // consecutive matching drone frames
+    int        exit_count_{0};    // consecutive frames with no drone hit
+    bool       present_{false};   // drone state — fires C_PRESENCE on edge
+    bool       platform_visible_{false};  // plate visibility, edge-triggered too
+    // Enter is harder than exit on purpose — the user's default scene is
+    // "empty platform" and they want NO false PRESENT. 5 frames at 5 fps
+    // ≈ 1 s of continuous confirmed hits before flipping. Real drone hits
+    // every frame; sporadic COCO phantoms can't sustain a 5-in-a-row run.
+    static constexpr int kEnterFrames = 5;
     static constexpr int kExitFrames  = 5;
 };
 

@@ -267,13 +267,28 @@ UavCResult Postprocess::run(const InferenceFrame &frame,
         if (aspect < kMinAspect || aspect > kMaxAspect) continue;
 
         // Apply plate clip (drone class only — keep face / battery
-        // pass-throughs untouched).
+        // pass-throughs untouched). Two-stage rejection:
+        //   1. bbox CENTER must lie inside the plate (with pad). The
+        //      old "50 % area overlap" rule let phantoms anchored
+        //      outside the plate but reaching one edge survive — for
+        //      the empty-platform default the user wants those gone.
+        //   2. After clipping, ≥ 60 % of the original area must still
+        //      remain. Borderline phantoms hugging the plate edge fail
+        //      this too.
         float cx1 = g.x1, cy1 = g.y1, cx2 = g.x2, cy2 = g.y2;
         if (have_plate) {
             const float px1 = static_cast<float>(plate.x1) - plate_pad;
             const float py1 = static_cast<float>(plate.y1) - plate_pad;
             const float px2 = static_cast<float>(plate.x2) + plate_pad;
             const float py2 = static_cast<float>(plate.y2) + plate_pad;
+
+            const float bcx = (g.x1 + g.x2) * 0.5f;
+            const float bcy = (g.y1 + g.y2) * 0.5f;
+            if (bcx < px1 || bcx > px2 || bcy < py1 || bcy > py2) {
+                // Centre off-plate — phantom on background junk.
+                continue;
+            }
+
             const float orig_area = (g.x2 - g.x1) * (g.y2 - g.y1);
             cx1 = std::max(g.x1, px1);
             cy1 = std::max(g.y1, py1);
@@ -281,9 +296,7 @@ UavCResult Postprocess::run(const InferenceFrame &frame,
             cy2 = std::min(g.y2, py2);
             const float clip_area = std::max(0.0f, cx2 - cx1)
                                   * std::max(0.0f, cy2 - cy1);
-            if (orig_area <= 0.0f || clip_area / orig_area < 0.50f) {
-                // Mostly outside the plate — almost certainly a
-                // phantom airplane detection on background junk.
+            if (orig_area <= 0.0f || clip_area / orig_area < 0.60f) {
                 continue;
             }
         }
@@ -338,6 +351,27 @@ UavCResult Postprocess::run(const InferenceFrame &frame,
         }
 
         out.detections[out.num_detections++] = det;
+    }
+
+    // ── Positive "empty platform" signal ─────────────────────────────────
+    // When the user's camera is pointed at the workspace and the plate is
+    // visible, emit a synthetic marker detection so the GUI can show
+    // "platform is in view, no drone" with confidence — distinct from
+    // "camera is dark / covered / disconnected → no detections at all".
+    // class_id = UAV_CLASS_PLATFORM (900) is a sentinel that downstream
+    // consumers (npu_pipeline, HostGUI CameraWidget) treat as info, not
+    // as a drone hit.
+    if (have_plate && out.num_detections < UAV_MAX_DETECTIONS) {
+        UavDetection marker{};
+        marker.class_id = UAV_CLASS_PLATFORM;
+        marker.score    = 1.0f;
+        marker.x1       = static_cast<float>(plate.x1);
+        marker.y1       = static_cast<float>(plate.y1);
+        marker.x2       = static_cast<float>(plate.x2);
+        marker.y2       = static_cast<float>(plate.y2);
+        marker.has_xyz  = 0;
+        marker.has_rpy  = 0;
+        out.detections[out.num_detections++] = marker;
     }
 
     return out;

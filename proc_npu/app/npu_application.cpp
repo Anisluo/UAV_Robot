@@ -74,15 +74,18 @@ void print_heartbeat(const UavCHeartbeat &hb) {
 int NpuApplication::run() {
     std::atomic<bool> running{true};
     std::atomic<bool> infer_enabled{true};
-    // 0.45 default. The COCO-pretrained mavic3_drone.rknn produces
-    // weak ~0.50 hits on the empty workbench (the dark battery on a
-    // white plate reads as a tiny plane on a runway), but the real
-    // Mavic 3 lands anywhere from 0.45 to 0.58 depending on pose.
-    // Raising the threshold to suppress phantoms cost too many real-
-    // drone frames; npu_pipeline now has a 2-frame consensus instead
-    // — it filters single-frame phantoms via a WARMUP state, so we
-    // keep the threshold low to catch the drone reliably.
-    std::atomic<float> threshold{0.45F};
+    // 0.55 default. The user's operating scene is "empty platform by
+    // default" and they need ZERO false PRESENT. The COCO-pretrained
+    // mavic3_drone.rknn produces ~0.50 score "airplane" phantoms on
+    // the empty workbench every few frames; raising the gate to 0.55
+    // kills those before they even reach the consensus stage. Real
+    // Mavic 3 hits register 0.55–0.70 reliably at typical workspace
+    // distances, so true-positive recall stays high.
+    // Combined with the 5-frame Schmitt-trigger in npu_pipeline,
+    // single-frame phantoms can't promote and double-frame phantoms
+    // can't either — only a sustained run does. Override at runtime
+    // via npu.set_threshold if needed.
+    std::atomic<float> threshold{0.55F};
     std::atomic<uint32_t> rate_fps{30U};
     std::mutex model_mu;
     std::string pending_model;

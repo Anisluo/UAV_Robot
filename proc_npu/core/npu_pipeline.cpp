@@ -73,26 +73,52 @@ bool NpuPipeline::process_frame(const InferenceFrame &frame,
 
     UavCResult result = postprocess_.run(frame, raw, threshold);
 
-    // ── PRESENT/ABSENT state machine (Schmitt-trigger hysteresis) ────────
-    // The user needs a clean binary platform state, not just per-frame
-    // boxes. The COCO model flicks single-frame "airplane" phantoms on
-    // background junk and conversely drops the real drone for one frame
-    // every couple of seconds, so we use asymmetric counters:
-    //
-    //   ABSENT  state — empty published frames. To leave: need
-    //                   kEnterFrames consecutive hits that IoU-match the
-    //                   prior hit (same drone, not a moving phantom).
-    //   PRESENT state — sticky bbox published. To leave: need kExitFrames
-    //                   consecutive empty frames. Any hit mid-exit
-    //                   resets exit_count_ — drone re-found.
-    //
-    // The bbox itself is EMA-blended while PRESENT so it tracks motion
-    // without snapping on every frame.
-    constexpr float kIouConfirm = 0.40F;
+    // Separate the synthetic platform marker (class_id >= UAV_CLASS_META_BASE)
+    // from real drone hits so the Schmitt-trigger below counts ONLY drones.
+    // The marker still ends up published unchanged — HostGUI uses it to
+    // render the "platform visible" badge.
+    auto has_drone_hit = [](const UavCResult &r) {
+        for (uint32_t i = 0; i < r.num_detections; ++i) {
+            if (r.detections[i].class_id < UAV_CLASS_META_BASE) return true;
+        }
+        return false;
+    };
+    auto has_platform_marker = [](const UavCResult &r) {
+        for (uint32_t i = 0; i < r.num_detections; ++i) {
+            if (r.detections[i].class_id == UAV_CLASS_PLATFORM) return true;
+        }
+        return false;
+    };
 
-    auto detections_match = [&](const UavCResult &a, const UavCResult &b) {
+    const bool drone_hit_this_frame = has_drone_hit(result);
+    const bool platform_now         = has_platform_marker(result);
+
+    // Platform state has no flicker (large bright region), so a single-frame
+    // edge is the truth. Emit C_PRESENCE on every transition so journald
+    // shows a clean ABSENT-from-the-start signal even before any drone
+    // ever appears.
+    if (platform_now != platform_visible_) {
+        platform_visible_ = platform_now;
+        std::printf("C_PRESENCE drone=%d platform=%d\n",
+                    present_ ? 1 : 0, platform_visible_ ? 1 : 0);
+        std::fflush(stdout);
+    }
+
+    // ── PRESENT/ABSENT (drone) state machine — Schmitt-trigger ──────────
+    //   ABSENT  → PRESENT: kEnterFrames consecutive matching drone hits.
+    //   PRESENT → ABSENT:  kExitFrames consecutive frames with no drone hit
+    //                      (platform marker is ignored).
+    // The bbox is EMA-blended while PRESENT.
+    // Tight IoU (0.55) — real drone holds 0.7+ between adjacent frames even
+    // at 5 fps; sporadic phantoms jitter around at 0.2–0.3 and can't make
+    // a 5-in-a-row run.
+    constexpr float kIouConfirm = 0.55F;
+
+    auto drone_iou = [&](const UavCResult &a, const UavCResult &b) {
         for (uint32_t i = 0; i < a.num_detections; ++i) {
+            if (a.detections[i].class_id >= UAV_CLASS_META_BASE) continue;
             for (uint32_t j = 0; j < b.num_detections; ++j) {
+                if (b.detections[j].class_id >= UAV_CLASS_META_BASE) continue;
                 if (a.detections[i].class_id != b.detections[j].class_id) continue;
                 if (det_iou(a.detections[i], b.detections[j]) >= kIouConfirm) {
                     return true;
@@ -102,15 +128,16 @@ bool NpuPipeline::process_frame(const InferenceFrame &frame,
         return false;
     };
 
-    if (result.num_detections > 0) {
-        // Hit this frame.
+    if (drone_hit_this_frame) {
         exit_count_ = 0;
         if (present_) {
-            // PRESENT: EMA-blend bbox with sticky to kill jitter.
+            // PRESENT: EMA-blend each drone bbox against sticky.
             for (uint32_t i = 0; i < result.num_detections; ++i) {
                 UavDetection &cur = result.detections[i];
+                if (cur.class_id >= UAV_CLASS_META_BASE) continue;
                 for (uint32_t j = 0; j < sticky_.num_detections; ++j) {
                     const UavDetection &prev = sticky_.detections[j];
+                    if (prev.class_id >= UAV_CLASS_META_BASE) continue;
                     if (prev.class_id != cur.class_id) continue;
                     if (det_iou(prev, cur) >= kIouSnap) {
                         cur = ema_blend(prev, cur, kEmaAlpha);
@@ -120,45 +147,58 @@ bool NpuPipeline::process_frame(const InferenceFrame &frame,
             }
             sticky_ = result;
         } else {
-            // ABSENT: count consecutive matching hits.
-            if (pending_valid_ && detections_match(result, pending_)) {
+            if (pending_valid_ && drone_iou(result, pending_)) {
                 ++enter_count_;
             } else {
-                enter_count_ = 1;       // first hit (or hit moved too much)
+                enter_count_ = 1;
             }
             pending_       = result;
             pending_valid_ = true;
             if (enter_count_ >= kEnterFrames) {
-                // Promote to PRESENT.
                 sticky_           = result;
                 sticky_valid_     = true;
                 present_          = true;
                 enter_count_      = 0;
                 pending_valid_    = false;
-                std::printf("C_PRESENCE drone=1\n");
+                std::printf("C_PRESENCE drone=1 platform=%d\n",
+                            platform_visible_ ? 1 : 0);
                 std::fflush(stdout);
             }
         }
     } else {
-        // Empty frame.
+        // No drone this frame. The platform marker (if any) is still in
+        // `result` and will be published — that's the "empty platform"
+        // positive signal.
         enter_count_   = 0;
         pending_valid_ = false;
         if (present_) {
             ++exit_count_;
-            // Keep showing the sticky bbox until we confirm absence.
             if (exit_count_ < kExitFrames && sticky_valid_) {
-                result = sticky_;
-                result.frame_id = frame.slot.frame_id;
+                // Re-attach the sticky drone bbox; keep the platform
+                // marker from `result` so the GUI shows BOTH.
+                UavCResult merged = sticky_;
+                merged.frame_id = frame.slot.frame_id;
+                if (platform_now && merged.num_detections < UAV_MAX_DETECTIONS) {
+                    for (uint32_t i = 0; i < result.num_detections; ++i) {
+                        if (result.detections[i].class_id == UAV_CLASS_PLATFORM) {
+                            merged.detections[merged.num_detections++] =
+                                result.detections[i];
+                            break;
+                        }
+                    }
+                }
+                result = merged;
             } else {
-                // PRESENT → ABSENT transition.
                 present_       = false;
                 sticky_valid_  = false;
                 exit_count_    = 0;
-                std::printf("C_PRESENCE drone=0\n");
+                std::printf("C_PRESENCE drone=0 platform=%d\n",
+                            platform_visible_ ? 1 : 0);
                 std::fflush(stdout);
             }
         }
-        // else: stay ABSENT, emit empty result.
+        // else: ABSENT — publish whatever postprocess returned (platform
+        // marker only, or fully empty if camera is blind).
     }
 
     print_result(result);
