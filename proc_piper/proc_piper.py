@@ -403,82 +403,39 @@ class PiperController:
             return {"ok": False, "error": str(e)}
 
     def m_arm_set_free_mode(self, enable: bool) -> Dict[str, Any]:
-        """Legacy alias. New code should call set_teach_mode directly."""
+        """Legacy stub. See m_arm_set_teach_mode."""
         return self.m_arm_set_teach_mode(bool(enable))
 
     def m_arm_set_teach_mode(self, enable: bool) -> Dict[str, Any]:
-        """Software drag-teach for Piper V1.8-2.
+        """Software drag-teach is NOT supported on Piper V1.8-2.
 
-        Implementation discovery (verified empirically on the live arm):
+        Tested every plausible CAN path on the live arm:
+          - MotionCtrl_1(grag_teach_ctrl=0x01)      → flips teach_status to
+            recording but keeps motor torque, arm rigid. Not useful.
+          - MasterSlaveConfig(0xFA, 0, 0, 0)        → ctrl_mode stays at
+            CAN_CTRL, motors locked. Not useful.
+          - DisableArm(7, 0x01)                     → ctrl_mode drops to
+            STANDBY, motors free — but no gravity comp, the arm sags
+            (operator perceives this as "the power blinked").
+          - Raw CAN frame 0x151 byte0=0x02          → firmware rejects,
+            falls to STANDBY.
 
-          - MotionCtrl_1(grag_teach_ctrl=0x01) puts the firmware into
-            "示教记录" recording state but DOES NOT release motor torque —
-            the arm stays rigid, operator can't drag it. Not what we want.
-          - MasterSlaveConfig(0xFA, …) "设置为示教输入臂" likewise leaves
-            ctrl_mode at CAN_CTRL with motors locked.
-          - DisableArm(7, 0x01) IS the path that actually makes the motors
-            compliant. The arm goes into STANDBY, motors drop holding
-            torque, and the operator can drag each joint by hand. This is
-            mechanically the same effect as pressing the physical drag-
-            teach button on the arm body.
+        The real ctrl_mode=0x02 TEACHING state (motors compliant WITH
+        gravity comp) is reachable only through the physical drag-teach
+        button on the arm body — that button uses an internal firmware
+        path that no documented CAN command replicates.
 
-        Safety note: with motors disabled the arm loses gravity
-        compensation. Piper is small enough that this isn't catastrophic
-        but the operator should expect a slight sag, especially at J2/J3.
-        Support the wrist before pressing the button.
-
-        Exit path: EnableArm(7, 0x02) + MotionCtrl_2(CAN_CTRL, MOVE_J,…)
-        re-enables motors at the current pose. We snapshot the live joints
-        into target_joints first so the heartbeat's resumed JointCtrl
-        commands "stay where you are" rather than the stale pre-teach
-        target — that snapshot is the difference between "arm holds steady"
-        and "arm yanks back to old target".
+        Workflow on this firmware: press the physical button, drag, press
+        again to release. proc_piper's heartbeat detects teach_status and
+        suppresses MotionCtrl_2/JointCtrl/GripperCtrl sends while the
+        operator is dragging, and snapshots the live pose on release so
+        the arm holds where it was left (see cache-refresh in heartbeat).
         """
-        try:
-            if enable:
-                # Mute heartbeat FIRST. Otherwise the next 10 ms tick
-                # would fire MotionCtrl_2(CAN_CTRL,…) + JointCtrl(target),
-                # which would silently re-enable the motors and undo our
-                # DisableArm before the operator even gets a chance to
-                # drag the arm. The 20 ms sleep gives at least one
-                # heartbeat tick to observe _teach_active and skip its
-                # send block.
-                self._teach_active = True
-                time.sleep(0.02)
-                self.p.DisableArm(7, 0x01)
-                log("INFO", "teach mode: motors disabled (drag-teach), heartbeat muted")
-                return {"ok": True, "teach_active": True}
-            else:
-                # Snapshot current pose BEFORE re-enabling motors. Once
-                # the heartbeat resumes JointCtrl(target_joints), if
-                # target_joints still holds the pre-teach pose the arm
-                # would yank back to it. Snapshot is from cache (refreshed
-                # at 50 Hz, ≤20 ms stale).
-                with self._cache_lock:
-                    snap = list(self._cache_joints)
-                if len(snap) == 6:
-                    with self.lock:
-                        self.target_joints = snap
-                        self.target_cart   = None
-                        self.move_mode     = MODE_J
-                    log("INFO", f"teach exit: held at current pose {snap}")
-                else:
-                    log("WARN",
-                        "teach exit: cache empty, heartbeat will fall back "
-                        "to last target_joints (may cause a jump)")
-                # Re-enable motors at the snapshotted pose. Short sleeps
-                # between calls let the firmware process each command —
-                # piper_sdk is picky about back-to-back sends.
-                self.p.EnableArm(7, 0x02)
-                time.sleep(0.05)
-                self.p.MotionCtrl_2(0x01, MODE_J, self.speed, 0x00)
-                time.sleep(0.05)
-                self._teach_active = False
-                log("INFO", "teach mode: disabled, motors re-enabled, heartbeat resumed")
-                return {"ok": True, "teach_active": False}
-        except Exception as e:
-            log("ERROR", f"set_teach_mode({enable}) failed: {e}")
-            return {"ok": False, "error": str(e)}
+        return {
+            "ok": False,
+            "error": "software drag-teach not supported on Piper V1.8-2; "
+                     "use the physical button on the arm body",
+        }
 
     def m_arm_set_speeds(self, joint_dps: Optional[float] = None,
                                 zero_dps:  Optional[float] = None,
