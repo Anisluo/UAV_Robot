@@ -405,10 +405,17 @@ class PiperController:
         reach the arm.
 
         On enable the heartbeat is muted (see Controller.heartbeat) so it
-        doesn't fight the firmware's TEACH state every 10 ms. On disable we
-        re-run the full handshake to ensure CAN_CTRL latches cleanly —
-        otherwise the arm tends to sit in STANDBY/oscillation for a few
-        seconds.
+        doesn't fight the firmware's TEACH state every 10 ms.
+
+        On disable we snapshot the live joint angles into target_joints so
+        the heartbeat — which is about to start sending JointCtrl again —
+        commands the arm to hold WHERE-IT-IS-NOW rather than snapping back
+        to the old pre-teach target. We DO NOT re-run the full handshake
+        here: that path transitions through STANDBY, which drops motor
+        torque briefly and the operator perceives as a "power blink / the
+        arm dropped". Instead we trust the heartbeat's natural
+        MotionCtrl_2(CAN_CTRL,...) refresh + the auto-recovery streak
+        counter to re-latch CAN_CTRL within a few hundred ms.
         """
         try:
             if enable:
@@ -419,13 +426,26 @@ class PiperController:
                 log("INFO", "teach mode: enabled (heartbeat muted)")
                 return {"ok": True, "teach_active": True}
             else:
+                # Snapshot current pose BEFORE leaving teach — once teach
+                # exits, the heartbeat resumes JointCtrl(target_joints)
+                # immediately, and if target_joints still holds the pre-
+                # teach pose the arm yanks back to it. Read the live
+                # cache (refreshed at 50 Hz, so ≤20 ms stale).
+                with self._cache_lock:
+                    snap = list(self._cache_joints)
+                if len(snap) == 6:
+                    with self.lock:
+                        self.target_joints = snap
+                        self.target_cart   = None
+                        self.move_mode     = MODE_J
+                    log("INFO", f"teach exit: held at current pose {snap}")
+                else:
+                    log("WARN",
+                        "teach exit: cache empty, heartbeat will fall back "
+                        "to last target_joints (may cause a jump)")
                 self.p.MotionCtrl_1(0, 0, 0x02)
-                # Clear latch and re-handshake so CAN_CTRL latches cleanly.
-                # Without the handshake the firmware can sit in STANDBY for
-                # a noticeable window after teach exits.
                 self._teach_active = False
-                self._do_full_handshake()
-                log("INFO", "teach mode: disabled (handshake done, CAN_CTRL latched)")
+                log("INFO", "teach mode: disabled, heartbeat resumed")
                 return {"ok": True, "teach_active": False}
         except Exception as e:
             log("ERROR", f"set_teach_mode({enable}) failed: {e}")
