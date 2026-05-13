@@ -198,11 +198,19 @@ class PiperController:
         arm keeps oscillating STANDBY ↔ CAN_CTRL even with continuous
         heartbeat. The Resume command clears an internal "abnormal" flag
         the firmware sets when teach mode terminates, and is the cure.
+
+        NOTE: we used to also call MasterSlaveConfig(0xFC) here ("set as
+        motion output / slave arm"). Empirically that command put the
+        firmware into a "I'm a slave, my master should be driving me"
+        state, with the side effect that physical-button-release from
+        TEACHING caused the arm to DROP (firmware released gravity-comp
+        expecting master input). Running the handshake WITHOUT
+        MasterSlaveConfig: teach release stays smooth and gravity-comp
+        is held continuously. So we drop that step entirely — we don't
+        run as part of a master-slave pair, this arm is standalone.
         """
         log("INFO", "handshake: EmergencyStop(0x02) — resume from any halt/teach")
         self.p.EmergencyStop(0x02); time.sleep(0.3)
-        log("INFO", "handshake: MasterSlaveConfig(0xFC)")
-        self.p.MasterSlaveConfig(0xFC, 0, 0, 0); time.sleep(0.3)
         log("INFO", "handshake: STANDBY")
         self.p.MotionCtrl_2(0x00, 0x00, 0, 0x00); time.sleep(0.3)
         log("INFO", "handshake: CAN_CTRL")
