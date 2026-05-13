@@ -115,6 +115,13 @@ class PiperController:
         # alone can't pull it back without EmergencyStop(0x02) first.
         self._nonctrl_streak    = 0
         self._last_recovery_t   = 0.0
+        # Teach-mode latch. When True the heartbeat suppresses its CAN_CTRL
+        # refresh + JointCtrl + GripperCtrl sends so the operator can drag
+        # the arm by hand without us fighting them every 10 ms. Set by the
+        # RPC handler (piper.set_teach_mode) and ALSO inferred from the
+        # firmware's teach_status feedback — so pressing the physical drag-
+        # teach button on the arm body works without any RPC call.
+        self._teach_active = False
 
         # Lifecycle
         self.connected = False
@@ -217,19 +224,27 @@ class PiperController:
                     g_eff = self.gripper_effort
                     g_dirty = self._gripper_dirty
                     self._gripper_dirty = False
-                # Always send mode + target each cycle — Piper firmware needs
-                # this to keep CAN_CTRL latched.
-                self.p.MotionCtrl_2(0x01, mode, speed, 0x00)
-                if c is not None and mode in (MODE_P, MODE_L, MODE_C):
-                    self.p.EndPoseCtrl(*c)
-                else:
-                    self.p.JointCtrl(*j)
-                # Gripper: only send when the target changed, or as a 1Hz
-                # safety re-send in case a frame got lost.
-                now = time.monotonic()
-                if g_dirty or (now - self._gripper_last_send_t) > 1.0:
-                    self.p.GripperCtrl(int(g_um), int(g_eff), 0x01, 0)
-                    self._gripper_last_send_t = now
+                    in_teach = self._teach_active
+                # During drag-teach the heartbeat MUST yield. Otherwise our
+                # 10 ms MotionCtrl_2(CAN_CTRL,...) + JointCtrl(target_joints)
+                # immediately fight the firmware's TEACH state and the arm
+                # visibly oscillates between modes. Cache refresh below still
+                # runs so HostGUI sees the live (operator-dragged) angles for
+                # waypoint recording.
+                if not in_teach:
+                    # Send mode + target each cycle — Piper firmware needs
+                    # this to keep CAN_CTRL latched.
+                    self.p.MotionCtrl_2(0x01, mode, speed, 0x00)
+                    if c is not None and mode in (MODE_P, MODE_L, MODE_C):
+                        self.p.EndPoseCtrl(*c)
+                    else:
+                        self.p.JointCtrl(*j)
+                    # Gripper: only send when the target changed, or as a 1Hz
+                    # safety re-send in case a frame got lost.
+                    now = time.monotonic()
+                    if g_dirty or (now - self._gripper_last_send_t) > 1.0:
+                        self.p.GripperCtrl(int(g_um), int(g_eff), 0x01, 0)
+                        self._gripper_last_send_t = now
 
                 # Refresh feedback cache every other heartbeat cycle (≈ HZ/2)
                 # to keep RX-thread CPU sane while still feeding HostGUI a
@@ -263,10 +278,40 @@ class PiperController:
                         # run the full EmergencyStop+STANDBY+CAN_CTRL sequence.
                         # This catches the post-teach STANDBY↔CAN_CTRL oscillation
                         # that the operator was hitting after exiting drag-teach.
-                        if cur_ctrl != 1:
-                            self._nonctrl_streak += 1
-                        else:
+                        #
+                        # BUT: if teach_status is non-zero, the operator pushed
+                        # the physical drag-teach button on the arm body and
+                        # IS DELIBERATELY in teach mode — they are physically
+                        # moving the arm to record waypoints. Forcing it back
+                        # to CAN_CTRL right now would mean we fight them every
+                        # ~100 ms and the arm visibly flickers between modes.
+                        # Skip recovery as long as teach is engaged; resume the
+                        # streak counter only after teach_status drops to 0.
+                        # Firmware teach state — set whenever the physical
+                        # drag-teach button is pressed OR we sent
+                        # MotionCtrl_1(grag_teach_ctrl=0x01). We track this
+                        # back into _teach_active so the heartbeat above will
+                        # stop fighting the operator next cycle even if the
+                        # software latch wasn't set (i.e. physical-button-
+                        # only path). Clears automatically when firmware
+                        # leaves teach (operator released button or we sent
+                        # MotionCtrl_1(grag_teach_ctrl=0x02)).
+                        teach_engaged = int(sa.teach_status) != 0 or cur_ctrl == 2
+                        if teach_engaged:
+                            self._teach_active = True
                             self._nonctrl_streak = 0
+                        else:
+                            # Only clear the software latch if firmware also
+                            # says we're out. (Software-initiated exit calls
+                            # set_teach_mode(False) which clears this directly.)
+                            # Leaving _teach_active alone here would cause us
+                            # to stay quiet forever after a physical-button
+                            # session — explicitly clear once firmware is out.
+                            self._teach_active = False
+                            if cur_ctrl != 1:
+                                self._nonctrl_streak += 1
+                            else:
+                                self._nonctrl_streak = 0
                         now_t = time.monotonic()
                         if (self._nonctrl_streak >= 5 and
                             now_t - self._last_recovery_t > 2.0):
@@ -347,10 +392,44 @@ class PiperController:
             return {"ok": False, "error": str(e)}
 
     def m_arm_set_free_mode(self, enable: bool) -> Dict[str, Any]:
-        """Drag-teach. Piper enters teach mode via the physical button on the
-        body — not via CAN. We DON'T silently disable, but report so HostGUI
-        can show the right message."""
-        return {"ok": False, "error": "piper drag-teach is via physical button, not CAN"}
+        """Legacy alias. New code should call set_teach_mode directly."""
+        return self.m_arm_set_teach_mode(bool(enable))
+
+    def m_arm_set_teach_mode(self, enable: bool) -> Dict[str, Any]:
+        """Software entry/exit of Piper drag-teach mode.
+
+        Uses MotionCtrl_1's grag_teach_ctrl byte (0x01 = enter, 0x02 = exit).
+        The physical drag-teach button on the arm body remains the
+        operator's primary entry point; this RPC just lets HostGUI offer the
+        same toggle from the dashboard so the operator doesn't have to
+        reach the arm.
+
+        On enable the heartbeat is muted (see Controller.heartbeat) so it
+        doesn't fight the firmware's TEACH state every 10 ms. On disable we
+        re-run the full handshake to ensure CAN_CTRL latches cleanly —
+        otherwise the arm tends to sit in STANDBY/oscillation for a few
+        seconds.
+        """
+        try:
+            if enable:
+                # Set the latch FIRST so the heartbeat yields immediately,
+                # otherwise the next 10 ms tick clobbers the teach cmd.
+                self._teach_active = True
+                self.p.MotionCtrl_1(0, 0, 0x01)
+                log("INFO", "teach mode: enabled (heartbeat muted)")
+                return {"ok": True, "teach_active": True}
+            else:
+                self.p.MotionCtrl_1(0, 0, 0x02)
+                # Clear latch and re-handshake so CAN_CTRL latches cleanly.
+                # Without the handshake the firmware can sit in STANDBY for
+                # a noticeable window after teach exits.
+                self._teach_active = False
+                self._do_full_handshake()
+                log("INFO", "teach mode: disabled (handshake done, CAN_CTRL latched)")
+                return {"ok": True, "teach_active": False}
+        except Exception as e:
+            log("ERROR", f"set_teach_mode({enable}) failed: {e}")
+            return {"ok": False, "error": str(e)}
 
     def m_arm_set_speeds(self, joint_dps: Optional[float] = None,
                                 zero_dps:  Optional[float] = None,
@@ -561,6 +640,8 @@ class RpcServer:
             "arm.stop":                     lambda **kw: c.m_arm_stop(),
             "arm.emergency_stop":           lambda enable=False, **_: c.m_arm_emergency_stop(enable),
             "arm.set_free_mode":            lambda enable=False, **_: c.m_arm_set_free_mode(enable),
+            "arm.set_teach_mode":           lambda enable=False, **_: c.m_arm_set_teach_mode(enable),
+            "piper.set_teach_mode":         lambda enable=False, **_: c.m_arm_set_teach_mode(enable),
             "arm.set_speeds":               lambda **kw: c.m_arm_set_speeds(**kw),
             "arm.get_speeds":               lambda **kw: c.m_arm_get_speeds(),
             "arm.move_joint":               lambda joint_index=None, joint=None, target_deg=0.0, **_: c.m_arm_move_joint(joint_index or joint or 1, target_deg),
