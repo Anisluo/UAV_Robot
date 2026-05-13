@@ -307,62 +307,49 @@ class PiperController:
                         # transition is our cue that the operator just
                         # finished dragging — that's when we run the soft
                         # re-engage to drop ctrl_mode back to 1.
-                        teach_engaged = int(sa.teach_status) == 1
-                        was_teaching  = self._teach_active
-                        if teach_engaged:
+                        # V1.8-2 teach_status state machine, all three values:
+                        #   0 = idle      — heartbeat resumes normal control
+                        #   1 = dragging  — heartbeat muted, operator using arm
+                        #   2 = released  — heartbeat STAYS muted. Firmware
+                        #                   is still in ctrl_mode=0x02 with
+                        #                   gravity-comp holding the arm up
+                        #                   at the dragged pose. Forcing it
+                        #                   back to CAN_CTRL from here (via
+                        #                   any combination of commands we
+                        #                   tried) caused the motors to lose
+                        #                   torque mid-transition — arm
+                        #                   DROPPED. Don't do that.
+                        #
+                        # Operator exits TEACHING manually by clicking 使能
+                        # in HostGUI (full handshake) WHILE supporting the
+                        # arm — the handshake's STANDBY transit causes the
+                        # same drop, but the operator's hand catches it.
+                        # Once handshake completes, firmware resets
+                        # teach_status to 0, which is when we resume.
+                        ts = int(sa.teach_status)
+                        was_teaching = self._teach_active
+                        if ts == 1:                          # actively dragging
                             self._teach_active = True
                             self._nonctrl_streak = 0
-                        else:
-                            # Falling edge: snapshot live pose into the
-                            # heartbeat target so the resumed JointCtrl
-                            # commands "stay where you are" rather than
-                            # the pre-teach pose, AND actively pull
-                            # firmware out of TEACHING. Just resuming
-                            # MotionCtrl_2(CAN_CTRL,…) from the heartbeat
-                            # is not enough — V1.8-2 firmware will sit
-                            # in ctrl_mode=2 until an explicit re-engage.
-                            # We send the smallest sequence that does it
-                            # WITHOUT a STANDBY blip:
-                            #   EmergencyStop(0x02) "resume"
-                            #   MotionCtrl_2(CAN_CTRL, MOVE_J, speed, 0)
-                            #   EnableArm(7, 0x02)
-                            # No MasterSlaveConfig, no STANDBY transit,
-                            # so motor torque stays smooth.
+                        elif ts == 2:                        # released, still in TEACHING
                             if was_teaching and len(self._cache_joints) == 6:
-                                # SAFETY-CRITICAL: TEACHING has gravity-comp.
-                                # When firmware exits TEACHING, that comp
-                                # turns off. If the firmware doesn't have a
-                                # JointCtrl target queued at that moment,
-                                # motors go limp and the arm drops.
-                                #
-                                # Just clearing _teach_active and letting
-                                # the next 10ms heartbeat tick send the
-                                # combo wasn't tight enough — there's still
-                                # a ~10ms window where firmware has no
-                                # target.
-                                #
-                                # Send JointCtrl(snap) and MotionCtrl_2
-                                # (CAN_CTRL) BACK-TO-BACK right here, with
-                                # NO sleeps between them. JointCtrl seeds
-                                # the target while firmware is still in
-                                # TEACHING; the very next frame switches
-                                # mode → motors latch onto the queued
-                                # target immediately. Microseconds, not
-                                # milliseconds.
+                                # Snapshot the dragged pose so when the
+                                # operator eventually exits TEACHING via
+                                # 使能, the resumed heartbeat tells the
+                                # arm to hold here rather than yank back
+                                # to the pre-teach target.
                                 snap = list(self._cache_joints)
                                 with self.lock:
                                     self.target_joints = snap
                                     self.target_cart   = None
                                     self.move_mode     = MODE_J
-                                try:
-                                    self.p.JointCtrl(*snap)
-                                    self.p.MotionCtrl_2(0x01, MODE_J, self.speed, 0x00)
-                                    log("INFO",
-                                        f"physical teach release: held at "
-                                        f"current pose {snap} "
-                                        f"(JointCtrl+CAN_CTRL back-to-back)")
-                                except Exception as e:
-                                    log("ERROR", f"teach release re-engage failed: {e}")
+                                log("INFO",
+                                    f"physical teach release: pose snapshotted "
+                                    f"{snap}. Arm stays in TEACHING; press 使能 "
+                                    f"with hand support to leave.")
+                            self._teach_active = True        # keep heartbeat muted
+                            self._nonctrl_streak = 0
+                        else:                                # ts == 0, idle
                             self._teach_active = False
                             if cur_ctrl != 1:
                                 self._nonctrl_streak += 1
