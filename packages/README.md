@@ -10,7 +10,7 @@ skip the wrong file.
 | `librknnrt.so` | proc_npu | YOLOv8 RKNN models fail to load (only matters if board's `/usr/lib/librknnrt.so` predates the toolkit you used to export the model) |
 | `gs_usb.ko` | proc_piper (gen-2 arm) | Piper backend won't bind to the candleLight USB-CAN — you'll see `can_piper` missing from `ip link` |
 | `numpy-*.whl` + `opencv_python_headless-*.whl` | battery_tracker, face_tracker | CV sidecars exit on import error if you don't already have these |
-| `piper_sdk*.whl`, `python_can*.whl` | proc_piper | proc_piper won't start; install_autostart.sh will try online pip as fallback |
+| `piper_sdk*.whl`, `python_can*.whl`, `msgpack*.whl`, `packaging*.whl`, `typing_extensions*.whl`, `wrapt*.whl` | proc_piper | proc_piper won't start; install_autostart.sh will try online pip as fallback. python-can needs msgpack + wrapt + packaging + typing_extensions transitively — bundle all six. |
 | `udev/*.rules` | RealSense + Piper CAN | RealSense camera intermittently fails to enumerate; CAN adapter shows up as random `canN` instead of `can_piper` |
 
 ## Kernel-matched bits — re-source per machine
@@ -42,7 +42,7 @@ pip3 download \
     --platform manylinux_2_17_aarch64 \
     --python-version 38 --only-binary=:all: \
     --dest packages/ \
-    opencv-python-headless numpy piper_sdk python-can
+    opencv-python-headless numpy piper_sdk python-can msgpack
 ```
 
 Then `./tools/install_autostart.sh` picks them up with `--no-index`.
