@@ -125,11 +125,17 @@ class PiperController:
         # Emergency-stop latch. When the operator hits 急停, EmergencyStop
         # (0x01) brakes the motors and the firmware enters a halted state
         # (ctrl_mode != CAN_CTRL). The heartbeat MUST mute its CAN_CTRL
-        # refresh and the auto-recovery MUST NOT fire — otherwise we'd send
-        # EmergencyStop(0x02) "resume" as part of recovery, cancelling the
-        # operator's e-stop and dropping the arm. Cleared by 急停(enable=
-        # False) "resume" RPC.
+        # refresh — otherwise it would silently cancel the brake. Cleared
+        # either by 急停(enable=False), or automatically after the
+        # deceleration grace period via _estop_auto_recover_at.
         self._estop_engaged = False
+        # Auto-recover deadline. After EmergencyStop(0x01), the arm needs
+        # ~1-2 s to actually decelerate to a halt. Once it's settled it's
+        # SAFE to send EmergencyStop(0x02)+handshake to restore CAN_CTRL.
+        # Doing it sooner cancels the in-flight brake → arm free-falls
+        # (operator observed: "缓慢降落一会，然后急速掉下去"). Set when
+        # estop engages, checked by heartbeat.
+        self._estop_auto_recover_at: float = 0.0
 
         # Lifecycle
         self.connected = False
@@ -219,6 +225,14 @@ class PiperController:
         """
         log("INFO", "handshake: EmergencyStop(0x02) — resume from any halt/teach")
         self.p.EmergencyStop(0x02); time.sleep(0.3)
+        # Handshake = explicit operator decision to return to active
+        # control. Clear the e-stop / teach latches so the heartbeat can
+        # resume sending JointCtrl after the handshake completes.
+        # Otherwise the operator clicks 使能, firmware shows CAN_CTRL,
+        # but proc_piper keeps the heartbeat muted and the arm doesn't
+        # respond to any subsequent commands.
+        self._estop_engaged = False
+        self._teach_active  = False
         log("INFO", "handshake: STANDBY")
         self.p.MotionCtrl_2(0x00, 0x00, 0, 0x00); time.sleep(0.3)
         log("INFO", "handshake: CAN_CTRL")
@@ -389,15 +403,24 @@ class PiperController:
                                 self._nonctrl_streak += 1
                             else:
                                 self._nonctrl_streak = 0
-                        # No auto-recovery. If the firmware drops to
-                        # STANDBY (post-teach, post-e-stop, post-anything),
-                        # we leave it there. The operator decides when to
-                        # come back to CAN_CTRL by clicking 使能 (or 恢复
-                        # via emergency_stop(enable=False)). Forcing a
-                        # handshake automatically was the source of the
-                        # "急停 → slow descent → sudden drop" bug —
-                        # auto-recovery fired EmergencyStop(0x02) which
-                        # cancelled the operator's brake.
+                        # No general auto-recovery (post-teach STANDBY is
+                        # left alone; operator clicks 使能 to come back).
+                        # But e-stop has a deadline-based auto-recovery:
+                        # after the brake-deceleration grace period, the
+                        # arm is fully stopped — safe to re-handshake and
+                        # restore CAN_CTRL automatically so the operator's
+                        # next move/home command works without first
+                        # clicking 恢复. The grace period is the critical
+                        # part — recovering DURING deceleration was what
+                        # caused the "缓动→急速掉下去" bug.
+                        if (self._estop_engaged and
+                            time.monotonic() >= self._estop_auto_recover_at):
+                            log("INFO", "estop grace period elapsed → auto-recover to CAN_CTRL")
+                            try:
+                                # _do_full_handshake also clears _estop_engaged
+                                self._do_full_handshake()
+                            except Exception as e:
+                                log("ERROR", f"estop auto-recover failed: {e}")
                     except Exception:
                         pass   # don't kill the loop on a transient read miss
             except Exception as e:
@@ -470,8 +493,16 @@ class PiperController:
         try:
             if enable:
                 self._estop_engaged = True
+                # Auto-recover after deceleration grace period. 1.5 s is
+                # enough for the brake to fully halt Piper at its typical
+                # speed envelope. Heartbeat watches this deadline and runs
+                # the handshake when reached.
+                grace_s = float(os.environ.get("UAV_PIPER_ESTOP_AUTO_RECOVER_S", "1.5"))
+                self._estop_auto_recover_at = time.monotonic() + grace_s
                 self.p.EmergencyStop(0x01)
-                log("INFO", "estop engaged (brake applied, heartbeat muted)")
+                log("INFO",
+                    f"estop engaged (brake applied, heartbeat muted, "
+                    f"auto-recover in {grace_s:.1f}s)")
             else:
                 # Snapshot pose so resumed heartbeat holds, doesn't yank
                 with self._cache_lock:
