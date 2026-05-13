@@ -328,27 +328,37 @@ class PiperController:
                             #   EnableArm(7, 0x02)
                             # No MasterSlaveConfig, no STANDBY transit,
                             # so motor torque stays smooth.
-                            if was_teaching:
-                                if len(self._cache_joints) == 6:
-                                    snap = list(self._cache_joints)
-                                    with self.lock:
-                                        self.target_joints = snap
-                                        self.target_cart   = None
-                                        self.move_mode     = MODE_J
-                                    log("INFO",
-                                        f"physical teach release: held at "
-                                        f"current pose {snap}")
-                                try:
-                                    self.p.EmergencyStop(0x02)
-                                    time.sleep(0.05)
-                                    self.p.MotionCtrl_2(0x01, MODE_J, self.speed, 0x00)
-                                    time.sleep(0.05)
-                                    self.p.EnableArm(7, 0x02)
-                                    log("INFO",
-                                        "teach release: soft re-engage sent "
-                                        "(EmergencyStop+CAN_CTRL+EnableArm, no STANDBY)")
-                                except Exception as e:
-                                    log("ERROR", f"teach release re-engage failed: {e}")
+                            if was_teaching and len(self._cache_joints) == 6:
+                                # SAFETY-CRITICAL: TEACHING has gravity-comp.
+                                # The arm holds itself up because firmware
+                                # applies just enough torque to counter
+                                # gravity while remaining compliant to
+                                # operator force. The previous "auto re-
+                                # engage" sent EmergencyStop+MotionCtrl_2+
+                                # EnableArm with 50ms sleeps between, and
+                                # the operator reported the arm dropping
+                                # mid-air during the sleeps. NOT acceptable.
+                                #
+                                # The safe path is to send NO explicit
+                                # control commands here at all. We only:
+                                #   1. snapshot the dragged pose into
+                                #      target_joints
+                                #   2. flip _teach_active = False
+                                # The heartbeat's next ~10ms tick then
+                                # naturally fires MotionCtrl_2(CAN_CTRL,…)
+                                # + JointCtrl(snap) together as one batch.
+                                # Firmware transitions to CAN_CTRL with an
+                                # immediate target → no torque gap, no drop.
+                                # No sleeps in this critical section.
+                                snap = list(self._cache_joints)
+                                with self.lock:
+                                    self.target_joints = snap
+                                    self.target_cart   = None
+                                    self.move_mode     = MODE_J
+                                log("INFO",
+                                    f"physical teach release: held at "
+                                    f"current pose {snap} "
+                                    f"(heartbeat resumes next tick, no manual cmds)")
                             self._teach_active = False
                             if cur_ctrl != 1:
                                 self._nonctrl_streak += 1
