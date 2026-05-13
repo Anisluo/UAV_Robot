@@ -364,6 +364,12 @@ class PiperController:
                             self._teach_active = True
                             self._nonctrl_streak = 0
                         elif ts == 2:                        # released, still in TEACHING
+                            # Edge-trigger: only snapshot + log the FIRST
+                            # time we see the falling edge. Without this,
+                            # the cache-refresh fires every 20 ms and the
+                            # journal floods with the same "snapshotted"
+                            # line until the operator does something else.
+                            edge = was_teaching
                             # SAFETY: do NOT auto-exit TEACHING here.
                             # We tried, but our detection window is too
                             # slow — by the time we see teach_status=2,
@@ -384,7 +390,7 @@ class PiperController:
                             # exit (either via safe_teach_exit or via
                             # 使能 with hand support), the resumed
                             # heartbeat holds at the dragged pose.
-                            if was_teaching and len(self._cache_joints) == 6:
+                            if edge and len(self._cache_joints) == 6:
                                 snap = list(self._cache_joints)
                                 with self.lock:
                                     self.target_joints = snap
@@ -592,9 +598,39 @@ class PiperController:
             "zero_rpm":  int(self.speed * 30),
         }
 
+    def _check_can_ctrl(self) -> Optional[Dict[str, Any]]:
+        """Return None if firmware is in CAN_CTRL and ready to accept
+        JointCtrl commands. Otherwise return an error dict explaining
+        what state the arm is in and how to get out.
+
+        Used by every motion-issuing RPC (move_joint, move_joints,
+        move_xyz, etc.) so they fail-fast with a clear message instead
+        of silently dropping the command (heartbeat stays muted when
+        the firmware is in TEACHING / STANDBY and JointCtrl never goes
+        out, so the arm appears to ignore the operator).
+        """
+        with self._cache_lock:
+            cur_ctrl = int(self._cache_status.get("ctrl_mode", 0))
+        if cur_ctrl == 1 and not self._teach_active and not self._estop_engaged:
+            return None
+        # Diagnose for the operator
+        if self._estop_engaged:
+            reason = "急停已生效, 请先点 恢复 释放急停"
+        elif cur_ctrl == 2 or self._teach_active:
+            reason = ("机械臂在 TEACHING(物理示教)模式, 不接受运动指令。"
+                      "请先扶住机械臂, 点 使能 退出示教进入 CAN_CTRL")
+        elif cur_ctrl == 0:
+            reason = "机械臂在 STANDBY, 请先点 使能 进入 CAN_CTRL"
+        else:
+            reason = f"ctrl_mode={cur_ctrl} 不是 CAN_CTRL, 请先点 使能"
+        return {"ok": False, "error": reason, "ctrl_mode": cur_ctrl}
+
     def m_arm_move_joint(self, joint_index: int, target_deg: float) -> Dict[str, Any]:
         if not (1 <= joint_index <= 6):
             return {"ok": False, "error": "joint_index out of range"}
+        err = self._check_can_ctrl()
+        if err is not None:
+            return err
         clamped = self._clamp_joint(joint_index - 1, target_deg)
         cur = self._read_joints() or list(self.target_joints)
         new = list(cur)
@@ -609,6 +645,9 @@ class PiperController:
                           speed_ratio: float = 1.0) -> Dict[str, Any]:
         if len(angles_deg) != 6:
             return {"ok": False, "error": "need 6 joints"}
+        err = self._check_can_ctrl()
+        if err is not None:
+            return err
         clamped = [self._clamp_joint(i, a) for i, a in enumerate(angles_deg)]
         with self.lock:
             self.move_mode = MODE_J
