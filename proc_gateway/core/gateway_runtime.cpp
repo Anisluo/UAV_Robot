@@ -1206,6 +1206,22 @@ public:
         std::fprintf(stderr,
                      "proc_gateway: airport rail=%d addr=%u speed_rpm=%d iface=%s\n",
                      rail_index, (unsigned int)addr, rpm, iface_.c_str());
+
+        // Stall protection for rail 2 (the standalone 单独控制 rail).
+        // Rails 0+2 are monitored by start_lock_pair's pair-monitor; rail
+        // 1 (= UI "rail 2") has no such cover. Spawn one here whenever
+        // the user kicks it into motion, so a mechanical jam stops the
+        // motor instead of grinding into the obstruction. Bumping the
+        // session also cancels any prior monitor — handles rapid 前进/
+        // 后退 / stop cycling without double-monitoring.
+        if (rail_index == 1) {
+            const uint64_t session = rail2_motion_session_.fetch_add(1) + 1;
+            if (actual_rpm > 0) {
+                std::thread([this, session]() {
+                    monitor_rail_until_stall(1, session);
+                }).detach();
+            }
+        }
         return true;
     }
 
@@ -1290,6 +1306,13 @@ public:
             return false;
         }
 
+        // Cancel any running rail-2 stall monitor so it doesn't keep
+        // polling a stopped motor (and doesn't fire a redundant stop
+        // a moment later).
+        if (rail_index == 1) {
+            rail2_motion_session_.fetch_add(1);
+        }
+
         std::fprintf(stderr, "proc_gateway: airport rail=%d addr=%u stop iface=%s\n",
                      rail_index, (unsigned int)addr, iface_.c_str());
         return true;
@@ -1312,6 +1335,7 @@ private:
     std::array<double, 3> current_pos_mm_{{0.0, 0.0, 0.0}};
     std::mutex io_mu_;
     std::atomic<uint64_t> pair_motion_session_{0};
+    std::atomic<uint64_t> rail2_motion_session_{0};
 
     static int clamp_int(int value, int min_value, int max_value) {
         if (value < min_value) return min_value;
@@ -1507,6 +1531,68 @@ private:
             if (all_stopped || (stopped[0] && stopped[1])) {
                 break;
             }
+            sleep_ms(poll_ms);
+        }
+    }
+
+    // Single-rail variant of monitor_pair_until_stall, used by rail 2
+    // (the 单独控制 rail). Same stall detection (status bits 0x04/0x08),
+    // same "CAN silence == stall" fallback, same hard duration cap.
+    // Defaults are independent so they can be tuned per rail without
+    // affecting the pair-lock timings.
+    void monitor_rail_until_stall(int rail_index, uint64_t session) {
+        const int poll_ms       = clamp_int(env_int("UAV_AIRPORT_RAIL2_POLL_MS",      120), 20, 1000);
+        const int confirm_hits  = clamp_int(env_int("UAV_AIRPORT_RAIL2_CONFIRM_HITS",   2),  1,   10);
+        // Rail 2 can sweep further than the lock pair, so allow a longer
+        // run before the safety cap kicks in. Override via env if the
+        // physical travel time exceeds this.
+        const int max_duration  = clamp_int(env_int("UAV_AIRPORT_RAIL2_MAX_MS",     30000), 500, 600000);
+        const int max_read_fail = clamp_int(env_int("UAV_AIRPORT_RAIL2_READ_FAIL_HITS", 8),  1,   100);
+
+        const uint8_t addr = rail_addr(rail_index);
+        if (addr == 0U) return;
+
+        int stall_hits = 0;
+        int read_fails = 0;
+        const uint64_t t0 = now_ms();
+
+        while (g_running && rail2_motion_session_.load() == session) {
+            if ((int64_t)(now_ms() - t0) >= max_duration) {
+                std::fprintf(stderr,
+                    "proc_gateway: airport rail=%d max-duration %dms hit, force-stop\n",
+                    rail_index, max_duration);
+                (void)stop_rail(rail_index);
+                break;
+            }
+
+            uint8_t flags = 0;
+            if (!read_status_flags(addr, &flags)) {
+                if (++read_fails >= max_read_fail) {
+                    std::fprintf(stderr,
+                        "proc_gateway: airport rail=%d %d consecutive status reads failed → force-stop\n",
+                        rail_index, read_fails);
+                    (void)stop_rail(rail_index);
+                    break;
+                }
+                sleep_ms(poll_ms);
+                continue;
+            }
+            read_fails = 0;
+
+            const bool stalled = (flags & 0x04U) != 0U || (flags & 0x08U) != 0U;
+            if (stalled) {
+                stall_hits += 1;
+                if (stall_hits >= confirm_hits) {
+                    std::fprintf(stderr,
+                        "proc_gateway: airport rail=%d stall flags=0x%02X → stop\n",
+                        rail_index, flags);
+                    (void)stop_rail(rail_index);
+                    break;
+                }
+            } else {
+                stall_hits = 0;
+            }
+
             sleep_ms(poll_ms);
         }
     }
