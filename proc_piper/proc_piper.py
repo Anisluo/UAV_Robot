@@ -333,22 +333,61 @@ class PiperController:
                             self._nonctrl_streak = 0
                         elif ts == 2:                        # released, still in TEACHING
                             if was_teaching and len(self._cache_joints) == 6:
-                                # Snapshot the dragged pose so when the
-                                # operator eventually exits TEACHING via
-                                # 使能, the resumed heartbeat tells the
-                                # arm to hold here rather than yank back
-                                # to the pre-teach target.
+                                # SAFE auto-exit sequence (operator-
+                                # validated): the missing piece in all
+                                # our previous attempts was the leading
+                                # EmergencyStop(0x01) "快速急停". That
+                                # command applies controlled braking
+                                # torque to the motors — the arm settles
+                                # in place instead of free-falling when
+                                # gravity-comp ends. Without it, the
+                                # firmware just drops torque and the arm
+                                # falls.
+                                #
+                                # The full safe sequence is:
+                                #   EmergencyStop(0x01)  → braked halt
+                                #   sleep ~300 ms        → let motors settle
+                                #   EmergencyStop(0x02)  → resume from halt
+                                #   MotionCtrl_2(CAN_CTRL,…)
+                                #   EnableArm(7, 0x02)
+                                # which is what the operator does manually
+                                # via 急停 → 恢复 → 使能. Snapshot pose
+                                # first so the heartbeat's resumed
+                                # JointCtrl tells the arm to hold here.
                                 snap = list(self._cache_joints)
                                 with self.lock:
                                     self.target_joints = snap
                                     self.target_cart   = None
                                     self.move_mode     = MODE_J
                                 log("INFO",
-                                    f"physical teach release: pose snapshotted "
-                                    f"{snap}. Arm stays in TEACHING; press 使能 "
-                                    f"with hand support to leave.")
-                            self._teach_active = True        # keep heartbeat muted
-                            self._nonctrl_streak = 0
+                                    f"physical teach release: pose {snap}; "
+                                    f"running safe auto-exit "
+                                    f"(EStop+settle+resume+CAN_CTRL+enable)")
+                                try:
+                                    # Step 1: braked halt
+                                    self.p.EmergencyStop(0x01)
+                                    time.sleep(0.3)
+                                    # Step 2: resume from halt
+                                    self.p.EmergencyStop(0x02)
+                                    time.sleep(0.1)
+                                    # Step 3: latch CAN_CTRL with MOVE_J
+                                    self.p.MotionCtrl_2(0x01, MODE_J, self.speed, 0x00)
+                                    time.sleep(0.1)
+                                    # Step 4: ensure motors enabled
+                                    self.p.EnableArm(7, 0x02)
+                                    log("INFO", "teach safe-exit completed; heartbeat resumes")
+                                    self._teach_active = False  # let heartbeat take over
+                                    self._nonctrl_streak = 0
+                                except Exception as e:
+                                    log("ERROR", f"teach safe-exit failed: {e}; "
+                                                 f"staying in TEACHING — use 使能 manually")
+                                    self._teach_active = True   # keep muted, operator's call
+                                    self._nonctrl_streak = 0
+                            else:
+                                # No fresh snapshot (cache hasn't filled
+                                # yet) — too risky to auto-exit blind.
+                                self._teach_active = True
+                                self._nonctrl_streak = 0
                         else:                                # ts == 0, idle
                             self._teach_active = False
                             if cur_ctrl != 1:
