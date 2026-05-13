@@ -287,26 +287,37 @@ class PiperController:
                         # ~100 ms and the arm visibly flickers between modes.
                         # Skip recovery as long as teach is engaged; resume the
                         # streak counter only after teach_status drops to 0.
-                        # Firmware teach state — set whenever the physical
-                        # drag-teach button is pressed OR we sent
-                        # MotionCtrl_1(grag_teach_ctrl=0x01). We track this
-                        # back into _teach_active so the heartbeat above will
-                        # stop fighting the operator next cycle even if the
-                        # software latch wasn't set (i.e. physical-button-
-                        # only path). Clears automatically when firmware
-                        # leaves teach (operator released button or we sent
-                        # MotionCtrl_1(grag_teach_ctrl=0x02)).
+                        # Firmware teach state — true when the operator
+                        # pressed the physical drag-teach button on the arm
+                        # body (firmware reports ctrl_mode=0x02 TEACHING).
+                        # Software path (DisableArm) reports differently,
+                        # so we hit this branch primarily for the physical
+                        # button workflow. Track back into _teach_active so
+                        # the heartbeat above stops fighting the operator.
                         teach_engaged = int(sa.teach_status) != 0 or cur_ctrl == 2
+                        was_teaching  = self._teach_active
                         if teach_engaged:
                             self._teach_active = True
                             self._nonctrl_streak = 0
                         else:
-                            # Only clear the software latch if firmware also
-                            # says we're out. (Software-initiated exit calls
-                            # set_teach_mode(False) which clears this directly.)
-                            # Leaving _teach_active alone here would cause us
-                            # to stay quiet forever after a physical-button
-                            # session — explicitly clear once firmware is out.
+                            # Transition teach → not-teach: the operator
+                            # just released the physical button (or the
+                            # software exit path ran). Snapshot the live
+                            # joint angles into target_joints so that when
+                            # heartbeat resumes JointCtrl on the next tick
+                            # it commands "stay where you are" rather than
+                            # snapping back to the pre-teach pose. Without
+                            # this, releasing the physical button causes a
+                            # visible yank-back.
+                            if was_teaching and len(self._cache_joints) == 6:
+                                snap = list(self._cache_joints)
+                                with self.lock:
+                                    self.target_joints = snap
+                                    self.target_cart   = None
+                                    self.move_mode     = MODE_J
+                                log("INFO",
+                                    f"physical teach release: held at "
+                                    f"current pose {snap}")
                             self._teach_active = False
                             if cur_ctrl != 1:
                                 self._nonctrl_streak += 1
