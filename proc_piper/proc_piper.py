@@ -294,18 +294,20 @@ class PiperController:
                         # so we hit this branch primarily for the physical
                         # button workflow. Track back into _teach_active so
                         # the heartbeat above stops fighting the operator.
-                        # "Engaged" = operator is ACTIVELY dragging. This is
-                        # signalled by teach_status != 0 (firmware reports
-                        # recording in progress). We deliberately do NOT
-                        # gate on ctrl_mode == 2 here: on Piper V1.8-2 the
-                        # firmware leaves ctrl_mode stuck at 2 even after
-                        # the operator releases the physical button, so
-                        # gating on it would keep the heartbeat muted
-                        # forever and the operator would have to manually
-                        # press 使能 to leave TEACHING. Using teach_status
-                        # alone gives us a clean 1→0 falling edge the
-                        # moment the operator stops dragging.
-                        teach_engaged = int(sa.teach_status) != 0
+                        # V1.8-2 teach_status state machine (verified live):
+                        #   0 = idle (never engaged this session)
+                        #   1 = START_RECORDING — operator is actively dragging
+                        #   2 = STOP_RECORDING  — operator released the button
+                        # ctrl_mode follows a separate path: it jumps to 2
+                        # on first press but stays at 2 even after release
+                        # until someone (us, or 使能 button) actively pulls
+                        # it back to 1.
+                        #
+                        # So "engaged" is teach_status == 1 ONLY. The 1→2
+                        # transition is our cue that the operator just
+                        # finished dragging — that's when we run the soft
+                        # re-engage to drop ctrl_mode back to 1.
+                        teach_engaged = int(sa.teach_status) == 1
                         was_teaching  = self._teach_active
                         if teach_engaged:
                             self._teach_active = True
