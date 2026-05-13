@@ -1432,13 +1432,42 @@ private:
     }
 
     void monitor_pair_until_stall(uint64_t session) {
-        const int poll_ms = clamp_int(env_int("UAV_AIRPORT_LOCK_POLL_MS", 120), 20, 1000);
-        const int confirm_hits = clamp_int(env_int("UAV_AIRPORT_LOCK_CONFIRM_HITS", 2), 1, 10);
-        const int rails[2] = {0, 2};
-        bool stopped[2] = {false, false};
-        int stall_hits[2] = {0, 0};
+        const int poll_ms       = clamp_int(env_int("UAV_AIRPORT_LOCK_POLL_MS",      120), 20, 1000);
+        const int confirm_hits  = clamp_int(env_int("UAV_AIRPORT_LOCK_CONFIRM_HITS",   2),  1,   10);
+        // Hard cap on how long the pair is allowed to move. If we never
+        // see a confirmed stall within this window the operation is
+        // forcibly aborted — protects against silent CAN failure where
+        // read_status_flags returns false forever and the motors keep
+        // grinding into whatever's in the way.
+        const int max_duration  = clamp_int(env_int("UAV_AIRPORT_LOCK_MAX_MS",      6000), 500, 60000);
+        // If status reads fail this many times in a row for a given
+        // rail, treat the silence itself as a stall — the motor is
+        // either unplugged or its firmware locked up under load, and
+        // neither case is one where we want it to keep trying.
+        const int max_read_fail = clamp_int(env_int("UAV_AIRPORT_LOCK_READ_FAIL_HITS", 8),  1,   100);
+
+        const int rails[2]  = {0, 2};
+        bool stopped[2]     = {false, false};
+        int  stall_hits[2]  = {0, 0};
+        int  read_fails[2]  = {0, 0};
+
+        const uint64_t t0 = now_ms();
 
         while (g_running && pair_motion_session_.load() == session) {
+            // Hard timeout — slam both rails to a stop and bail.
+            if ((int64_t)(now_ms() - t0) >= max_duration) {
+                for (int i = 0; i < 2; ++i) {
+                    if (!stopped[i]) {
+                        std::fprintf(stderr,
+                            "proc_gateway: airport lock max-duration %dms hit, force-stop rail %d\n",
+                            max_duration, rails[i]);
+                        (void)stop_rail(rails[i]);
+                        stopped[i] = true;
+                    }
+                }
+                break;
+            }
+
             bool all_stopped = true;
             for (int i = 0; i < 2; ++i) {
                 if (stopped[i]) continue;
@@ -1446,13 +1475,27 @@ private:
 
                 uint8_t flags = 0;
                 if (!read_status_flags(rail_addr(rails[i]), &flags)) {
+                    // Repeated read failures imply CAN silence — treat
+                    // as worst-case (stall) so the motor doesn't keep
+                    // fighting whatever is jamming it.
+                    if (++read_fails[i] >= max_read_fail) {
+                        std::fprintf(stderr,
+                            "proc_gateway: airport lock rail=%d %d consecutive status reads failed → force-stop\n",
+                            rails[i], read_fails[i]);
+                        (void)stop_rail(rails[i]);
+                        stopped[i] = true;
+                    }
                     continue;
                 }
+                read_fails[i] = 0;
 
                 const bool stalled = (flags & 0x04U) != 0U || (flags & 0x08U) != 0U;
                 if (stalled) {
                     stall_hits[i] += 1;
                     if (stall_hits[i] >= confirm_hits) {
+                        std::fprintf(stderr,
+                            "proc_gateway: airport lock rail=%d stall flags=0x%02X → stop\n",
+                            rails[i], flags);
                         (void)stop_rail(rails[i]);
                         stopped[i] = true;
                     }
@@ -2302,7 +2345,26 @@ static void colorize_depth(const uint8_t *depth16,
 
 // ─── Push one JPEG frame to a video client ───────────────────────────────────
 // Returns false if the client should be closed.
+//
+// Critical: gateway runs the RPC poll loop and the video push in the same
+// thread. A blocking send() on a slow video client (full kernel send buffer
+// because the GUI is behind) used to stall RPC traffic for seconds —
+// operators saw the arm "respond late" to slider moves. We now probe each
+// client with POLLOUT first and drop the entire frame if it would block.
+// Once a send starts (POLLOUT says writable), we commit to finishing it;
+// that's bounded by RTT in practice (~ms on a healthy LAN).
 static bool push_frame(int fd, const std::vector<uint8_t> &jpeg) {
+    pollfd pfd = {fd, POLLOUT, 0};
+    if (poll(&pfd, 1, 0) <= 0) {
+        return true;          // not writable yet — skip this frame, keep conn
+    }
+    if (pfd.revents & (POLLERR | POLLHUP | POLLNVAL)) {
+        return false;         // socket genuinely dead
+    }
+    if (!(pfd.revents & POLLOUT)) {
+        return true;          // kernel buffer full — drop frame, retry next tick
+    }
+
     // Build header + payload as a single contiguous buffer for one send() call.
     uint32_t sz = (uint32_t)jpeg.size();
     std::vector<uint8_t> pkt(4 + jpeg.size());
