@@ -122,6 +122,14 @@ class PiperController:
         # firmware's teach_status feedback — so pressing the physical drag-
         # teach button on the arm body works without any RPC call.
         self._teach_active = False
+        # Emergency-stop latch. When the operator hits 急停, EmergencyStop
+        # (0x01) brakes the motors and the firmware enters a halted state
+        # (ctrl_mode != CAN_CTRL). The heartbeat MUST mute its CAN_CTRL
+        # refresh and the auto-recovery MUST NOT fire — otherwise we'd send
+        # EmergencyStop(0x02) "resume" as part of recovery, cancelling the
+        # operator's e-stop and dropping the arm. Cleared by 急停(enable=
+        # False) "resume" RPC.
+        self._estop_engaged = False
 
         # Lifecycle
         self.connected = False
@@ -233,13 +241,15 @@ class PiperController:
                     g_dirty = self._gripper_dirty
                     self._gripper_dirty = False
                     in_teach = self._teach_active
-                # During drag-teach the heartbeat MUST yield. Otherwise our
-                # 10 ms MotionCtrl_2(CAN_CTRL,...) + JointCtrl(target_joints)
-                # immediately fight the firmware's TEACH state and the arm
-                # visibly oscillates between modes. Cache refresh below still
-                # runs so HostGUI sees the live (operator-dragged) angles for
-                # waypoint recording.
-                if not in_teach:
+                    in_estop = self._estop_engaged
+                # During drag-teach OR an active emergency stop the heartbeat
+                # MUST yield. For teach: our 10ms MotionCtrl_2(CAN_CTRL,...)
+                # + JointCtrl(target_joints) would fight the firmware's TEACH
+                # state. For e-stop: a MotionCtrl_2(CAN_CTRL) refresh would
+                # immediately cancel the brake (firmware treats it as
+                # "operator wants control back") and the arm drops. Cache
+                # refresh below still runs so HostGUI sees live state.
+                if not in_teach and not in_estop:
                     # Send mode + target each cycle — Piper firmware needs
                     # this to keep CAN_CTRL latched.
                     self.p.MotionCtrl_2(0x01, mode, speed, 0x00)
@@ -379,18 +389,15 @@ class PiperController:
                                 self._nonctrl_streak += 1
                             else:
                                 self._nonctrl_streak = 0
-                        now_t = time.monotonic()
-                        if (self._nonctrl_streak >= 5 and
-                            now_t - self._last_recovery_t > 2.0):
-                            log("WARN",
-                                f"ctrl_mode={cur_ctrl} (not CAN_CTRL) for "
-                                f"{self._nonctrl_streak} snapshots → auto-recovery")
-                            try:
-                                self._do_full_handshake()
-                            except Exception as e:
-                                log("ERROR", f"recovery handshake failed: {e}")
-                            self._last_recovery_t = now_t
-                            self._nonctrl_streak  = 0
+                        # No auto-recovery. If the firmware drops to
+                        # STANDBY (post-teach, post-e-stop, post-anything),
+                        # we leave it there. The operator decides when to
+                        # come back to CAN_CTRL by clicking 使能 (or 恢复
+                        # via emergency_stop(enable=False)). Forcing a
+                        # handshake automatically was the source of the
+                        # "急停 → slow descent → sudden drop" bug —
+                        # auto-recovery fired EmergencyStop(0x02) which
+                        # cancelled the operator's brake.
                     except Exception:
                         pass   # don't kill the loop on a transient read miss
             except Exception as e:
@@ -447,15 +454,44 @@ class PiperController:
         return {"ok": True}
 
     def m_arm_emergency_stop(self, enable: bool) -> Dict[str, Any]:
+        """Emergency stop / resume.
+
+        enable=True  → EmergencyStop(0x01) "快速急停": motors apply brake,
+                       arm settles in place. Latch _estop_engaged so the
+                       heartbeat stops sending MotionCtrl_2(CAN_CTRL,…)
+                       (would cancel the brake) and the auto-recovery
+                       doesn't fire EmergencyStop(0x02) "resume".
+        enable=False → EmergencyStop(0x02) "恢复": release halt, re-run
+                       handshake to latch CAN_CTRL with current pose held.
+                       Snapshot live joints into target_joints first so
+                       the heartbeat's resumed JointCtrl tells the arm to
+                       hold where it stopped, not snap back to old target.
+        """
         try:
-            self.p.EmergencyStop(0x01 if enable else 0x02)
-            if not enable:
-                # On resume, re-do handshake to lock CAN_CTRL
+            if enable:
+                self._estop_engaged = True
+                self.p.EmergencyStop(0x01)
+                log("INFO", "estop engaged (brake applied, heartbeat muted)")
+            else:
+                # Snapshot pose so resumed heartbeat holds, doesn't yank
+                with self._cache_lock:
+                    snap = list(self._cache_joints)
+                if len(snap) == 6:
+                    with self.lock:
+                        self.target_joints = snap
+                        self.target_cart   = None
+                        self.move_mode     = MODE_J
+                    log("INFO", f"estop release: held at current pose {snap}")
+                self.p.EmergencyStop(0x02); time.sleep(0.2)
                 self.p.MotionCtrl_2(0x00, 0x00, 0, 0x00); time.sleep(0.2)
                 self.p.MotionCtrl_2(0x01, MODE_J, self.speed, 0x00); time.sleep(0.2)
                 self.p.EnableArm(7, 0x02)
+                self._estop_engaged = False
+                self._nonctrl_streak = 0
+                log("INFO", "estop released, heartbeat resumes")
             return {"ok": True}
         except Exception as e:
+            log("ERROR", f"emergency_stop({enable}) failed: {e}")
             return {"ok": False, "error": str(e)}
 
     def m_arm_set_free_mode(self, enable: bool) -> Dict[str, Any]:
