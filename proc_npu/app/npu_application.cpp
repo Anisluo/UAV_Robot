@@ -21,6 +21,7 @@
 namespace {
 constexpr const char *kFaceTriggerFlag    = "/tmp/uav_face_tracker_enabled";
 constexpr const char *kBatteryTriggerFlag = "/tmp/uav_battery_tracker_enabled";
+constexpr const char *kHelipadTriggerFlag = "/tmp/uav_helipad_tracker_enabled";
 
 // Resolve model file with absolute path. The systemd unit sets
 // WorkingDirectory=/home/ubuntu/UAV_Robot, but `bash -lc` in the
@@ -168,6 +169,12 @@ int NpuApplication::run() {
             set_trigger_flag(kBatteryTriggerFlag,
                              strategy_id == UAV_STRATEGY_BATTERY_CV
                           || strategy_id == UAV_STRATEGY_MAVIC3_DRONE);
+            // Helipad marker tracker (black ring + H) runs alongside
+            // the drone NPU model in MAVIC3 strategy. Provides the
+            // "empty platform is viewable" positive signal — distinct
+            // from "no detections at all = camera blind".
+            set_trigger_flag(kHelipadTriggerFlag,
+                             strategy_id == UAV_STRATEGY_MAVIC3_DRONE);
             {
                 std::lock_guard<std::mutex> lk(model_mu);
                 pending_model = name;

@@ -14,7 +14,7 @@ PACKAGES_DIR="${PROJECT_ROOT}/packages"
 BACKEND="${UAV_ARM_BACKEND:-piper}"
 
 # Shared services (backend-independent)
-SHARED_SERVICES="uav_robotd,proc_realsense,proc_npu,proc_gateway,proc_car,proc_airport,proc_grasp,battery_tracker,face_tracker"
+SHARED_SERVICES="uav_robotd,proc_realsense,proc_npu,proc_gateway,proc_car,proc_airport,proc_grasp,battery_tracker,face_tracker,helipad_tracker"
 
 # Backend-dependent arm services
 ARM_SERVICES_PIPER="proc_piper"
@@ -38,7 +38,8 @@ Options:
                Available values:
                  uav_robotd, proc_realsense, proc_npu, proc_gateway,
                  proc_car, proc_piper, proc_gripper, proc_arm,
-                 proc_airport, proc_grasp, battery_tracker, face_tracker
+                 proc_airport, proc_grasp, battery_tracker, face_tracker,
+                 helipad_tracker
   --skip-deps  Skip system dependency setup (librknnrt.so, udev rules,
                cv2/numpy pip install). Useful for incremental rebuilds.
   -h, --help   Show this help message.
@@ -155,6 +156,7 @@ declare -A BUILD_COMMANDS=(
     [proc_grasp]="make -C proc_grasp"
     [battery_tracker]=""
     [face_tracker]=""
+    [helipad_tracker]=""
 )
 
 declare -A UNIT_NAMES=(
@@ -170,6 +172,7 @@ declare -A UNIT_NAMES=(
     [proc_grasp]="uav-proc-grasp.service"
     [battery_tracker]="uav-battery-tracker.service"
     [face_tracker]="uav-face-tracker.service"
+    [helipad_tracker]="uav-helipad-tracker.service"
 )
 
 IFS=',' read -r -a REQUESTED_SERVICES <<< "${SERVICES}"
@@ -178,7 +181,7 @@ normalize_service_name() {
     local name
     name=$(echo "$1" | tr -d '[:space:]')
     case "${name}" in
-        uav_robotd|proc_realsense|proc_npu|proc_gateway|proc_car|proc_gripper|proc_arm|proc_piper|proc_airport|proc_grasp|battery_tracker|face_tracker)
+        uav_robotd|proc_realsense|proc_npu|proc_gateway|proc_car|proc_gripper|proc_arm|proc_piper|proc_airport|proc_grasp|battery_tracker|face_tracker|helipad_tracker)
             printf '%s\n' "${name}"
             ;;
         *)

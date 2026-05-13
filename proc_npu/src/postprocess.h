@@ -18,6 +18,10 @@
 //                                frame, so the GUI can distinguish
 //                                "camera sees an empty platform" from
 //                                "camera can't see anything".
+//   UAV_CLASS_HELIPAD   = 901 — black-ring-with-H landing marker
+//                                emitted by tools/helipad_tracker.py.
+//                                Positive evidence the platform is
+//                                viewable AND in its expected layout.
 //   UAV_CLASS_BATTERY   = 200 — already in use by battery_tracker.py.
 //
 // Anything class_id >= UAV_CLASS_META_BASE is metadata, not a target.
@@ -25,6 +29,7 @@ static constexpr int32_t UAV_CLASS_DRONE     = 4;
 static constexpr int32_t UAV_CLASS_BATTERY   = 200;
 static constexpr int32_t UAV_CLASS_META_BASE = 900;
 static constexpr int32_t UAV_CLASS_PLATFORM  = 900;
+static constexpr int32_t UAV_CLASS_HELIPAD   = 901;
 
 class Postprocess {
 public:
