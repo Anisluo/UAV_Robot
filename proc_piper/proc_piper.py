@@ -396,41 +396,53 @@ class PiperController:
         return self.m_arm_set_teach_mode(bool(enable))
 
     def m_arm_set_teach_mode(self, enable: bool) -> Dict[str, Any]:
-        """Software entry/exit of Piper drag-teach mode.
+        """Software drag-teach for Piper V1.8-2.
 
-        Uses MotionCtrl_1's grag_teach_ctrl byte (0x01 = enter, 0x02 = exit).
-        The physical drag-teach button on the arm body remains the
-        operator's primary entry point; this RPC just lets HostGUI offer the
-        same toggle from the dashboard so the operator doesn't have to
-        reach the arm.
+        Implementation discovery (verified empirically on the live arm):
 
-        On enable the heartbeat is muted (see Controller.heartbeat) so it
-        doesn't fight the firmware's TEACH state every 10 ms.
+          - MotionCtrl_1(grag_teach_ctrl=0x01) puts the firmware into
+            "示教记录" recording state but DOES NOT release motor torque —
+            the arm stays rigid, operator can't drag it. Not what we want.
+          - MasterSlaveConfig(0xFA, …) "设置为示教输入臂" likewise leaves
+            ctrl_mode at CAN_CTRL with motors locked.
+          - DisableArm(7, 0x01) IS the path that actually makes the motors
+            compliant. The arm goes into STANDBY, motors drop holding
+            torque, and the operator can drag each joint by hand. This is
+            mechanically the same effect as pressing the physical drag-
+            teach button on the arm body.
 
-        On disable we snapshot the live joint angles into target_joints so
-        the heartbeat — which is about to start sending JointCtrl again —
-        commands the arm to hold WHERE-IT-IS-NOW rather than snapping back
-        to the old pre-teach target. We DO NOT re-run the full handshake
-        here: that path transitions through STANDBY, which drops motor
-        torque briefly and the operator perceives as a "power blink / the
-        arm dropped". Instead we trust the heartbeat's natural
-        MotionCtrl_2(CAN_CTRL,...) refresh + the auto-recovery streak
-        counter to re-latch CAN_CTRL within a few hundred ms.
+        Safety note: with motors disabled the arm loses gravity
+        compensation. Piper is small enough that this isn't catastrophic
+        but the operator should expect a slight sag, especially at J2/J3.
+        Support the wrist before pressing the button.
+
+        Exit path: EnableArm(7, 0x02) + MotionCtrl_2(CAN_CTRL, MOVE_J,…)
+        re-enables motors at the current pose. We snapshot the live joints
+        into target_joints first so the heartbeat's resumed JointCtrl
+        commands "stay where you are" rather than the stale pre-teach
+        target — that snapshot is the difference between "arm holds steady"
+        and "arm yanks back to old target".
         """
         try:
             if enable:
-                # Set the latch FIRST so the heartbeat yields immediately,
-                # otherwise the next 10 ms tick clobbers the teach cmd.
+                # Mute heartbeat FIRST. Otherwise the next 10 ms tick
+                # would fire MotionCtrl_2(CAN_CTRL,…) + JointCtrl(target),
+                # which would silently re-enable the motors and undo our
+                # DisableArm before the operator even gets a chance to
+                # drag the arm. The 20 ms sleep gives at least one
+                # heartbeat tick to observe _teach_active and skip its
+                # send block.
                 self._teach_active = True
-                self.p.MotionCtrl_1(0, 0, 0x01)
-                log("INFO", "teach mode: enabled (heartbeat muted)")
+                time.sleep(0.02)
+                self.p.DisableArm(7, 0x01)
+                log("INFO", "teach mode: motors disabled (drag-teach), heartbeat muted")
                 return {"ok": True, "teach_active": True}
             else:
-                # Snapshot current pose BEFORE leaving teach — once teach
-                # exits, the heartbeat resumes JointCtrl(target_joints)
-                # immediately, and if target_joints still holds the pre-
-                # teach pose the arm yanks back to it. Read the live
-                # cache (refreshed at 50 Hz, so ≤20 ms stale).
+                # Snapshot current pose BEFORE re-enabling motors. Once
+                # the heartbeat resumes JointCtrl(target_joints), if
+                # target_joints still holds the pre-teach pose the arm
+                # would yank back to it. Snapshot is from cache (refreshed
+                # at 50 Hz, ≤20 ms stale).
                 with self._cache_lock:
                     snap = list(self._cache_joints)
                 if len(snap) == 6:
@@ -443,9 +455,15 @@ class PiperController:
                     log("WARN",
                         "teach exit: cache empty, heartbeat will fall back "
                         "to last target_joints (may cause a jump)")
-                self.p.MotionCtrl_1(0, 0, 0x02)
+                # Re-enable motors at the snapshotted pose. Short sleeps
+                # between calls let the firmware process each command —
+                # piper_sdk is picky about back-to-back sends.
+                self.p.EnableArm(7, 0x02)
+                time.sleep(0.05)
+                self.p.MotionCtrl_2(0x01, MODE_J, self.speed, 0x00)
+                time.sleep(0.05)
                 self._teach_active = False
-                log("INFO", "teach mode: disabled, heartbeat resumed")
+                log("INFO", "teach mode: disabled, motors re-enabled, heartbeat resumed")
                 return {"ok": True, "teach_active": False}
         except Exception as e:
             log("ERROR", f"set_teach_mode({enable}) failed: {e}")
