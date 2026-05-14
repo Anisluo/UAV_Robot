@@ -1298,6 +1298,66 @@ public:
         return move_absolute_mm(rail_index, std::max(0.0, current_pos_mm_[rail_index] + delta_mm));
     }
 
+    // Open-loop fixed-distance move at a chosen speed. Used by stage
+    // scripts in "distance" stop_mode — drive the rail N mm at speed_rpm,
+    // motor self-stops on its internal pulse counter, GUI advances when
+    // state goes IDLE. If the motor stalls before reaching distance,
+    // monitor_distance_move catches that and transitions to STALLED so
+    // GUI still advances.
+    //   distance_mm: signed. positive=normal direction, negative=reverse.
+    bool move_distance(int rail_index, double distance_mm, int speed_rpm) {
+        if (rail_index < 0 || rail_index >= 3) return false;
+        if (!ensure_ready()) return false;
+
+        const uint8_t addr = rail_addr(rail_index);
+        const int max_rpm = clamp_int(env_int("UAV_AIRPORT_RAIL_MAX_RPM", 1500), 1, 3000);
+        const uint8_t acc = (uint8_t)clamp_int(env_int("UAV_AIRPORT_RAIL_SPEED_ACC", 10), 0, 255);
+        const double pulses_per_mm = env_double_for_rail(rail_index, "UAV_AIRPORT_RAIL_PULSES_PER_MM", 100.0);
+        const bool reverse = env_bool_for_rail(rail_index, "UAV_AIRPORT_RAIL_REVERSE", false);
+
+        if (addr == 0 || pulses_per_mm <= 0.0) return false;
+        if (!enable_if_needed(addr)) return false;
+
+        const uint32_t pulses = (uint32_t)std::llround(std::fabs(distance_mm) * pulses_per_mm);
+        if (pulses == 0U) return true;
+        const uint16_t rpm = (uint16_t)clamp_int(std::abs(speed_rpm), 1, max_rpm);
+        const bool ccw = (distance_mm < 0.0) ? !reverse : reverse;
+
+        ZdtArmCanBatch batch{};
+        if (!proto_zdt_arm_encode_position(addr, ccw, rpm, acc, pulses,
+                                            /*absolute_mode=*/false,
+                                            /*sync=*/false, &batch)) {
+            return false;
+        }
+        if (!send_batch(batch)) return false;
+
+        rail_state_[rail_index].store(RAIL_MOVING);
+        // Bump rail-2 session if this is rail 1 — same cancel semantics
+        // as set_speed_rpm so a subsequent user click cancels any active
+        // distance-completion monitor.
+        if (rail_index == 1) rail2_motion_session_.fetch_add(1);
+
+        // Estimate motion duration as the safety cap: pulses / (rpm * 200 / 60)
+        // assuming 200 microsteps/rev. We won't trust this to "complete" —
+        // we trust the motor's status flag — but it bounds the monitor's
+        // worst-case lifetime.
+        const double pulses_per_s = double(rpm) * 200.0 / 60.0;
+        const int est_ms = (pulses_per_s > 1.0)
+            ? int(double(pulses) / pulses_per_s * 1000.0)
+            : 5000;
+        const int cap_ms = std::max(2000, est_ms + 2000);
+
+        std::thread([this, rail_index, cap_ms]() {
+            monitor_distance_completion(rail_index, cap_ms);
+        }).detach();
+
+        std::fprintf(stderr,
+                     "proc_gateway: airport rail=%d addr=%u distance_mm=%.1f pulses=%u rpm=%u est=%dms\n",
+                     rail_index, (unsigned int)addr, distance_mm,
+                     (unsigned int)pulses, (unsigned int)rpm, est_ms);
+        return true;
+    }
+
     bool stop_rail(int rail_index) {
         if (rail_index < 0 || rail_index >= 3) return false;
         if (!ensure_ready()) return false;
@@ -1683,6 +1743,79 @@ private:
                 }
             } else {
                 stall_hits = 0;
+            }
+
+            sleep_ms(poll_ms);
+        }
+    }
+
+    // Watches a position-mode (move_distance) run until the motor's
+    // status flag reports "reached" (bit 0x02) OR stalls (0x04/0x08) OR
+    // we hit cap_ms (safety). Transitions rail_state_ accordingly so
+    // HostGUI's poll loop can advance the script step.
+    void monitor_distance_completion(int rail_index, int cap_ms) {
+        if (rail_index < 0 || rail_index >= 3) return;
+        const uint8_t addr = rail_addr(rail_index);
+        if (addr == 0U) return;
+        constexpr int poll_ms = 80;
+        constexpr int reach_confirm = 2;     // 2 consecutive 0x02 hits
+        constexpr int max_read_fail = 12;
+        int reached_hits = 0;
+        int stall_hits   = 0;
+        int read_fails   = 0;
+        const uint64_t t0 = now_ms();
+        while (g_running) {
+            if ((int64_t)(now_ms() - t0) >= cap_ms) {
+                std::fprintf(stderr,
+                    "proc_gateway: airport rail=%d distance monitor cap %dms hit, force-stop\n",
+                    rail_index, cap_ms);
+                rail_state_[rail_index].store(RAIL_STALLED);
+                (void)stop_rail(rail_index);
+                clear_stall_latch(addr);
+                return;
+            }
+            uint8_t flags = 0;
+            if (!read_status_flags(addr, &flags)) {
+                if (++read_fails >= max_read_fail) {
+                    std::fprintf(stderr,
+                        "proc_gateway: airport rail=%d distance monitor %d CAN reads failed → stall\n",
+                        rail_index, read_fails);
+                    rail_state_[rail_index].store(RAIL_STALLED);
+                    (void)stop_rail(rail_index);
+                    clear_stall_latch(addr);
+                    return;
+                }
+                sleep_ms(poll_ms);
+                continue;
+            }
+            read_fails = 0;
+
+            const bool stalled = (flags & 0x04U) != 0U || (flags & 0x08U) != 0U;
+            if (stalled) {
+                if (++stall_hits >= 2) {
+                    std::fprintf(stderr,
+                        "proc_gateway: airport rail=%d distance run stalled early flags=0x%02X\n",
+                        rail_index, flags);
+                    rail_state_[rail_index].store(RAIL_STALLED);
+                    (void)stop_rail(rail_index);
+                    clear_stall_latch(addr);
+                    return;
+                }
+            } else {
+                stall_hits = 0;
+            }
+
+            const bool reached = (flags & 0x02U) != 0U;
+            if (reached) {
+                if (++reached_hits >= reach_confirm) {
+                    std::fprintf(stderr,
+                        "proc_gateway: airport rail=%d distance run reached target flags=0x%02X\n",
+                        rail_index, flags);
+                    rail_state_[rail_index].store(RAIL_IDLE);
+                    return;
+                }
+            } else {
+                reached_hits = 0;
             }
 
             sleep_ms(poll_ms);
@@ -2371,6 +2504,18 @@ static void handle_rpc(int fd, const std::string &line,
         snprintf(resp, sizeof(resp),
                  "{\"id\":%d,\"result\":{\"ok\":%s}}\n",
                  id, ok ? "true" : "false");
+
+    } else if (method == "airport.move_distance") {
+        // Open-loop relative move at speed_rpm. Motor self-stops after the
+        // pulse count is consumed. backend monitor flips rail_state_
+        // IDLE/STALLED so HostGUI's poll loop advances the script step.
+        int rail = json_int(s, "rail", -1);
+        double dist_mm = json_double(s, "distance_mm", 0.0);
+        int speed_rpm = json_int(s, "speed_rpm", 500);
+        bool ok = g_airport.move_distance(rail, dist_mm, speed_rpm);
+        snprintf(resp, sizeof(resp),
+                 "{\"id\":%d,\"result\":{\"ok\":%s,\"rail\":%d,\"distance_mm\":%.2f,\"speed_rpm\":%d}}\n",
+                 id, ok ? "true" : "false", rail, dist_mm, speed_rpm);
 
     } else if (method == "airport.get_status") {
         // Per-rail observable state. HostGUI Tab4 script orchestrator polls
