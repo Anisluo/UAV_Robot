@@ -204,25 +204,38 @@ class PiperController:
     def _do_full_handshake(self) -> None:
         """Drive Piper into a stable CAN_CTRL state.
 
-        Used both on startup and on runtime recovery (when ctrl_mode falls
-        out of CAN_CTRL — typically because the operator triggered the
-        physical drag-teach button on the arm body, then exited teach).
+        Used both on startup and on runtime recovery (after crash / e-stop
+        / drag-teach exit). The firmware can be in any of several latched
+        fault states, so we clear each one in order before re-arming:
 
-        Without EmergencyStop(0x02) "Resume" at the start, a post-teach
-        arm keeps oscillating STANDBY ↔ CAN_CTRL even with continuous
-        heartbeat. The Resume command clears an internal "abnormal" flag
-        the firmware sets when teach mode terminates, and is the cure.
+          1. MotionCtrl_1(0x02, 0, 0)   — clear COLLISION latch (arm_status
+                                          0x07). Firmware silently rejects
+                                          CAN_CTRL transitions while this
+                                          bit is set; without this step,
+                                          'click 使能/恢复 after 撞机 →
+                                          nothing happens' (user report).
+          2. EmergencyStop(0x02)         — Resume from any halt/teach. Clears
+                                          the "abnormal" flag the firmware
+                                          sets when teach mode terminates;
+                                          without this a post-teach arm
+                                          keeps oscillating STANDBY↔CAN_CTRL.
+          3. MotionCtrl_2(0x00, ...)     — explicit STANDBY transit
+          4. MotionCtrl_2(0x01, MODE_J)  — into CAN_CTRL
+          5. EnableArm(7, 0x02)          — power on all 6 joints
 
-        NOTE: we used to also call MasterSlaveConfig(0xFC) here ("set as
-        motion output / slave arm"). Empirically that command put the
-        firmware into a "I'm a slave, my master should be driving me"
-        state, with the side effect that physical-button-release from
-        TEACHING caused the arm to DROP (firmware released gravity-comp
-        expecting master input). Running the handshake WITHOUT
-        MasterSlaveConfig: teach release stays smooth and gravity-comp
-        is held continuously. So we drop that step entirely — we don't
-        run as part of a master-slave pair, this arm is standalone.
+        NOTE: we used to also call MasterSlaveConfig(0xFC) here. That put
+        the firmware into a slave-arm state which caused the arm to DROP
+        on teach-release (firmware released gravity-comp expecting master
+        input). Dropped that step entirely — this arm is standalone.
         """
+        log("INFO", "handshake: MotionCtrl_1(resume) — clear COLLISION latch")
+        try:
+            self.p.MotionCtrl_1(0x02, 0x00, 0x00); time.sleep(0.3)
+        except Exception as e:
+            # Older SDK versions don't expose the 3-arg form. Fall through —
+            # the EmergencyStop below covers the common case.
+            log("WARN", f"MotionCtrl_1 collision-clear failed: {e}")
+
         log("INFO", "handshake: EmergencyStop(0x02) — resume from any halt/teach")
         self.p.EmergencyStop(0x02); time.sleep(0.3)
         # Handshake = explicit operator decision to return to active
