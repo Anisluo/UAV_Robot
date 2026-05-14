@@ -1455,6 +1455,24 @@ private:
         return true;
     }
 
+    // ZDT (Emm V5.0) drivers latch the stall-protection bit on overload:
+    // status flag 0x04/0x08 stays set after motion halts, and the driver
+    // silently REJECTS subsequent SPEED commands until ENABLE is toggled
+    // off→on. So once our monitor detects a stall and sends STOP, we
+    // ALSO have to disable+re-arm the motor; otherwise the next click
+    // (e.g. 后退 right after 前进 stalls) does nothing on the bus, and
+    // it looks like a HostGUI bug.
+    void clear_stall_latch(uint8_t addr) {
+        if (addr == 0U) return;
+        ZdtArmCanBatch dis{};
+        if (proto_zdt_arm_encode_enable(addr, false, false, &dis)) {
+            (void)send_batch(dis);
+            sleep_ms(40);
+        }
+        enabled_[addr] = false;   // force enable_if_needed() to re-arm
+                                  // on the next motion command
+    }
+
     void monitor_pair_until_stall(uint64_t session) {
         const int poll_ms       = clamp_int(env_int("UAV_AIRPORT_LOCK_POLL_MS",      120), 20, 1000);
         const int confirm_hits  = clamp_int(env_int("UAV_AIRPORT_LOCK_CONFIRM_HITS",   2),  1,   10);
@@ -1486,6 +1504,7 @@ private:
                             "proc_gateway: airport lock max-duration %dms hit, force-stop rail %d\n",
                             max_duration, rails[i]);
                         (void)stop_rail(rails[i]);
+                        clear_stall_latch(rail_addr(rails[i]));
                         stopped[i] = true;
                     }
                 }
@@ -1507,6 +1526,7 @@ private:
                             "proc_gateway: airport lock rail=%d %d consecutive status reads failed → force-stop\n",
                             rails[i], read_fails[i]);
                         (void)stop_rail(rails[i]);
+                        clear_stall_latch(rail_addr(rails[i]));
                         stopped[i] = true;
                     }
                     continue;
@@ -1521,6 +1541,7 @@ private:
                             "proc_gateway: airport lock rail=%d stall flags=0x%02X → stop\n",
                             rails[i], flags);
                         (void)stop_rail(rails[i]);
+                        clear_stall_latch(rail_addr(rails[i]));
                         stopped[i] = true;
                     }
                 } else {
@@ -1562,6 +1583,7 @@ private:
                     "proc_gateway: airport rail=%d max-duration %dms hit, force-stop\n",
                     rail_index, max_duration);
                 (void)stop_rail(rail_index);
+                clear_stall_latch(addr);
                 break;
             }
 
@@ -1572,6 +1594,7 @@ private:
                         "proc_gateway: airport rail=%d %d consecutive status reads failed → force-stop\n",
                         rail_index, read_fails);
                     (void)stop_rail(rail_index);
+                    clear_stall_latch(addr);
                     break;
                 }
                 sleep_ms(poll_ms);
@@ -1587,6 +1610,7 @@ private:
                         "proc_gateway: airport rail=%d stall flags=0x%02X → stop\n",
                         rail_index, flags);
                     (void)stop_rail(rail_index);
+                    clear_stall_latch(addr);
                     break;
                 }
             } else {
