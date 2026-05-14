@@ -1473,19 +1473,34 @@ private:
     // true so enable_if_needed() short-circuits.
     void clear_stall_latch(uint8_t addr) {
         if (addr == 0U) return;
+        // CRITICAL: hold io_mu_ across the entire DISABLE → sleep → ENABLE
+        // → sleep window. Earlier version released the lock between each
+        // send_batch() call, leaving a 170 ms window where a fast operator
+        // click (e.g. "前进 stalls → click 后退 immediately") would have
+        // set_speed_rpm sneak its SPEED frame onto the bus WHILE the motor
+        // was disabled — the firmware silently dropped the SPEED, then the
+        // monitor sent ENABLE which armed the motor but with nothing
+        // queued, leaving the rail sitting until the next click. User
+        // reported "间隔很久才真正后退" — that's this race.
+        //
+        // By holding the lock, any concurrent set_speed_rpm queues on
+        // send_batch() internally and resumes only after we exit. The
+        // motor is in a stable enabled state by then; the queued SPEED
+        // takes effect immediately.
+        std::lock_guard<std::mutex> lk(io_mu_);
         ZdtArmCanBatch batch{};
         if (proto_zdt_arm_encode_enable(addr, false, false, &batch)) {
-            (void)send_batch(batch);
+            (void)send_batch_locked(batch);
         }
         sleep_ms(120);
         batch = {};
         if (proto_zdt_arm_encode_enable(addr, true, false, &batch)) {
-            (void)send_batch(batch);
+            (void)send_batch_locked(batch);
         }
         sleep_ms(50);
         enabled_[addr] = true;
         std::fprintf(stderr,
-                     "proc_gateway: airport addr=%u stall latch cleared (DISABLE→ENABLE cycle)\n",
+                     "proc_gateway: airport addr=%u stall latch cleared (locked DISABLE→ENABLE cycle)\n",
                      (unsigned int)addr);
     }
 
