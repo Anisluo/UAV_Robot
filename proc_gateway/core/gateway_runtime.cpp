@@ -1458,19 +1458,35 @@ private:
     // ZDT (Emm V5.0) drivers latch the stall-protection bit on overload:
     // status flag 0x04/0x08 stays set after motion halts, and the driver
     // silently REJECTS subsequent SPEED commands until ENABLE is toggled
-    // off→on. So once our monitor detects a stall and sends STOP, we
-    // ALSO have to disable+re-arm the motor; otherwise the next click
-    // (e.g. 后退 right after 前进 stalls) does nothing on the bus, and
-    // it looks like a HostGUI bug.
+    // off → wait → on. The first attempt at this (commit c61a503) only
+    // sent DISABLE and let the next set_speed_rpm's enable_if_needed()
+    // send ENABLE later. That wasn't enough — user reported still having
+    // to hit 急停 to unstick. Strengthen to a full explicit cycle:
+    //
+    //   1. DISABLE                   (de-energize, clears stall latch)
+    //   2. sleep 120 ms              (firmware needs >100ms to settle)
+    //   3. ENABLE                    (re-arm before any motion arrives)
+    //   4. sleep 50 ms               (driver internal init)
+    //
+    // After this the motor is in a clean enabled state, ready for the
+    // next SPEED command without further setup. enabled_[addr] stays
+    // true so enable_if_needed() short-circuits.
     void clear_stall_latch(uint8_t addr) {
         if (addr == 0U) return;
-        ZdtArmCanBatch dis{};
-        if (proto_zdt_arm_encode_enable(addr, false, false, &dis)) {
-            (void)send_batch(dis);
-            sleep_ms(40);
+        ZdtArmCanBatch batch{};
+        if (proto_zdt_arm_encode_enable(addr, false, false, &batch)) {
+            (void)send_batch(batch);
         }
-        enabled_[addr] = false;   // force enable_if_needed() to re-arm
-                                  // on the next motion command
+        sleep_ms(120);
+        batch = {};
+        if (proto_zdt_arm_encode_enable(addr, true, false, &batch)) {
+            (void)send_batch(batch);
+        }
+        sleep_ms(50);
+        enabled_[addr] = true;
+        std::fprintf(stderr,
+                     "proc_gateway: airport addr=%u stall latch cleared (DISABLE→ENABLE cycle)\n",
+                     (unsigned int)addr);
     }
 
     void monitor_pair_until_stall(uint64_t session) {
