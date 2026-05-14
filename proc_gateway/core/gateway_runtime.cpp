@@ -1207,6 +1207,11 @@ public:
                      "proc_gateway: airport rail=%d addr=%u speed_rpm=%d iface=%s\n",
                      rail_index, (unsigned int)addr, rpm, iface_.c_str());
 
+        // State transition: any new motion command moves the rail out of
+        // IDLE / STALLED and into MOVING — the previous stall (if any) is
+        // cleared the moment we commit to a fresh direction.
+        rail_state_[rail_index].store(actual_rpm > 0 ? RAIL_MOVING : RAIL_IDLE);
+
         // Stall protection for rail 2 (the standalone 单独控制 rail).
         // Rails 0+2 are monitored by start_lock_pair's pair-monitor; rail
         // 1 (= UI "rail 2") has no such cover. Spawn one here whenever
@@ -1313,6 +1318,14 @@ public:
             rail2_motion_session_.fetch_add(1);
         }
 
+        // Manual stop drops out of MOVING into IDLE. If the rail was
+        // already STALLED, the monitor's own stop already transitioned
+        // it (compare_exchange below) — don't clobber STALLED with IDLE
+        // because HostGUI's poll loop is waiting to observe the STALLED
+        // transition to advance the script step.
+        int expected = RAIL_MOVING;
+        rail_state_[rail_index].compare_exchange_strong(expected, RAIL_IDLE);
+
         std::fprintf(stderr, "proc_gateway: airport rail=%d addr=%u stop iface=%s\n",
                      rail_index, (unsigned int)addr, iface_.c_str());
         return true;
@@ -1336,6 +1349,24 @@ private:
     std::mutex io_mu_;
     std::atomic<uint64_t> pair_motion_session_{0};
     std::atomic<uint64_t> rail2_motion_session_{0};
+
+    // Per-rail observable state — HostGUI polls this via airport.get_status
+    // to advance script steps the instant the stall fires, instead of
+    // waiting out the operator's max_ms upper bound. 0=IDLE, 1=MOVING,
+    // 2=STALLED. set_speed flips IDLE/STALLED→MOVING; the stall monitors
+    // flip MOVING→STALLED; stop_rail (manual) flips MOVING→IDLE.
+    enum RailState : int { RAIL_IDLE = 0, RAIL_MOVING = 1, RAIL_STALLED = 2 };
+    std::array<std::atomic<int>, 3> rail_state_{{
+        std::atomic<int>{RAIL_IDLE},
+        std::atomic<int>{RAIL_IDLE},
+        std::atomic<int>{RAIL_IDLE}
+    }};
+public:
+    int get_rail_state(int rail_index) const {
+        if (rail_index < 0 || rail_index >= 3) return RAIL_IDLE;
+        return rail_state_[rail_index].load();
+    }
+private:
 
     static int clamp_int(int value, int min_value, int max_value) {
         if (value < min_value) return min_value;
@@ -1534,6 +1565,7 @@ private:
                         std::fprintf(stderr,
                             "proc_gateway: airport lock max-duration %dms hit, force-stop rail %d\n",
                             max_duration, rails[i]);
+                        rail_state_[rails[i]].store(RAIL_STALLED);
                         (void)stop_rail(rails[i]);
                         clear_stall_latch(rail_addr(rails[i]));
                         stopped[i] = true;
@@ -1556,6 +1588,7 @@ private:
                         std::fprintf(stderr,
                             "proc_gateway: airport lock rail=%d %d consecutive status reads failed → force-stop\n",
                             rails[i], read_fails[i]);
+                        rail_state_[rails[i]].store(RAIL_STALLED);
                         (void)stop_rail(rails[i]);
                         clear_stall_latch(rail_addr(rails[i]));
                         stopped[i] = true;
@@ -1571,6 +1604,7 @@ private:
                         std::fprintf(stderr,
                             "proc_gateway: airport lock rail=%d stall flags=0x%02X → stop\n",
                             rails[i], flags);
+                        rail_state_[rails[i]].store(RAIL_STALLED);
                         (void)stop_rail(rails[i]);
                         clear_stall_latch(rail_addr(rails[i]));
                         stopped[i] = true;
@@ -1613,6 +1647,7 @@ private:
                 std::fprintf(stderr,
                     "proc_gateway: airport rail=%d max-duration %dms hit, force-stop\n",
                     rail_index, max_duration);
+                rail_state_[rail_index].store(RAIL_STALLED);
                 (void)stop_rail(rail_index);
                 clear_stall_latch(addr);
                 break;
@@ -1624,6 +1659,7 @@ private:
                     std::fprintf(stderr,
                         "proc_gateway: airport rail=%d %d consecutive status reads failed → force-stop\n",
                         rail_index, read_fails);
+                    rail_state_[rail_index].store(RAIL_STALLED);
                     (void)stop_rail(rail_index);
                     clear_stall_latch(addr);
                     break;
@@ -1640,6 +1676,7 @@ private:
                     std::fprintf(stderr,
                         "proc_gateway: airport rail=%d stall flags=0x%02X → stop\n",
                         rail_index, flags);
+                    rail_state_[rail_index].store(RAIL_STALLED);
                     (void)stop_rail(rail_index);
                     clear_stall_latch(addr);
                     break;
@@ -2334,6 +2371,21 @@ static void handle_rpc(int fd, const std::string &line,
         snprintf(resp, sizeof(resp),
                  "{\"id\":%d,\"result\":{\"ok\":%s}}\n",
                  id, ok ? "true" : "false");
+
+    } else if (method == "airport.get_status") {
+        // Per-rail observable state. HostGUI Tab4 script orchestrator polls
+        // this every ~200ms during AIRPORT_RAIL steps so it can advance to
+        // the next step the instant a stall fires, instead of waiting out
+        // the max_ms budget. state: 0=idle, 1=moving, 2=stalled.
+        const int s0 = g_airport.get_rail_state(0);
+        const int s1 = g_airport.get_rail_state(1);
+        const int s2 = g_airport.get_rail_state(2);
+        snprintf(resp, sizeof(resp),
+                 "{\"id\":%d,\"result\":{\"ok\":true,"
+                 "\"rails\":[{\"index\":0,\"state\":%d},"
+                            "{\"index\":1,\"state\":%d},"
+                            "{\"index\":2,\"state\":%d}]}}\n",
+                 id, s0, s1, s2);
 
     } else if (method == "airport.relay") {
         int channel = json_int(s, "channel", -1);
