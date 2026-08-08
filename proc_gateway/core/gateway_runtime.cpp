@@ -1362,6 +1362,58 @@ public:
         return move_absolute_mm(rail_index, std::max(0.0, current_pos_mm_[rail_index] + delta_mm));
     }
 
+    // Closed-loop precise move: drive at speed and stop when the ENCODER
+    // says we have covered dist_mm. The open-loop move_distance below
+    // overshoots badly (a commanded 50 mm ran ~70 mm) because these
+    // drivers ignore position mode (0xFD) and only honour speed mode
+    // (0xF6) — so distance has to be closed by watching 0x36 ourselves.
+    //   dist_mm: signed, sign selects direction.
+    bool move_mm(int rail_index, double dist_mm, int speed_rpm) {
+        if (rail_index < 0 || rail_index >= 3) return false;
+        if (!ensure_ready()) return false;
+
+        const uint8_t addr = rail_addr(rail_index);
+        if (addr == 0) return false;
+
+        const double cpmm = counts_per_mm_for_rail(rail_index);
+        if (cpmm <= 0.0) return false;
+        const int64_t target_counts = (int64_t)std::llround(std::fabs(dist_mm) * cpmm);
+        if (target_counts <= 0) return true;   // nothing to do
+
+        const int max_rpm  = clamp_int(env_int("UAV_AIRPORT_RAIL_MAX_RPM", 1500), 1, 3000);
+        const int run_rpm  = clamp_int((speed_rpm != 0 ? std::abs(speed_rpm) : 1500), 1, max_rpm);
+        const uint8_t acc  = (uint8_t)clamp_int(env_int("UAV_AIRPORT_RAIL_SPEED_ACC", 10), 0, 255);
+        const bool reverse = env_bool_for_rail(rail_index, "UAV_AIRPORT_RAIL_REVERSE", false);
+        const bool ccw     = (dist_mm < 0.0) ? !reverse : reverse;
+
+        int64_t start_pos = 0;
+        if (!read_position(addr, &start_pos)) {
+            std::fprintf(stderr,
+                "proc_gateway: airport move_mm rail=%d: cannot read start position\n", rail_index);
+            return false;
+        }
+        if (!enable_if_needed(addr)) return false;
+
+        ZdtArmCanBatch batch{};
+        if (!proto_zdt_arm_encode_speed(addr, ccw, (uint16_t)run_rpm, acc, false, &batch)) return false;
+        if (!send_batch(batch)) return false;
+
+        rail_state_[rail_index].store(RAIL_MOVING);
+        if (rail_index == 1) rail2_motion_session_.fetch_add(1);  // cancel rail-2 speed watcher
+        const uint64_t session = move_motion_session_.fetch_add(1) + 1;
+
+        std::fprintf(stderr,
+            "proc_gateway: airport move_mm rail=%d addr=%u dist_mm=%.2f cpmm=%.0f "
+            "target=%lld rpm=%d ccw=%d start=%lld\n",
+            rail_index, (unsigned int)addr, dist_mm, cpmm,
+            (long long)target_counts, run_rpm, (int)ccw, (long long)start_pos);
+
+        std::thread([this, rail_index, addr, start_pos, target_counts, run_rpm, session]() {
+            monitor_move_mm(rail_index, addr, start_pos, target_counts, run_rpm, session);
+        }).detach();
+        return true;
+    }
+
     // Open-loop fixed-distance move at a chosen speed. Used by stage
     // scripts in "distance" stop_mode — drive the rail N mm at speed_rpm,
     // motor self-stops on its internal pulse counter, GUI advances when
@@ -1455,8 +1507,30 @@ public:
         return true;
     }
 
+    // Decisive emergency stop for one axis: send 立即停止(FE) four times
+    // back-to-back so it lands even if a frame is dropped. The stall
+    // handlers use this rather than stop_rail because a single dropped
+    // STOP means the motor keeps grinding into whatever jammed it — which
+    // is how the lead screw got forced off its coupling before.
+    void estop_rail(int rail_index) {
+        if (rail_index < 0 || rail_index >= 3) return;
+        if (rail_index == 1) rail2_motion_session_.fetch_add(1);
+        move_motion_session_.fetch_add(1);
+        if (!ensure_ready()) return;
+        const uint8_t addr = rail_addr(rail_index);
+        ZdtArmCanBatch batch{};
+        if (!proto_zdt_arm_encode_stop(addr, false, &batch)) return;
+        for (int i = 0; i < 4; ++i) {
+            (void)send_batch(batch);
+            sleep_ms(5);
+        }
+        std::fprintf(stderr, "proc_gateway: airport rail=%d addr=%u ESTOP x4\n",
+                     rail_index, (unsigned int)addr);
+    }
+
     bool stop_all() {
         pair_motion_session_.fetch_add(1);
+        move_motion_session_.fetch_add(1);   // abort any running move_mm loop
         bool ok = true;
         ok = stop_rail(0) && ok;
         ok = stop_rail(1) && ok;
@@ -1473,6 +1547,10 @@ private:
     std::mutex io_mu_;
     std::atomic<uint64_t> pair_motion_session_{0};
     std::atomic<uint64_t> rail2_motion_session_{0};
+    // Guards the closed-loop move_mm watcher: any new motion command, stop
+    // or stop_all bumps it so a superseded watcher exits instead of
+    // stopping the rail out from under whatever is running now.
+    std::atomic<uint64_t> move_motion_session_{0};
 
     // Per-rail observable state — HostGUI polls this via airport.get_status
     // to advance script steps the instant the stall fires, instead of
@@ -1543,6 +1621,18 @@ private:
         char specific[64];
         std::snprintf(specific, sizeof(specific), "UAV_AIRPORT_RAIL%d_REVERSE", rail_index + 1);
         return env_bool(specific, env_bool(base_name, fallback));
+    }
+
+    // Encoder counts per mm, for the closed-loop move_mm. Distinct from
+    // UAV_AIRPORT_RAIL_PULSES_PER_MM (command pulses, used by the
+    // open-loop move_distance) — this one is what the 0x36 encoder
+    // actually reports. Per-rail override, else the shared default, else
+    // 62922 (measured on rail 2: 2,516,870 counts over 40.0 mm).
+    static double counts_per_mm_for_rail(int rail_index) {
+        char specific[64];
+        std::snprintf(specific, sizeof(specific),
+                      "UAV_AIRPORT_RAIL%d_COUNTS_PER_MM", rail_index + 1);
+        return env_double(specific, env_double("UAV_AIRPORT_RAIL_COUNTS_PER_MM", 62922.0));
     }
 
     static uint8_t rail_addr(int rail_index) {
@@ -1690,7 +1780,7 @@ private:
                             "proc_gateway: airport lock max-duration %dms hit, force-stop rail %d\n",
                             max_duration, rails[i]);
                         rail_state_[rails[i]].store(RAIL_STALLED);
-                        (void)stop_rail(rails[i]);
+                        estop_rail(rails[i]);
                         clear_stall_latch(rail_addr(rails[i]));
                         stopped[i] = true;
                     }
@@ -1713,7 +1803,7 @@ private:
                             "proc_gateway: airport lock rail=%d %d consecutive status reads failed → force-stop\n",
                             rails[i], read_fails[i]);
                         rail_state_[rails[i]].store(RAIL_STALLED);
-                        (void)stop_rail(rails[i]);
+                        estop_rail(rails[i]);
                         clear_stall_latch(rail_addr(rails[i]));
                         stopped[i] = true;
                     }
@@ -1729,7 +1819,7 @@ private:
                             "proc_gateway: airport lock rail=%d stall flags=0x%02X → stop\n",
                             rails[i], flags);
                         rail_state_[rails[i]].store(RAIL_STALLED);
-                        (void)stop_rail(rails[i]);
+                        estop_rail(rails[i]);
                         clear_stall_latch(rail_addr(rails[i]));
                         stopped[i] = true;
                     }
@@ -1772,7 +1862,7 @@ private:
                     "proc_gateway: airport rail=%d max-duration %dms hit, force-stop\n",
                     rail_index, max_duration);
                 rail_state_[rail_index].store(RAIL_STALLED);
-                (void)stop_rail(rail_index);
+                estop_rail(rail_index);
                 clear_stall_latch(addr);
                 break;
             }
@@ -1784,7 +1874,7 @@ private:
                         "proc_gateway: airport rail=%d %d consecutive status reads failed → force-stop\n",
                         rail_index, read_fails);
                     rail_state_[rail_index].store(RAIL_STALLED);
-                    (void)stop_rail(rail_index);
+                    estop_rail(rail_index);
                     clear_stall_latch(addr);
                     break;
                 }
@@ -1801,7 +1891,7 @@ private:
                         "proc_gateway: airport rail=%d stall flags=0x%02X → stop\n",
                         rail_index, flags);
                     rail_state_[rail_index].store(RAIL_STALLED);
-                    (void)stop_rail(rail_index);
+                    estop_rail(rail_index);
                     clear_stall_latch(addr);
                     break;
                 }
@@ -1834,7 +1924,7 @@ private:
                     "proc_gateway: airport rail=%d distance monitor cap %dms hit, force-stop\n",
                     rail_index, cap_ms);
                 rail_state_[rail_index].store(RAIL_STALLED);
-                (void)stop_rail(rail_index);
+                estop_rail(rail_index);
                 clear_stall_latch(addr);
                 return;
             }
@@ -1845,7 +1935,7 @@ private:
                         "proc_gateway: airport rail=%d distance monitor %d CAN reads failed → stall\n",
                         rail_index, read_fails);
                     rail_state_[rail_index].store(RAIL_STALLED);
-                    (void)stop_rail(rail_index);
+                    estop_rail(rail_index);
                     clear_stall_latch(addr);
                     return;
                 }
@@ -1861,7 +1951,7 @@ private:
                         "proc_gateway: airport rail=%d distance run stalled early flags=0x%02X\n",
                         rail_index, flags);
                     rail_state_[rail_index].store(RAIL_STALLED);
-                    (void)stop_rail(rail_index);
+                    estop_rail(rail_index);
                     clear_stall_latch(addr);
                     return;
                 }
@@ -1884,6 +1974,121 @@ private:
 
             sleep_ms(poll_ms);
         }
+    }
+
+    // Read the driver's live encoder count (ZDT cmd 0x36). Reply layout:
+    // [0]=0x36 [1]=sign [2..5]=big-endian magnitude [last]=0x6B.
+    // This is the only motion feedback these drivers report reliably —
+    // the 0x35 speed read returns 0 even while turning — so the
+    // closed-loop move below is built on it.
+    // Watches a move_mm until the encoder has covered target_counts, then
+    // ESTOPs. Three exits besides "reached":
+    //   no-progress  the rail jammed or hit an end stop — position stops
+    //                advancing. This is the stall signal that matters here;
+    //                stopping fast is what protects the lead screw.
+    //   read-fail    CAN went quiet — stop rather than run blind.
+    //   timeout      absolute cap, sized from the commanded distance.
+    void monitor_move_mm(int rail_index, uint8_t addr, int64_t start_pos,
+                         int64_t target_counts, int run_rpm, uint64_t session) {
+        const int poll_ms       = clamp_int(env_int("UAV_AIRPORT_MOVE_POLL_MS", 30), 5, 500);
+        const int max_read_fail = clamp_int(env_int("UAV_AIRPORT_MOVE_READ_FAIL_HITS", 15), 1, 200);
+        const int stall_ms      = clamp_int(env_int("UAV_AIRPORT_MOVE_STALL_MS", 300), 100, 10000);
+        // counts/s ≈ rpm × 176.6 empirically; allow 2× the estimate + 4 s.
+        const double est_ms = (run_rpm > 0)
+            ? (double)target_counts / (double(run_rpm) * 176.6 / 1000.0) : 30000.0;
+        const int max_duration = clamp_int(env_int("UAV_AIRPORT_MOVE_MAX_MS",
+                                  (int)(est_ms * 2.0 + 4000.0)), 1000, 180000);
+
+        int read_fails = 0;
+        int64_t best_progress = 0;
+        const uint64_t t0 = now_ms();
+        uint64_t last_progress_ms = t0;
+        const char *why = "?";
+        bool stalled = false;
+
+        while (g_running && move_motion_session_.load() == session) {
+            if ((int64_t)(now_ms() - t0) >= max_duration) { why = "timeout"; stalled = true; break; }
+
+            int64_t pos = 0;
+            if (!read_position(addr, &pos)) {
+                if (++read_fails >= max_read_fail) { why = "read-fail"; stalled = true; break; }
+                sleep_ms(poll_ms);
+                continue;
+            }
+            read_fails = 0;
+
+            const int64_t progressed = (pos >= start_pos) ? (pos - start_pos) : (start_pos - pos);
+            if (progressed >= target_counts) { why = "reached"; break; }
+
+            if (progressed > best_progress + 50) {          // still advancing
+                best_progress = progressed;
+                last_progress_ms = now_ms();
+            } else if ((int64_t)(now_ms() - last_progress_ms) >= stall_ms) {
+                why = "no-progress(jam/end-stop)";
+                stalled = true;
+                break;
+            }
+            sleep_ms(poll_ms);
+        }
+
+        if (move_motion_session_.load() != session) {
+            std::fprintf(stderr, "proc_gateway: airport move_mm rail=%d superseded\n", rail_index);
+            return;
+        }
+        estop_rail(rail_index);
+        // Report the outcome through the same rail_state_ HostGUI polls for
+        // the open-loop path, so a script step advances either way.
+        rail_state_[rail_index].store(stalled ? RAIL_STALLED : RAIL_IDLE);
+        std::fprintf(stderr,
+            "proc_gateway: airport move_mm rail=%d done (%s): progressed~%lld/%lld counts\n",
+            rail_index, why, (long long)best_progress, (long long)target_counts);
+    }
+
+    bool read_position(uint8_t addr, int64_t *out_pos) {
+        if (out_pos == nullptr || addr == 0U) return false;
+        if (!ensure_ready()) return false;
+
+        std::lock_guard<std::mutex> lk(io_mu_);
+        drain_rx_locked();
+
+        can_frame query{};
+        query.can_id = ((canid_t)(((uint32_t)addr << 8) | 0U) & CAN_EFF_MASK) | CAN_EFF_FLAG;
+        query.can_dlc = 2;
+        query.data[0] = 0x36U;
+        query.data[1] = 0x6BU;
+        if (write(fd_, &query, sizeof(query)) != (ssize_t)sizeof(query)) {
+            return false;
+        }
+
+        const uint64_t deadline = now_ms() +
+            (uint64_t)clamp_int(env_int("UAV_AIRPORT_STATUS_TIMEOUT_MS", 150), 20, 2000);
+        while (now_ms() < deadline) {
+            pollfd pfd{};
+            pfd.fd = fd_;
+            pfd.events = POLLIN;
+            const int timeout = (int)std::max<int64_t>(1, (int64_t)(deadline - now_ms()));
+            int rc = poll(&pfd, 1, timeout);
+            if (rc <= 0) break;
+            if ((pfd.revents & POLLIN) == 0) continue;
+
+            can_frame frame{};
+            ssize_t n = recv(fd_, &frame, sizeof(frame), 0);
+            if (n != (ssize_t)sizeof(frame)) continue;
+            if (frame.can_dlc < 7) continue;
+
+            const uint32_t raw_id = frame.can_id & CAN_EFF_MASK;
+            if ((uint8_t)((raw_id >> 8) & 0xFFU) != addr) continue;
+            if (frame.data[frame.can_dlc - 1] != 0x6BU) continue;
+            if (frame.data[0] != 0x36U) continue;
+
+            const uint32_t mag = ((uint32_t)frame.data[2] << 24) |
+                                 ((uint32_t)frame.data[3] << 16) |
+                                 ((uint32_t)frame.data[4] << 8)  |
+                                 ((uint32_t)frame.data[5]);
+            *out_pos = (frame.data[1] != 0U) ? -(int64_t)mag : (int64_t)mag;
+            return true;
+        }
+        return false;
     }
 
     bool read_status_flags(uint8_t addr, uint8_t *out_flags) {
@@ -2580,6 +2785,20 @@ static void handle_rpc(int fd, const std::string &line,
         bool ok = g_airport.move_distance(rail, dist_mm, speed_rpm);
         snprintf(resp, sizeof(resp),
                  "{\"id\":%d,\"result\":{\"ok\":%s,\"rail\":%d,\"distance_mm\":%.2f,\"speed_rpm\":%d}}\n",
+                 id, ok ? "true" : "false", rail, dist_mm, speed_rpm);
+
+    } else if (method == "airport.move_mm") {
+        // Closed-loop precise relative move: drive at speed_rpm and stop
+        // when the 0x36 encoder says dist_mm has been covered. Signed
+        // dist_mm carries the direction. Unlike airport.move_distance
+        // (open loop, overshoots), this lands on the commanded distance.
+        int rail = json_int(s, "rail", -1);
+        double dist_mm = json_double(s, "dist_mm", 0.0);
+        if (dist_mm == 0.0) dist_mm = json_double(s, "distance_mm", 0.0);
+        int speed_rpm = json_int(s, "speed_rpm", 0);
+        bool ok = g_airport.move_mm(rail, dist_mm, speed_rpm);
+        snprintf(resp, sizeof(resp),
+                 "{\"id\":%d,\"result\":{\"ok\":%s,\"rail\":%d,\"dist_mm\":%.2f,\"speed_rpm\":%d}}\n",
                  id, ok ? "true" : "false", rail, dist_mm, speed_rpm);
 
     } else if (method == "airport.get_status") {
