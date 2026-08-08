@@ -1392,6 +1392,38 @@ public:
                 "proc_gateway: airport move_mm rail=%d: cannot read start position\n", rail_index);
             return false;
         }
+
+        // Soft travel limit, once the rail knows where its zero is. Zero is
+        // the hard stop, so any move that would end at a negative position
+        // is driving into it — that is how this rail has been wedged
+        // repeatedly, including by our own homing back-off with a flipped
+        // sign. Refuse rather than grind. UAV_AIRPORT_RAIL{N}_MAX_MM caps
+        // the far end the same way (0 = no far limit configured).
+        if (rail_homed_[rail_index].load()) {
+            double cur_mm = 0.0;
+            if (rail_position_mm(rail_index, &cur_mm)) {
+                const double target = cur_mm + dist_mm;
+                char maxvar[64];
+                std::snprintf(maxvar, sizeof(maxvar),
+                              "UAV_AIRPORT_RAIL%d_MAX_MM", rail_index + 1);
+                const double max_mm = env_double(maxvar, 0.0);
+                const double margin = env_double("UAV_AIRPORT_SOFT_LIMIT_MARGIN_MM", 0.5);
+                if (target < -margin) {
+                    std::fprintf(stderr,
+                        "proc_gateway: airport move_mm rail=%d REFUSED: target %.2fmm < 0 "
+                        "(would drive into the zero-side hard stop; now at %.2f)\n",
+                        rail_index, target, cur_mm);
+                    return false;
+                }
+                if (max_mm > 0.0 && target > max_mm + margin) {
+                    std::fprintf(stderr,
+                        "proc_gateway: airport move_mm rail=%d REFUSED: target %.2fmm > "
+                        "%s=%.2f (now at %.2f)\n",
+                        rail_index, target, maxvar, max_mm, cur_mm);
+                    return false;
+                }
+            }
+        }
         if (!enable_if_needed(addr)) return false;
 
         ZdtArmCanBatch batch{};
@@ -1549,10 +1581,19 @@ public:
             // Latch per rail on its own end state rather than on the shared
             // session: STALLED means it reached the hard stop, IDLE means
             // someone stopped it deliberately and the zero would be wrong.
+            const double backoff = env_double("UAV_AIRPORT_HOME_BACKOFF_MM", 2.0);
+            const int backoff_rpm = clamp_int(env_int("UAV_AIRPORT_HOME_BACKOFF_RPM", 150), 1, 1500);
             for (int rail : {0, 2}) {
                 if (rail_state_[rail].load() == RAIL_STALLED) {
                     sleep_ms(200);        // let the motor come to rest
                     latch_zero(rail);
+                    // Homing for this pair runs in the RELEASE direction,
+                    // so stepping off means moving the other way (+). Same
+                    // reasoning as rail 2: never leave a rail parked in its
+                    // hard stop.
+                    if (backoff > 0.0) {
+                        (void)move_mm(rail, +backoff, backoff_rpm);
+                    }
                 } else {
                     std::fprintf(stderr,
                         "proc_gateway: airport home rail=%d aborted (state=%d)\n",
@@ -1606,6 +1647,21 @@ public:
             if (final_state == RAIL_STALLED) {
                 sleep_ms(300);
                 latch_zero(kRail2);
+                // Step off the seat immediately, and derive the direction
+                // from the homing direction rather than taking it as a
+                // parameter — a caller that got the sign wrong would drive
+                // the rail HARDER into the stop right after it landed,
+                // which is exactly how this rail got wedged (2026-08-08).
+                // Leaving it seated is also bad on a 1 mm-lead screw: the
+                // holding force is enormous and it cannot always back out.
+                const double backoff = env_double("UAV_AIRPORT_HOME_BACKOFF_MM", 2.0);
+                if (backoff > 0.0) {
+                    const int dir = (env_int("UAV_AIRPORT_RAIL2_HOME_DIR", 1) < 0) ? -1 : 1;
+                    const int rpm = clamp_int(env_int("UAV_AIRPORT_HOME_BACKOFF_RPM", 150), 1, 1500);
+                    std::fprintf(stderr,
+                        "proc_gateway: airport home rail=1 backing off %.2fmm\n", backoff);
+                    (void)move_mm(kRail2, -dir * backoff, rpm);
+                }
             } else {
                 std::fprintf(stderr,
                     "proc_gateway: airport home rail=1 aborted (state=%d)\n", final_state);
@@ -1643,7 +1699,17 @@ public:
         if (!read_position(rail_addr(rail_index), &pos)) return false;
         const double cpmm = counts_per_mm_for_rail(rail_index);
         if (cpmm <= 0.0) return false;
-        *out_mm = double(pos - rail_zero_[rail_index].load()) / cpmm;
+        double mm = double(pos - rail_zero_[rail_index].load()) / cpmm;
+        // Report position in the same sign convention the motion commands
+        // use, so "+10 mm" and "pos_mm 10" mean the same direction. Whether
+        // the encoder counts up or down as the rail travels that way is a
+        // wiring detail; UAV_AIRPORT_RAIL{N}_REVERSE already captures it.
+        // Without this the operator sees pos_mm go to -100 after commanding
+        // the rail 100 mm away from its zero, which reads like a bug.
+        if (env_bool_for_rail(rail_index, "UAV_AIRPORT_RAIL_REVERSE", false)) {
+            mm = -mm;
+        }
+        *out_mm = mm;
         return true;
     }
 
