@@ -1518,15 +1518,17 @@ public:
     // rail hits its hard stop, then latch the encoder count there as zero.
     // Everything after that is measured from it.
     bool home_rails(int rpm) {
-        if (homing_.load()) return false;          // already running
+        if (rail_homing_[0].load() || rail_homing_[2].load()) return false;  // already running
         if (!ensure_ready()) return false;
 
         const int speed = clamp_int(std::abs(rpm) > 0 ? std::abs(rpm) : 150,
                                     1, clamp_int(env_int("UAV_AIRPORT_RAIL_MAX_RPM", 1500), 1, 3000));
         if (!start_lock_pair(/*forward=*/false, speed)) return false;
 
-        homing_.store(true);
-        homed_.store(false);
+        rail_homing_[0].store(true);
+        rail_homing_[2].store(true);
+        rail_homed_[0].store(false);
+        rail_homed_[2].store(false);
         const uint64_t session = pair_motion_session_.load();
 
         std::thread([this, session]() {
@@ -1535,44 +1537,97 @@ public:
             // we only latch the resulting positions.
             const int wait_cap_ms = clamp_int(env_int("UAV_AIRPORT_HOME_WAIT_MS", 40000), 2000, 180000);
             const uint64_t t0 = now_ms();
-            bool settled = false;
             while (g_running && (int64_t)(now_ms() - t0) < wait_cap_ms) {
                 sleep_ms(200);
                 if (pair_motion_session_.load() != session) break;   // superseded
                 if (rail_state_[0].load() != RAIL_MOVING &&
                     rail_state_[2].load() != RAIL_MOVING) {
-                    settled = true;
                     break;
                 }
             }
 
-            if (settled && pair_motion_session_.load() == session) {
-                sleep_ms(300);            // let the motors come to rest
-                bool ok = true;
-                for (int rail : {0, 2}) {
-                    int64_t pos = 0;
-                    if (read_position(rail_addr(rail), &pos)) {
-                        rail_zero_[rail].store(pos);
-                        std::fprintf(stderr,
-                            "proc_gateway: airport home rail=%d zero=%lld\n",
-                            rail, (long long)pos);
-                    } else {
-                        ok = false;
-                        std::fprintf(stderr,
-                            "proc_gateway: airport home rail=%d: position read failed\n", rail);
-                    }
+            // Latch per rail on its own end state rather than on the shared
+            // session: STALLED means it reached the hard stop, IDLE means
+            // someone stopped it deliberately and the zero would be wrong.
+            for (int rail : {0, 2}) {
+                if (rail_state_[rail].load() == RAIL_STALLED) {
+                    sleep_ms(200);        // let the motor come to rest
+                    latch_zero(rail);
+                } else {
+                    std::fprintf(stderr,
+                        "proc_gateway: airport home rail=%d aborted (state=%d)\n",
+                        rail, rail_state_[rail].load());
                 }
-                homed_.store(ok);
-            } else {
-                std::fprintf(stderr, "proc_gateway: airport home aborted/timeout\n");
             }
-            homing_.store(false);
+            rail_homing_[0].store(false);
+            rail_homing_[2].store(false);
         }).detach();
         return true;
     }
 
-    bool is_homing() const { return homing_.load(); }
-    bool is_homed()  const { return homed_.load(); }
+    // 导轨2 homes independently: it has its own hard stop and is not part
+    // of the clamp pair, so it gets its own command and its own zero.
+    // Direction is env-selectable because which end is "home" is a
+    // mechanical choice, not something we can infer.
+    bool home_rail2(int rpm) {
+        constexpr int kRail = 1;
+        if (rail_homing_[kRail].load()) return false;
+        if (!ensure_ready()) return false;
+
+        const int max_rpm = clamp_int(env_int("UAV_AIRPORT_RAIL_MAX_RPM", 1500), 1, 3000);
+        const int speed = clamp_int(std::abs(rpm) > 0 ? std::abs(rpm) : 150, 1, max_rpm);
+        const int dir = (env_int("UAV_AIRPORT_RAIL2_HOME_DIR", 1) < 0) ? -1 : 1;
+
+        // set_speed_rpm spawns monitor_rail_until_stall for this rail, which
+        // is what actually decides when we have arrived (stall flags, or
+        // its own safety cap). We only latch the position afterwards.
+        if (!set_speed_rpm(kRail, dir * speed)) return false;
+
+        rail_homing_[kRail].store(true);
+        rail_homed_[kRail].store(false);
+
+        std::thread([this]() {
+            constexpr int kRail2 = 1;
+            const int wait_cap_ms = clamp_int(env_int("UAV_AIRPORT_HOME_WAIT_MS", 40000), 2000, 180000);
+            const uint64_t t0 = now_ms();
+            int final_state = RAIL_MOVING;
+            while (g_running && (int64_t)(now_ms() - t0) < wait_cap_ms) {
+                sleep_ms(200);
+                final_state = rail_state_[kRail2].load();
+                if (final_state != RAIL_MOVING) break;
+            }
+            // Deliberately NOT guarded on rail2_motion_session_: the stall
+            // monitor stops the rail via estop_rail(), which bumps that
+            // session itself — so a successful homing looks "superseded"
+            // and the zero never gets latched. The rail's own end state is
+            // the honest signal instead:
+            //   STALLED → it reached the hard stop, latch here
+            //   IDLE    → someone stopped it on purpose, don't latch
+            if (final_state == RAIL_STALLED) {
+                sleep_ms(300);
+                latch_zero(kRail2);
+            } else {
+                std::fprintf(stderr,
+                    "proc_gateway: airport home rail=1 aborted (state=%d)\n", final_state);
+            }
+            rail_homing_[kRail2].store(false);
+        }).detach();
+        return true;
+    }
+
+    bool is_homing() const {
+        return rail_homing_[0].load() || rail_homing_[1].load() || rail_homing_[2].load();
+    }
+    bool is_rail_homing(int rail_index) const {
+        if (rail_index < 0 || rail_index >= 3) return false;
+        return rail_homing_[rail_index].load();
+    }
+    bool is_rail_homed(int rail_index) const {
+        if (rail_index < 0 || rail_index >= 3) return false;
+        return rail_homed_[rail_index].load();
+    }
+    // Kept for the pair: HostGUI's 归零 panel reports on rails 0+2.
+    bool is_homed() const { return rail_homed_[0].load() && rail_homed_[2].load(); }
     int64_t rail_zero(int rail_index) const {
         if (rail_index < 0 || rail_index >= 3) return 0;
         return rail_zero_[rail_index].load();
@@ -1583,13 +1638,29 @@ public:
     // "未归零" rather than a number that would be silently wrong.
     bool rail_position_mm(int rail_index, double *out_mm) {
         if (rail_index < 0 || rail_index >= 3 || out_mm == nullptr) return false;
-        if (!homed_.load()) return false;
+        if (!rail_homed_[rail_index].load()) return false;
         int64_t pos = 0;
         if (!read_position(rail_addr(rail_index), &pos)) return false;
         const double cpmm = counts_per_mm_for_rail(rail_index);
         if (cpmm <= 0.0) return false;
         *out_mm = double(pos - rail_zero_[rail_index].load()) / cpmm;
         return true;
+    }
+
+    // Read the rail's encoder where it came to rest and make that its zero.
+    void latch_zero(int rail_index) {
+        int64_t pos = 0;
+        if (read_position(rail_addr(rail_index), &pos)) {
+            rail_zero_[rail_index].store(pos);
+            rail_homed_[rail_index].store(true);
+            std::fprintf(stderr, "proc_gateway: airport home rail=%d zero=%lld\n",
+                         rail_index, (long long)pos);
+        } else {
+            rail_homed_[rail_index].store(false);
+            std::fprintf(stderr,
+                         "proc_gateway: airport home rail=%d: position read failed\n",
+                         rail_index);
+        }
     }
 
     // Decisive emergency stop for one axis: send 立即停止(FE) four times
@@ -1644,8 +1715,14 @@ private:
     std::array<std::atomic<int64_t>, 3> rail_zero_{{
         std::atomic<int64_t>{0}, std::atomic<int64_t>{0}, std::atomic<int64_t>{0}
     }};
-    std::atomic<bool> homing_{false};
-    std::atomic<bool> homed_{false};
+    // Per-rail, because 导轨2 homes on its own hard stop independently of
+    // the 导轨1+3 clamp pair — homing one must not claim the others.
+    std::array<std::atomic<bool>, 3> rail_homing_{{
+        std::atomic<bool>{false}, std::atomic<bool>{false}, std::atomic<bool>{false}
+    }};
+    std::array<std::atomic<bool>, 3> rail_homed_{{
+        std::atomic<bool>{false}, std::atomic<bool>{false}, std::atomic<bool>{false}
+    }};
 
     // Per-rail observable state — HostGUI polls this via airport.get_status
     // to advance script steps the instant the stall fires, instead of
@@ -2088,6 +2165,14 @@ private:
         const int poll_ms       = clamp_int(env_int("UAV_AIRPORT_MOVE_POLL_MS", 30), 5, 500);
         const int max_read_fail = clamp_int(env_int("UAV_AIRPORT_MOVE_READ_FAIL_HITS", 15), 1, 200);
         const int stall_ms      = clamp_int(env_int("UAV_AIRPORT_MOVE_STALL_MS", 300), 100, 10000);
+        // Grace period before the no-progress check is allowed to fire.
+        // Starting from rest — especially when the rail is pressed against
+        // a hard stop, e.g. the first move away after homing — the motor
+        // ramps up over a good fraction of a second and covers only a few
+        // encoder counts at first. Without this the stall detector reads
+        // that normal startup as a jam and emergency-stops immediately
+        // (observed: "progressed~0/629220" on a perfectly healthy rail).
+        const int startup_ms    = clamp_int(env_int("UAV_AIRPORT_MOVE_STARTUP_MS", 1200), 0, 20000);
         // counts/s ≈ rpm × 176.6 empirically; allow 2× the estimate + 4 s.
         const double est_ms = (run_rpm > 0)
             ? (double)target_counts / (double(run_rpm) * 176.6 / 1000.0) : 30000.0;
@@ -2118,7 +2203,8 @@ private:
             if (progressed > best_progress + 50) {          // still advancing
                 best_progress = progressed;
                 last_progress_ms = now_ms();
-            } else if ((int64_t)(now_ms() - last_progress_ms) >= stall_ms) {
+            } else if ((int64_t)(now_ms() - t0) >= startup_ms &&
+                       (int64_t)(now_ms() - last_progress_ms) >= stall_ms) {
                 why = "no-progress(jam/end-stop)";
                 stalled = true;
                 break;
@@ -2894,6 +2980,16 @@ static void handle_rpc(int fd, const std::string &line,
                  id, ok ? "true" : "false",
                  g_airport.is_homing() ? "true" : "false", speed_rpm);
 
+    } else if (method == "airport.home_rail2") {
+        // 导轨2 归零 — independent of the 导轨1+3 pair: its own hard stop,
+        // its own zero. Direction from UAV_AIRPORT_RAIL2_HOME_DIR.
+        int speed_rpm = json_int(s, "speed_rpm", 150);
+        bool ok = g_airport.home_rail2(speed_rpm);
+        snprintf(resp, sizeof(resp),
+                 "{\"id\":%d,\"result\":{\"ok\":%s,\"homing\":%s,\"speed_rpm\":%d}}\n",
+                 id, ok ? "true" : "false",
+                 g_airport.is_rail_homing(1) ? "true" : "false", speed_rpm);
+
     } else if (method == "airport.move_mm") {
         // Closed-loop precise relative move: drive at speed_rpm and stop
         // when the 0x36 encoder says dist_mm has been covered. Signed
@@ -2919,22 +3015,28 @@ static void handle_rpc(int fd, const std::string &line,
         // Position is only reported once the rails have been homed — an
         // un-homed count is an arbitrary offset from wherever the driver
         // happened to power up, so showing it as mm would be a lie.
-        double p0 = 0.0, p2 = 0.0;
-        const bool have_p0 = g_airport.rail_position_mm(0, &p0);
-        const bool have_p2 = g_airport.rail_position_mm(2, &p2);
-        char pos0[48] = "null", pos2[48] = "null";
-        if (have_p0) snprintf(pos0, sizeof(pos0), "%.2f", p0);
-        if (have_p2) snprintf(pos2, sizeof(pos2), "%.2f", p2);
+        double p[3] = {0.0, 0.0, 0.0};
+        char pos[3][48] = {"null", "null", "null"};
+        for (int r = 0; r < 3; ++r) {
+            if (g_airport.rail_position_mm(r, &p[r])) {
+                snprintf(pos[r], sizeof(pos[r]), "%.2f", p[r]);
+            }
+        }
         snprintf(resp, sizeof(resp),
                  "{\"id\":%d,\"result\":{\"ok\":true,"
                  "\"homing\":%s,\"homed\":%s,"
-                 "\"rails\":[{\"index\":0,\"state\":%d,\"pos_mm\":%s},"
-                            "{\"index\":1,\"state\":%d},"
-                            "{\"index\":2,\"state\":%d,\"pos_mm\":%s}]}}\n",
+                 "\"rails\":[{\"index\":0,\"state\":%d,\"pos_mm\":%s,\"homed\":%s,\"homing\":%s},"
+                            "{\"index\":1,\"state\":%d,\"pos_mm\":%s,\"homed\":%s,\"homing\":%s},"
+                            "{\"index\":2,\"state\":%d,\"pos_mm\":%s,\"homed\":%s,\"homing\":%s}]}}\n",
                  id,
                  g_airport.is_homing() ? "true" : "false",
                  g_airport.is_homed()  ? "true" : "false",
-                 s0, pos0, s1, s2, pos2);
+                 s0, pos[0], g_airport.is_rail_homed(0) ? "true" : "false",
+                             g_airport.is_rail_homing(0) ? "true" : "false",
+                 s1, pos[1], g_airport.is_rail_homed(1) ? "true" : "false",
+                             g_airport.is_rail_homing(1) ? "true" : "false",
+                 s2, pos[2], g_airport.is_rail_homed(2) ? "true" : "false",
+                             g_airport.is_rail_homing(2) ? "true" : "false");
 
     } else if (method == "airport.relay") {
         int channel = json_int(s, "channel", -1);
