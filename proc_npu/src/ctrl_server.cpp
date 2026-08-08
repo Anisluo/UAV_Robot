@@ -4,6 +4,7 @@
 #include <cstdio>
 #include <cstring>
 #include <utility>
+#include <vector>
 
 #include <fcntl.h>
 #include <poll.h>
@@ -132,19 +133,34 @@ void CtrlServer::poll_once(int timeout_ms) {
         return;
     }
 
+    // Snapshot which client fds poll() reported on, BEFORE accept_new()
+    // can grow clients_. Indexing pfds[i + 1] against the post-accept
+    // clients_ read one past the end of pfds (it was sized before the
+    // poll) — undefined behaviour — and, once an erase shifted the vector,
+    // applied one client's revents to another, dropping live clients.
+    // Matching by fd is immune to both.
+    std::vector<int> ready;
+    ready.reserve(clients_.size());
+    for (std::size_t i = 1; i < pfds.size(); ++i) {
+        if (pfds[i].revents & (POLLIN | POLLHUP | POLLERR)) {
+            ready.push_back(pfds[i].fd);
+        }
+    }
+
     if (pfds[0].revents & POLLIN) {
         accept_new();
     }
 
-    for (std::size_t i = 0; i < clients_.size(); ) {
-        if (pfds[i + 1].revents & (POLLIN | POLLHUP | POLLERR)) {
-            handle_client(clients_[i]);
-            if (clients_[i].fd < 0) {
-                clients_.erase(clients_.begin() + static_cast<std::ptrdiff_t>(i));
-                continue;
-            }
+    for (int fd : ready) {
+        std::size_t idx = clients_.size();
+        for (std::size_t i = 0; i < clients_.size(); ++i) {
+            if (clients_[i].fd == fd) { idx = i; break; }
         }
-        ++i;
+        if (idx == clients_.size()) continue;   // already gone
+        handle_client(clients_[idx]);
+        if (clients_[idx].fd < 0) {
+            clients_.erase(clients_.begin() + static_cast<std::ptrdiff_t>(idx));
+        }
     }
 }
 

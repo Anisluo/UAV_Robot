@@ -23,6 +23,7 @@ UNITS=(
     "uav-proc-gripper.service"
     "uav-proc-arm.service"
     "uav-proc-airport.service"
+    "uav-proc-door.service"
 )
 
 # Patterns for `pkill -f` to catch processes started by hand or under a
@@ -38,6 +39,7 @@ PROCESS_PATTERNS=(
     "proc_gripper"
     "proc_arm"
     "proc_airport"
+    "proc_door"
 )
 
 # Stale unix sockets / FIFOs we want to wipe between runs.
@@ -46,6 +48,7 @@ IPC_FILES=(
     /tmp/uav_proc_realsense.ctrl.sock
     /tmp/uav_proc_npu.ctrl.sock
     /tmp/uav_proc_grasp.ctrl.sock
+    /tmp/uav_proc_door.sock
     /tmp/uav_realsense_frame_notify.sock
     /tmp/uav_gw_npu_rx.sock
     /tmp/uav_app_npu_rx.sock

@@ -394,6 +394,18 @@ int run_airport_runtime() {
             if (client_fd >= 0 && nclients < kMaxClients) {
                 client_fds[nclients] = client_fd;
                 buf_lens[nclients] = 0U;
+                // Initialise this pollfd slot now. poll() only wrote revents
+                // for the indices it was handed, and this one was not among
+                // them — it still holds this slot's values from an earlier
+                // iteration (a different client's fd, and stale revents).
+                // Without this the loop below reads that stale fd, treats
+                // the failure as a disconnect, and drops the brand-new
+                // client without ever closing it: an fd leak plus a caller
+                // that hangs until its own timeout. Diagnosed in proc_door
+                // on 2026-08-08, where it wedged the whole RPC chain.
+                pfds[1 + nclients].fd      = client_fd;
+                pfds[1 + nclients].events  = POLLIN;
+                pfds[1 + nclients].revents = 0;
                 ++nclients;
             } else if (client_fd >= 0) {
                 close(client_fd);
@@ -410,12 +422,18 @@ int run_airport_runtime() {
             ssize_t n = read(pfds[idx].fd, bufs[i] + buf_lens[i], kBufSize - buf_lens[i] - 1U);
             if (n <= 0) {
                 close(pfds[idx].fd);
-                if (i != nclients - 1) {
-                    client_fds[i] = client_fds[nclients - 1];
-                    buf_lens[i] = buf_lens[nclients - 1];
-                    std::memcpy(bufs[i], bufs[nclients - 1], buf_lens[i]);
+                const int last = nclients - 1;
+                if (i != last) {
+                    // Move the last client into this slot — pfds included,
+                    // so the `continue` below re-examines the moved client
+                    // with its own fd/revents rather than the closed one's
+                    // (which would read a dead fd and evict a live client).
+                    client_fds[i] = client_fds[last];
+                    buf_lens[i] = buf_lens[last];
+                    std::memcpy(bufs[i], bufs[last], buf_lens[i]);
+                    pfds[idx] = pfds[1 + last];
                 }
-                client_fds[nclients - 1] = -1;
+                client_fds[last] = -1;
                 --nclients;
                 continue;
             }

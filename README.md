@@ -6,7 +6,7 @@
 
 - 主控守护进程源码（`uav_robotd/app/`、`uav_robotd/core/`、`uav_robotd/drv/`）
 - 公共头文件与 ABI 定义（`common/include/`）
-- 独立处理进程（`proc_gateway/`、`proc_realsense/`、`proc_npu/`、`proc_car/`、`proc_gripper/`、`proc_arm/`、`proc_airport/`）
+- 独立处理进程（`proc_gateway/`、`proc_realsense/`、`proc_npu/`、`proc_car/`、`proc_gripper/`、`proc_arm/`、`proc_airport/`、`proc_door/`）
 
 ## 2. 目录结构
 
@@ -23,6 +23,7 @@ UAV_Robot/
 |- proc_gripper/   # 串口夹爪进程
 |- proc_arm/       # 机械臂进程
 |- proc_airport/   # 机场/平台锁进程
+|- proc_door/      # 舱门/继电器 RS485 进程（Modbus RTU）
 |- proc_npu/       # NPU 相关进程
 |- proc_realsense/ # Realsense 相关进程
 |- tools/          # 辅助工具

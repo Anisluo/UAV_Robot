@@ -1035,6 +1035,11 @@ int run_arm_runtime() {
                     client_fds[nclients] = client_fd;
                     pfds[1 + nclients].fd = client_fd;
                     pfds[1 + nclients].events = POLLIN;
+                    // poll() did not write revents for this slot (it wasn't
+                    // in the set), so it still holds a previous iteration's
+                    // value. Left stale, the loop below recv()s from a
+                    // client that has not sent anything yet and blocks.
+                    pfds[1 + nclients].revents = 0;
                     buf_lens[nclients] = 0U;
                     ++nclients;
                     register_client_fd(client_fd);

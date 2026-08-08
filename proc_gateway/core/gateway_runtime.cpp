@@ -301,6 +301,70 @@ static bool proc_arm_passthrough(const char *original_line,
     return true;
 }
 
+// ─── proc_door JSON-RPC forwarding (Unix stream socket) ────────────────────
+// proc_door owns the RS485 serial port of the digital-IO module (relays +
+// discrete inputs). Same deal as proc_arm: one process owns the device, the
+// gateway just forwards.
+//
+// The timeout here is deliberately SHORT. proc_door answers every method in
+// milliseconds — motion is supervised asynchronously on its side, so no
+// door.* call ever waits on a motor. A long timeout instead turns a dead
+// relay board into a console-wide outage: HostGUI polls door.get_status at
+// 300 ms, this RPC loop is single threaded, and each blocked forward stalls
+// *every* other method behind it (observed 2026-08-08 — even system.ping
+// stopped answering, with 18 connections queued on proc_door's socket).
+static const char *proc_door_sock_path() {
+    const char *e = std::getenv("UAV_PROC_DOOR_SOCK");
+    return (e && e[0] != '\0') ? e : "/tmp/uav_proc_door.sock";
+}
+
+// Transparent pass-through: forwards the original request line and copies
+// the reply back verbatim, so every door.* method proc_door grows works
+// through the gateway without a change here.
+static bool proc_door_passthrough(const char *original_line,
+                                  char *resp, size_t resp_sz) {
+    int fd = ::socket(AF_UNIX, SOCK_STREAM, 0);
+    if (fd < 0) return false;
+
+    struct timeval tv{};
+    tv.tv_sec  = 2;
+    tv.tv_usec = 0;
+    ::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    ::setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+
+    sockaddr_un addr{};
+    addr.sun_family = AF_UNIX;
+    std::strncpy(addr.sun_path, proc_door_sock_path(), sizeof(addr.sun_path) - 1);
+    if (::connect(fd, reinterpret_cast<sockaddr *>(&addr), sizeof(addr)) < 0) {
+        ::close(fd);
+        return false;
+    }
+
+    const size_t line_len = std::strlen(original_line);
+    if (::write(fd, original_line, line_len) != (ssize_t)line_len) {
+        ::close(fd);
+        return false;
+    }
+    if (line_len == 0 || original_line[line_len - 1] != '\n') {
+        const ssize_t nl_written = ::write(fd, "\n", 1);
+        (void)nl_written;
+    }
+
+    char buf[4096] = {};
+    int total = 0;
+    while (total < (int)sizeof(buf) - 1) {
+        ssize_t n = ::read(fd, buf + total, sizeof(buf) - 1 - (size_t)total);
+        if (n <= 0) break;
+        total += (int)n;
+        if (std::memchr(buf, '\n', (size_t)total)) break;
+    }
+    ::close(fd);
+    if (total <= 0) return false;
+
+    snprintf(resp, resp_sz, "%.*s", total, buf);
+    return true;
+}
+
 // ─── proc_npu JSON-RPC forwarding (Unix stream socket) ─────────────────────
 // The legacy binary ctrl channel (ctrl_c.send_cmd) never actually reached
 // proc_npu's JSON-RPC SOCK_STREAM server, so strategy-switch commands from
@@ -2180,6 +2244,7 @@ static void handle_rpc(int fd, const std::string &line,
             else if (source == "proc_gripper")    unit = "uav-proc-gripper.service";
             else if (source == "proc_airport")    unit = "uav-proc-airport.service";
             else if (source == "proc_grasp")      unit = "uav-proc-grasp.service";
+            else if (source == "proc_door")       unit = "uav-proc-door.service";
 
             if (unit == nullptr) {
                 logs = "[unknown log source: " + source + "]";
@@ -2598,6 +2663,19 @@ static void handle_rpc(int fd, const std::string &line,
         }
         snprintf(resp, sizeof(resp),
                  "{\"id\":%d,\"result\":%s}\n", id, status.c_str());
+
+    // ── proc_door forwarding (RS485 relay board + discrete inputs) ───────
+    } else if (std::strncmp(method.c_str(), "door.", 5) == 0 ||
+               std::strncmp(method.c_str(), "helipad.", 8) == 0) {
+        // Verbatim forward — proc_door decodes the params and owns the
+        // serial port. Covers the hatch verbs (door.open/close/stop), the
+        // helipad lift verbs (helipad.up/down/stop), door.get_status and
+        // the raw relay/diagnostic methods.
+        if (!proc_door_passthrough(line.c_str(), resp, sizeof(resp))) {
+            snprintf(resp, sizeof(resp),
+                     "{\"id\":%d,\"result\":{\"ok\":false,\"error\":\"proc_door unavailable\"}}\n",
+                     id);
+        }
 
     } else if (std::strncmp(method.c_str(), "arm.", 4) == 0 ||
                std::strncmp(method.c_str(), "piper.", 6) == 0) {

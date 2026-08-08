@@ -18,3 +18,7 @@ drone_dataset/
 runs/
 *.pt
 *.onnx
+
+# Python bytecode from the tools/ sidecars
+__pycache__/
+*.pyc

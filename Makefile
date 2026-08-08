@@ -41,9 +41,9 @@ ARM_TEST_SRCS := \
 ROBOTD_OBJS := $(patsubst %.c,$(OBJ_DIR)/%.o,$(ROBOTD_SRCS))
 ARM_TEST_OBJS := $(patsubst %.c,$(OBJ_DIR)/%.o,$(ARM_TEST_SRCS))
 
-.PHONY: all clean run install test dirs proc_realsense proc_npu proc_gateway proc_car proc_gripper proc_arm proc_airport proc_grasp
+.PHONY: all clean run install test dirs proc_realsense proc_npu proc_gateway proc_car proc_gripper proc_arm proc_airport proc_grasp proc_door
 
-all: dirs $(BIN_DIR)/uav_robotd $(BIN_DIR)/arm_motor_test proc_realsense proc_npu proc_gateway proc_car proc_gripper proc_arm proc_airport proc_grasp
+all: dirs $(BIN_DIR)/uav_robotd $(BIN_DIR)/arm_motor_test proc_realsense proc_npu proc_gateway proc_car proc_gripper proc_arm proc_airport proc_grasp proc_door
 
 dirs:
 	@mkdir -p $(BIN_DIR) \
@@ -104,6 +104,9 @@ proc_airport:
 proc_grasp:
 	$(MAKE) -C proc_grasp
 
+proc_door:
+	$(MAKE) -C proc_door
+
 clean:
 	rm -rf $(BUILD_DIR)
 	$(MAKE) -C proc_realsense clean
@@ -114,3 +117,4 @@ clean:
 	$(MAKE) -C proc_arm clean
 	$(MAKE) -C proc_airport clean
 	$(MAKE) -C proc_grasp clean
+	$(MAKE) -C proc_door clean

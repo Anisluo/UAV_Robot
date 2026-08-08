@@ -50,7 +50,7 @@ except ImportError:
 # user passes --services explicitly.
 ALL_SERVICES = (
     "uav_robotd,proc_realsense,proc_npu,proc_gateway,"
-    "proc_car,proc_gripper,proc_arm,proc_airport,proc_grasp"
+    "proc_car,proc_gripper,proc_arm,proc_airport,proc_grasp,proc_door"
 )
 
 # Apt packages needed to build everything on a fresh Ubuntu 22.04 RK3588.

@@ -226,6 +226,10 @@ int main() {
             if (cfd >= 0 && nclients < MAX_CLIENTS) {
                 pfds[1 + nclients].fd     = cfd;
                 pfds[1 + nclients].events = POLLIN;
+                // poll() did not fill revents for this slot; a stale value
+                // would make the loop below read from a client that has not
+                // sent its request yet, and block on it.
+                pfds[1 + nclients].revents = 0;
                 buf_lens[nclients]        = 0;
                 ++nclients;
                 log_info(TAG, "client connected (total %d)", nclients);

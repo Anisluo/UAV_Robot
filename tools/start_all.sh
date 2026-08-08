@@ -27,6 +27,7 @@ declare -A UNIT_TO_PATTERN=(
     [uav-proc-arm.service]="proc_arm/build/bin/proc_arm"
     [uav-proc-airport.service]="proc_airport/build/bin/proc_airport"
     [uav-proc-grasp.service]="proc_grasp/build/bin/proc_grasp"
+    [uav-proc-door.service]="proc_door/build/bin/proc_door"
 )
 
 # short-name -> systemd unit name
@@ -40,6 +41,7 @@ declare -A SHORT_TO_UNIT=(
     [proc_arm]="uav-proc-arm.service"
     [proc_airport]="uav-proc-airport.service"
     [proc_grasp]="uav-proc-grasp.service"
+    [proc_door]="uav-proc-door.service"
 )
 
 # Order matters - bring up the daemons that own hardware first, then the
@@ -50,6 +52,7 @@ UNIT_ORDER=(
     "uav-proc-car.service"
     "uav-proc-gripper.service"
     "uav-proc-airport.service"
+    "uav-proc-door.service"
     "uav-proc-realsense.service"
     "uav-proc-npu.service"
     "uav-proc-grasp.service"
@@ -82,7 +85,8 @@ Without --services this starts every installed unit. With --services it
 only starts (and only verifies) the listed subset.
 
 Service names: uav_robotd, proc_realsense, proc_npu, proc_gateway,
-               proc_car, proc_gripper, proc_arm, proc_airport, proc_grasp
+               proc_car, proc_gripper, proc_arm, proc_airport, proc_grasp,
+               proc_door
 EOF
             exit 0
             ;;

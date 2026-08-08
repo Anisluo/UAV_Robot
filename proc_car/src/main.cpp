@@ -545,11 +545,29 @@ int main() {
             break;
         }
 
+        // Snapshot the joystick's revents now. A client accepted below takes
+        // the pollfd slot right after the last client — which is exactly
+        // where the joystick sits this iteration — so the accept path has to
+        // overwrite that slot, and this value would be lost.
+        const short joy_revents =
+            (joy_pfd_idx >= 0) ? pfds[joy_pfd_idx].revents : static_cast<short>(0);
+
         if ((pfds[0].revents & POLLIN) != 0) {
             int client_fd = accept(server_fd, nullptr, nullptr);
             if (client_fd >= 0 && nclients < kMaxClients) {
                 client_fds[nclients] = client_fd;
                 buf_lens[nclients] = 0U;
+                // Initialise this pollfd slot. poll() only wrote revents for
+                // the indices it was handed, and this one was not among them
+                // — here it still holds the JOYSTICK's fd and revents. Left
+                // stale, the client loop below would read the joystick
+                // device and then close() it on failure, killing tele-op,
+                // while the brand-new client is dropped without its fd ever
+                // being closed. Same defect diagnosed in proc_door
+                // (2026-08-08), where it wedged the whole RPC chain.
+                pfds[client_pfd_start + nclients].fd      = client_fd;
+                pfds[client_pfd_start + nclients].events  = POLLIN;
+                pfds[client_pfd_start + nclients].revents = 0;
                 ++nclients;
             } else if (client_fd >= 0) {
                 close(client_fd);
@@ -565,12 +583,17 @@ int main() {
             ssize_t n = read(pfds[idx].fd, bufs[i] + buf_lens[i], kBufSize - buf_lens[i] - 1U);
             if (n <= 0) {
                 close(pfds[idx].fd);
-                if (i != nclients - 1) {
-                    client_fds[i] = client_fds[nclients - 1];
-                    buf_lens[i] = buf_lens[nclients - 1];
-                    std::memcpy(bufs[i], bufs[nclients - 1], buf_lens[i]);
+                const int last = nclients - 1;
+                if (i != last) {
+                    // Move the last client into this slot — pfds included,
+                    // so the `continue` below re-examines the moved client
+                    // with its own fd/revents rather than the closed one's.
+                    client_fds[i] = client_fds[last];
+                    buf_lens[i] = buf_lens[last];
+                    std::memcpy(bufs[i], bufs[last], buf_lens[i]);
+                    pfds[idx] = pfds[client_pfd_start + last];
                 }
-                client_fds[nclients - 1] = -1;
+                client_fds[last] = -1;
                 --nclients;
                 continue;
             }
@@ -598,7 +621,7 @@ int main() {
         }
 
         if (joy_pfd_idx >= 0) {
-            short rev = pfds[joy_pfd_idx].revents;
+            short rev = joy_revents;   // snapshot taken before accept()
             if ((rev & (POLLHUP | POLLERR | POLLNVAL)) != 0) {
                 joy_close(&joy_state, "POLLHUP/POLLERR/POLLNVAL");
             } else if ((rev & POLLIN) != 0) {
