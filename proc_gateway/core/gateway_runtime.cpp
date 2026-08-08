@@ -1432,7 +1432,7 @@ public:
 
         rail_state_[rail_index].store(RAIL_MOVING);
         if (rail_index == 1) rail2_motion_session_.fetch_add(1);  // cancel rail-2 speed watcher
-        const uint64_t session = move_motion_session_.fetch_add(1) + 1;
+        const uint64_t session = move_motion_session_[rail_index].fetch_add(1) + 1;
 
         std::fprintf(stderr,
             "proc_gateway: airport move_mm rail=%d addr=%u dist_mm=%.2f cpmm=%.0f "
@@ -1519,12 +1519,14 @@ public:
             return false;
         }
 
-        // Cancel any running rail-2 stall monitor so it doesn't keep
+        // Cancel any running monitor for THIS rail so it doesn't keep
         // polling a stopped motor (and doesn't fire a redundant stop
-        // a moment later).
+        // a moment later). Only this rail's — cancelling another rail's
+        // watcher would leave that rail running with nobody to stop it.
         if (rail_index == 1) {
             rail2_motion_session_.fetch_add(1);
         }
+        move_motion_session_[rail_index].fetch_add(1);
 
         // Manual stop drops out of MOVING into IDLE. If the rail was
         // already STALLED, the monitor's own stop already transitioned
@@ -1737,7 +1739,7 @@ public:
     void estop_rail(int rail_index) {
         if (rail_index < 0 || rail_index >= 3) return;
         if (rail_index == 1) rail2_motion_session_.fetch_add(1);
-        move_motion_session_.fetch_add(1);
+        move_motion_session_[rail_index].fetch_add(1);
         if (!ensure_ready()) return;
         const uint8_t addr = rail_addr(rail_index);
         ZdtArmCanBatch batch{};
@@ -1752,7 +1754,9 @@ public:
 
     bool stop_all() {
         pair_motion_session_.fetch_add(1);
-        move_motion_session_.fetch_add(1);   // abort any running move_mm loop
+        for (auto &sess : move_motion_session_) {   // abort every move_mm loop
+            sess.fetch_add(1);
+        }
         bool ok = true;
         ok = stop_rail(0) && ok;
         ok = stop_rail(1) && ok;
@@ -1769,10 +1773,15 @@ private:
     std::mutex io_mu_;
     std::atomic<uint64_t> pair_motion_session_{0};
     std::atomic<uint64_t> rail2_motion_session_{0};
-    // Guards the closed-loop move_mm watcher: any new motion command, stop
-    // or stop_all bumps it so a superseded watcher exits instead of
-    // stopping the rail out from under whatever is running now.
-    std::atomic<uint64_t> move_motion_session_{0};
+    // Guards the closed-loop move_mm watcher, PER RAIL. It used to be a
+    // single counter shared by all three, which meant starting a move on
+    // one rail silently cancelled another rail's watcher — the second rail
+    // then kept running in speed mode with nobody left to stop it, until
+    // it hit the far end stop. That is exactly what happened when homing
+    // backed rails 0 and 2 off one after the other.
+    std::array<std::atomic<uint64_t>, 3> move_motion_session_{{
+        std::atomic<uint64_t>{0}, std::atomic<uint64_t>{0}, std::atomic<uint64_t>{0}
+    }};
 
     // Homed zero per rail (encoder counts at the release-side hard stop),
     // plus whether a homing run is in flight / has ever succeeded. Held in
@@ -2252,7 +2261,7 @@ private:
         const char *why = "?";
         bool stalled = false;
 
-        while (g_running && move_motion_session_.load() == session) {
+        while (g_running && move_motion_session_[rail_index].load() == session) {
             if ((int64_t)(now_ms() - t0) >= max_duration) { why = "timeout"; stalled = true; break; }
 
             int64_t pos = 0;
@@ -2278,7 +2287,7 @@ private:
             sleep_ms(poll_ms);
         }
 
-        if (move_motion_session_.load() != session) {
+        if (move_motion_session_[rail_index].load() != session) {
             std::fprintf(stderr, "proc_gateway: airport move_mm rail=%d superseded\n", rail_index);
             return;
         }
