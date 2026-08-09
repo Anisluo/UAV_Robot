@@ -1250,8 +1250,8 @@ public:
         if (!ensure_ready()) return false;
 
         const uint8_t addr = rail_addr(rail_index);
-        const int max_rpm = clamp_int(env_int("UAV_AIRPORT_RAIL_MAX_RPM", 1500), 1, 3000);
-        const uint8_t acc = (uint8_t)clamp_int(env_int("UAV_AIRPORT_RAIL_SPEED_ACC", 10), 0, 255);
+        const int max_rpm = clamp_int(env_int_for_rail(rail_index, "UAV_AIRPORT_RAIL_MAX_RPM", 1500), 1, 3000);
+        const uint8_t acc = accel_for_rail(rail_index);
         const bool reverse = env_bool_for_rail(rail_index, "UAV_AIRPORT_RAIL_REVERSE", false);
         const int actual_rpm = clamp_int(std::abs(rpm), 0, max_rpm);
         const bool ccw = ((rpm < 0) ? !reverse : reverse);
@@ -1380,9 +1380,9 @@ public:
         const int64_t target_counts = (int64_t)std::llround(std::fabs(dist_mm) * cpmm);
         if (target_counts <= 0) return true;   // nothing to do
 
-        const int max_rpm  = clamp_int(env_int("UAV_AIRPORT_RAIL_MAX_RPM", 1500), 1, 3000);
+        const int max_rpm  = clamp_int(env_int_for_rail(rail_index, "UAV_AIRPORT_RAIL_MAX_RPM", 1500), 1, 3000);
         const int run_rpm  = clamp_int((speed_rpm != 0 ? std::abs(speed_rpm) : 1500), 1, max_rpm);
-        const uint8_t acc  = (uint8_t)clamp_int(env_int("UAV_AIRPORT_RAIL_SPEED_ACC", 10), 0, 255);
+        const uint8_t acc  = accel_for_rail(rail_index);
         const bool reverse = env_bool_for_rail(rail_index, "UAV_AIRPORT_RAIL_REVERSE", false);
         const bool ccw     = (dist_mm < 0.0) ? !reverse : reverse;
 
@@ -1486,6 +1486,20 @@ public:
         return move_mm(rail_index, delta, speed_rpm);
     }
 
+    // 加速度档位, 运行时可调 — 见 rail_accel_override_ 的说明。
+    // 0 = 直接启动 (无斜坡), 1..255 数值越大加速越快。下一次运动生效。
+    bool set_accel(int rail_index, int acc) {
+        if (rail_index < 0 || rail_index >= 3) return false;
+        if (acc < 0 || acc > 255) return false;
+        rail_accel_override_[rail_index].store(acc);
+        std::fprintf(stderr, "proc_gateway: airport rail=%d accel override = %d\n",
+                     rail_index, acc);
+        return true;
+    }
+
+    // Gear actually in force right now (override if set, else env).
+    int effective_accel(int rail_index) const { return (int)accel_for_rail(rail_index); }
+
     // Open-loop fixed-distance move at a chosen speed. Used by stage
     // scripts in "distance" stop_mode — drive the rail N mm at speed_rpm,
     // motor self-stops on its internal pulse counter, GUI advances when
@@ -1498,8 +1512,8 @@ public:
         if (!ensure_ready()) return false;
 
         const uint8_t addr = rail_addr(rail_index);
-        const int max_rpm = clamp_int(env_int("UAV_AIRPORT_RAIL_MAX_RPM", 1500), 1, 3000);
-        const uint8_t acc = (uint8_t)clamp_int(env_int("UAV_AIRPORT_RAIL_SPEED_ACC", 10), 0, 255);
+        const int max_rpm = clamp_int(env_int_for_rail(rail_index, "UAV_AIRPORT_RAIL_MAX_RPM", 1500), 1, 3000);
+        const uint8_t acc = accel_for_rail(rail_index);
         const double pulses_per_mm = env_double_for_rail(rail_index, "UAV_AIRPORT_RAIL_PULSES_PER_MM", 100.0);
         const bool reverse = env_bool_for_rail(rail_index, "UAV_AIRPORT_RAIL_REVERSE", false);
 
@@ -1657,7 +1671,7 @@ public:
         if (rail_homing_[kRail].load()) return false;
         if (!ensure_ready()) return false;
 
-        const int max_rpm = clamp_int(env_int("UAV_AIRPORT_RAIL_MAX_RPM", 1500), 1, 3000);
+        const int max_rpm = clamp_int(env_int_for_rail(kRail, "UAV_AIRPORT_RAIL_MAX_RPM", 1500), 1, 3000);
         const int speed = clamp_int(std::abs(rpm) > 0 ? std::abs(rpm) : 150, 1, max_rpm);
         const int dir = (env_int("UAV_AIRPORT_RAIL2_HOME_DIR", 1) < 0) ? -1 : 1;
 
@@ -1667,7 +1681,14 @@ public:
         if (!set_speed_rpm(kRail, dir * speed)) return false;
 
         rail_homing_[kRail].store(true);
-        rail_homed_[kRail].store(false);
+        // Do NOT clear rail_homed_ here. The old zero stays valid for the
+        // whole run — the encoder count is absolute and rail_zero_ is not
+        // touched until latch_zero() overwrites it, so positions remain
+        // meaningful while the rail seeks. Clearing it up front meant an
+        // aborted homing left the rail WORSE off than before it started:
+        // a good zero was thrown away and every subsequent move_to_mm was
+        // refused with "not homed", even though nothing about the old
+        // reference had become wrong.
 
         std::thread([this]() {
             constexpr int kRail2 = 1;
@@ -1823,6 +1844,20 @@ private:
         std::atomic<uint64_t>{0}, std::atomic<uint64_t>{0}, std::atomic<uint64_t>{0}
     }};
 
+    // Runtime acceleration override, per rail. -1 = use the env value.
+    // Exists so the operator can tune the ramp from the GUI and feel the
+    // result immediately, instead of editing /etc/default/uav_robot and
+    // restarting the gateway (which also wipes every rail's homed zero —
+    // a high price for trying one number).
+    //
+    // Deliberately NOT persisted: this is a tuning knob, and a value that
+    // silently survives a restart would drift out of sync with the env
+    // file that actually defines the boot-time behaviour. Once a value
+    // proves good it belongs in UAV_AIRPORT_RAIL{N}_SPEED_ACC.
+    std::array<std::atomic<int>, 3> rail_accel_override_{{
+        std::atomic<int>{-1}, std::atomic<int>{-1}, std::atomic<int>{-1}
+    }};
+
     // Homed zero per rail (encoder counts at the release-side hard stop),
     // plus whether a homing run is in flight / has ever succeeded. Held in
     // memory only: it is meaningless after the drivers are power-cycled,
@@ -1908,6 +1943,41 @@ private:
         char specific[64];
         std::snprintf(specific, sizeof(specific), "UAV_AIRPORT_RAIL%d_REVERSE", rail_index + 1);
         return env_bool(specific, env_bool(base_name, fallback));
+    }
+
+    // Acceleration gear for the ZDT 0xF6 speed command: 0 = 直接启动 (no
+    // ramp), 1..255 with LARGER meaning faster. Runtime override wins over
+    // the env value so GUI tuning takes effect on the next move.
+    uint8_t accel_for_rail(int rail_index) const {
+        if (rail_index >= 0 && rail_index < 3) {
+            const int ov = rail_accel_override_[rail_index].load();
+            if (ov >= 0) return (uint8_t)clamp_int(ov, 0, 255);
+        }
+        return (uint8_t)clamp_int(
+            env_int_for_rail(rail_index, "UAV_AIRPORT_RAIL_SPEED_ACC", 10), 0, 255);
+    }
+
+    // Generic per-rail integer override: UAV_AIRPORT_RAIL_FOO → look up
+    // UAV_AIRPORT_RAIL{N}_FOO first, then the shared UAV_AIRPORT_RAIL_FOO,
+    // then the built-in default.
+    //
+    // Unlike env_double_for_rail / env_bool_for_rail above, which each
+    // hardcode one suffix and ignore base_name entirely, this derives the
+    // per-rail name from base_name — so it works for any RAIL_* setting.
+    // Needed because the three rails are not interchangeable: rail 2 is a
+    // 1 mm lead screw and rails 1/3 are 6 mm, so a value tuned for one is
+    // wrong for the others.
+    static int env_int_for_rail(int rail_index, const char *base_name, int fallback) {
+        static const char kPrefix[] = "UAV_AIRPORT_RAIL";
+        const size_t plen = sizeof(kPrefix) - 1;
+        if (rail_index >= 0 && rail_index < 3 &&
+            std::strncmp(base_name, kPrefix, plen) == 0) {
+            char specific[96];
+            std::snprintf(specific, sizeof(specific), "%s%d%s",
+                          kPrefix, rail_index + 1, base_name + plen);
+            return env_int(specific, env_int(base_name, fallback));
+        }
+        return env_int(base_name, fallback);
     }
 
     // Encoder counts per mm, for the closed-loop move_mm. Distinct from
@@ -3140,6 +3210,17 @@ static void handle_rpc(int fd, const std::string &line,
                  (rail >= 0 && rail < 3 && g_airport.is_rail_homed(rail)) ? "true" : "false",
                  speed_rpm);
 
+    } else if (method == "airport.set_accel") {
+        // 加速度档位, 0=直接启动, 1..255 越大加速越快. Takes effect on the
+        // next move; not persisted (see rail_accel_override_).
+        int rail = json_int(s, "rail", -1);
+        int acc  = json_int(s, "accel", json_int(s, "acc", -1));
+        bool ok = g_airport.set_accel(rail, acc);
+        snprintf(resp, sizeof(resp),
+                 "{\"id\":%d,\"result\":{\"ok\":%s,\"rail\":%d,\"accel\":%d}}\n",
+                 id, ok ? "true" : "false", rail,
+                 (rail >= 0 && rail < 3) ? g_airport.effective_accel(rail) : -1);
+
     } else if (method == "airport.get_status") {
         // Per-rail observable state. HostGUI Tab4 script orchestrator polls
         // this every ~200ms during AIRPORT_RAIL steps so it can advance to
@@ -3161,18 +3242,21 @@ static void handle_rpc(int fd, const std::string &line,
         snprintf(resp, sizeof(resp),
                  "{\"id\":%d,\"result\":{\"ok\":true,"
                  "\"homing\":%s,\"homed\":%s,"
-                 "\"rails\":[{\"index\":0,\"state\":%d,\"pos_mm\":%s,\"homed\":%s,\"homing\":%s},"
-                            "{\"index\":1,\"state\":%d,\"pos_mm\":%s,\"homed\":%s,\"homing\":%s},"
-                            "{\"index\":2,\"state\":%d,\"pos_mm\":%s,\"homed\":%s,\"homing\":%s}]}}\n",
+                 "\"rails\":[{\"index\":0,\"state\":%d,\"pos_mm\":%s,\"homed\":%s,\"homing\":%s,\"accel\":%d},"
+                            "{\"index\":1,\"state\":%d,\"pos_mm\":%s,\"homed\":%s,\"homing\":%s,\"accel\":%d},"
+                            "{\"index\":2,\"state\":%d,\"pos_mm\":%s,\"homed\":%s,\"homing\":%s,\"accel\":%d}]}}\n",
                  id,
                  g_airport.is_homing() ? "true" : "false",
                  g_airport.is_homed()  ? "true" : "false",
                  s0, pos[0], g_airport.is_rail_homed(0) ? "true" : "false",
                              g_airport.is_rail_homing(0) ? "true" : "false",
+                             g_airport.effective_accel(0),
                  s1, pos[1], g_airport.is_rail_homed(1) ? "true" : "false",
                              g_airport.is_rail_homing(1) ? "true" : "false",
+                             g_airport.effective_accel(1),
                  s2, pos[2], g_airport.is_rail_homed(2) ? "true" : "false",
-                             g_airport.is_rail_homing(2) ? "true" : "false");
+                             g_airport.is_rail_homing(2) ? "true" : "false",
+                             g_airport.effective_accel(2));
 
     } else if (method == "airport.relay") {
         int channel = json_int(s, "channel", -1);
@@ -3274,6 +3358,29 @@ static void handle_rpc(int fd, const std::string &line,
         fprintf(stderr, "proc_gateway: RPC fd=%d resp: %s", fd, resp);
     }
     write_all(fd, resp, strlen(resp));
+}
+
+// Display frame-rate cap for the :7002 stream. The stream used to push
+// every frame the camera produced, tying bandwidth to capture fps even
+// though nobody needs 15 fps to watch a rail move — and at 424x240 that
+// was ~88 KB/s of which most frames were never looked at.
+//
+// Detection does NOT go through here (proc_npu reads the shm ring), so
+// dropping display frames costs no accuracy.
+//   UAV_GATEWAY_VIDEO_MAX_FPS  (1..60, default 0 = uncapped)
+static bool video_rate_ok() {
+    static const int max_fps = []() {
+        const char *e = std::getenv("UAV_GATEWAY_VIDEO_MAX_FPS");
+        if (!e || !*e) return 0;
+        const int v = std::atoi(e);
+        return (v >= 1 && v <= 60) ? v : 0;
+    }();
+    if (max_fps <= 0) return true;
+    static uint64_t last_ms = 0;
+    const uint64_t now = now_ms();
+    if (now - last_ms < (uint64_t)(1000 / max_fps)) return false;
+    last_ms = now;
+    return true;
 }
 
 // (VIDEO_SRC_* + g_video_source are declared above, near the top of the
@@ -3520,7 +3627,12 @@ int run_gateway_runtime() {
         }
 
         // ── Read latest frame from shm → encode → push to video clients ──────
-        if (video_stream_enabled && shm.is_open() && shm.read_latest(frame) && !vid_clients.empty()) {
+        // video_rate_ok() gates on the DISPLAY frame rate before anything
+        // else, so a dropped frame costs neither a shm read nor a JPEG
+        // encode. Detection is unaffected: proc_npu reads the shm ring
+        // itself and never touches this stream.
+        if (video_stream_enabled && shm.is_open() && !vid_clients.empty()
+            && video_rate_ok() && shm.read_latest(frame)) {
             // Runtime knobs for HostGUI display fps tuning. Detection
             // still uses the full-resolution shm frame; only the JPEG
             // we ship over :7002 is shrunk / lower-quality, so visual
@@ -3538,7 +3650,7 @@ int run_gateway_runtime() {
                 const char *e = std::getenv("UAV_GATEWAY_VIDEO_SCALE");
                 if (!e || !*e) return 1;
                 int v = std::atoi(e);
-                return (v == 2 || v == 4) ? v : 1;
+                return (v == 2 || v == 4 || v == 8) ? v : 1;
             }();
 
             std::vector<uint8_t> jpeg;
