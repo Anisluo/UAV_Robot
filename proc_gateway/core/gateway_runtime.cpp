@@ -1446,6 +1446,46 @@ public:
         return true;
     }
 
+    // Absolute move: go to pos_mm measured from the homed zero. The zero is
+    // the release-end hard stop that home_rails/home_rail2 latched, so this
+    // is only meaningful once the rail is homed — refuse otherwise rather
+    // than move relative to an arbitrary power-on offset (the encoder's
+    // multi-turn count is NOT retentive across driver power cycles).
+    //
+    // Deliberately resolved HERE and not in the GUI: doing it there would
+    // mean read-position → compute → command as three round trips, and any
+    // motion in between silently turns into a wrong delta. move_mm's soft
+    // travel limits still apply to the resulting delta.
+    bool move_to_mm(int rail_index, double pos_mm, int speed_rpm) {
+        if (rail_index < 0 || rail_index >= 3) return false;
+        if (!ensure_ready()) return false;
+
+        if (!rail_homed_[rail_index].load()) {
+            std::fprintf(stderr,
+                "proc_gateway: airport move_to_mm rail=%d REFUSED: not homed "
+                "(run airport.home_rails / airport.home_rail2 first)\n", rail_index);
+            return false;
+        }
+        double cur_mm = 0.0;
+        if (!rail_position_mm(rail_index, &cur_mm)) {
+            std::fprintf(stderr,
+                "proc_gateway: airport move_to_mm rail=%d: cannot read position\n",
+                rail_index);
+            return false;
+        }
+
+        const double delta = pos_mm - cur_mm;
+        const double tol = env_double("UAV_AIRPORT_MOVE_TO_TOL_MM", 0.2);
+        std::fprintf(stderr,
+            "proc_gateway: airport move_to_mm rail=%d target=%.2fmm now=%.2fmm delta=%.2fmm\n",
+            rail_index, pos_mm, cur_mm, delta);
+        if (std::fabs(delta) <= tol) {
+            rail_state_[rail_index].store(RAIL_IDLE);
+            return true;                      // already there, within tolerance
+        }
+        return move_mm(rail_index, delta, speed_rpm);
+    }
+
     // Open-loop fixed-distance move at a chosen speed. Used by stage
     // scripts in "distance" stop_mode — drive the rail N mm at speed_rpm,
     // motor self-stops on its internal pulse counter, GUI advances when
@@ -3078,6 +3118,27 @@ static void handle_rpc(int fd, const std::string &line,
         snprintf(resp, sizeof(resp),
                  "{\"id\":%d,\"result\":{\"ok\":%s,\"rail\":%d,\"dist_mm\":%.2f,\"speed_rpm\":%d}}\n",
                  id, ok ? "true" : "false", rail, dist_mm, speed_rpm);
+
+    } else if (method == "airport.move_to_mm") {
+        // Closed-loop ABSOLUTE move: go to pos_mm as measured from the homed
+        // zero (the release-end hard stop). Refused when the rail has never
+        // been homed — see move_to_mm(). The delta is computed inside the
+        // gateway so no motion can slip in between reading and commanding.
+        int rail = json_int(s, "rail", -1);
+        double pos_mm = json_double(s, "pos_mm", 0.0);
+        int speed_rpm = json_int(s, "speed_rpm", 0);
+        double now_mm = 0.0;
+        const bool have_now = g_airport.rail_position_mm(rail, &now_mm);
+        bool ok = g_airport.move_to_mm(rail, pos_mm, speed_rpm);
+        char nowbuf[32];
+        if (have_now) snprintf(nowbuf, sizeof(nowbuf), "%.2f", now_mm);
+        else          snprintf(nowbuf, sizeof(nowbuf), "null");
+        snprintf(resp, sizeof(resp),
+                 "{\"id\":%d,\"result\":{\"ok\":%s,\"rail\":%d,\"pos_mm\":%.2f,"
+                 "\"from_mm\":%s,\"homed\":%s,\"speed_rpm\":%d}}\n",
+                 id, ok ? "true" : "false", rail, pos_mm, nowbuf,
+                 (rail >= 0 && rail < 3 && g_airport.is_rail_homed(rail)) ? "true" : "false",
+                 speed_rpm);
 
     } else if (method == "airport.get_status") {
         // Per-rail observable state. HostGUI Tab4 script orchestrator polls
