@@ -92,6 +92,13 @@ class PiperController:
         # re-send every ~1 s as a safety heartbeat in case a frame was lost.
         self._gripper_dirty       = True
         self._gripper_last_send_t = 0.0
+        # Set to escalate the next GripperCtrl to code 0x03 (使能并清除错误).
+        # The gripper latches its fault (over-current from being driven into
+        # a stop, or a CAN dropout mid-motion) and then goes limp, ignoring
+        # every plain 0x01 — so the fault is unrecoverable without this.
+        # True at startup: if the process is restarted precisely because the
+        # gripper is stuck, the first send should already clear it.
+        self._gripper_clear_err   = True
 
         # Feedback cache, populated by heartbeat. RPC handlers return these
         # instead of calling SDK getters, so they don't contend for the SDK's
@@ -288,8 +295,26 @@ class PiperController:
                     # safety re-send in case a frame got lost.
                     now = time.monotonic()
                     if g_dirty or (now - self._gripper_last_send_t) > 1.0:
-                        self.p.GripperCtrl(int(g_um), int(g_eff), 0x01, 0)
+                        # gripper_code 0x01 = 使能, 0x03 = 使能并清除错误.
+                        # The gripper latches its error state (over-current,
+                        # or a CAN outage mid-motion) and then IGNORES every
+                        # plain 0x01 command until something clears it — the
+                        # symptom is a gripper that accepts commands and
+                        # simply never moves. Plain 0x01 can never recover
+                        # from that on its own, so a reset request escalates
+                        # this one send to 0x03.
+                        code = 0x03 if self._gripper_clear_err else 0x01
+                        self._gripper_clear_err = False
+                        self.p.GripperCtrl(int(g_um), int(g_eff), code, 0)
                         self._gripper_last_send_t = now
+                    elif g_dirty:
+                        # Not sent this cycle — put the flag back rather than
+                        # dropping the request. It used to be consumed above
+                        # unconditionally, so a gripper command issued while
+                        # the heartbeat was muted (drag-teach / e-stop) was
+                        # lost outright even though the RPC returned ok.
+                        with self.lock:
+                            self._gripper_dirty = True
 
                 # Refresh feedback cache every other heartbeat cycle (≈ HZ/2)
                 # to keep RX-thread CPU sane while still feeding HostGUI a
@@ -755,14 +780,61 @@ class PiperController:
             self.gripper_effort = new_eff
         return {"ok": True, "angle_mm": mm}
 
+    def m_piper_gripper_reset(self, angle_mm: float = None,
+                              effort_mNm: float = None) -> Dict[str, Any]:
+        """夹爪清除错误并重新使能 (GripperCtrl code 0x03).
+
+        Use when the gripper has gone limp / stopped responding: it has
+        latched a fault and will ignore the normal 0x01 enable forever.
+        Optionally retargets at the same time so the caller does not have to
+        issue a second command.
+        """
+        with self.lock:
+            if angle_mm is not None:
+                mm = max(GRIPPER_MIN_MM, min(GRIPPER_MAX_MM, float(angle_mm)))
+                self.gripper_target_um = int(mm * 1000)
+            if effort_mNm is not None:
+                self.gripper_effort = int(effort_mNm)
+            self._gripper_clear_err = True
+            self._gripper_dirty     = True      # force a send next heartbeat
+            tgt, eff = self.gripper_target_um, self.gripper_effort
+        log("INFO", f"gripper reset requested (0x03), target={tgt}um effort={eff}")
+        return {"ok": True, "angle_mm": tgt / 1000.0, "effort_mNm": eff}
+
     def m_piper_get_status(self) -> Dict[str, Any]:
         # Snapshot from cache (refreshed at 50Hz by heartbeat). Reading SDK
         # directly here was contending for the SDK mutex and adding 5 ms
         # latency per call.
+        #
+        # `angles` is included so a continuous trajectory recorder can get
+        # the teach state and the pose from ONE cache acquisition. Polling
+        # piper.get_status and arm.get_angles separately would sample them
+        # up to a tick apart, and the pose that arrives after teach_status
+        # already reported "released" is a pose the operator never taught.
         with self._cache_lock:
             out = dict(self._cache_status)
+            joints = list(self._cache_joints)
+        out["angles"]          = [v / F for v in joints]
         out["heartbeat_alive"] = self.heartbeat_alive
         out["speed_pct"]       = self.speed
+
+        # Gripper feedback. Without this the gripper is a black box: a
+        # command is accepted, nothing moves (or it goes limp), and there is
+        # no way to tell whether it faulted, hit an end stop, or never got
+        # the target. Field names vary across SDK versions, so read whatever
+        # is present rather than assuming a layout.
+        try:
+            g = self.p.GetArmGripperMsgs().gripper_state
+            out["gripper"] = {
+                "angle_mm":    getattr(g, "grippers_angle", 0) / 1000.0,
+                "effort_mNm":  getattr(g, "grippers_effort", 0),
+                "status_code": getattr(g, "status_code", None),
+                "foc_status":  str(getattr(g, "foc_status", "")),
+            }
+        except Exception as e:                      # never break get_status
+            out["gripper"] = {"error": str(e)}
+        out["gripper_target_mm"] = self.gripper_target_um / 1000.0
+        out["gripper_effort_set"] = self.gripper_effort
         return out
 
     def m_piper_park_zero(self) -> Dict[str, Any]:
@@ -918,6 +990,8 @@ class RpcServer:
                     angle_mm if angle_mm is not None else (angle if angle is not None else 0.0),
                     effort_mNm if effort_mNm is not None else (
                         float(force_pct) * 20.0 if force_pct is not None else 1000.0)),
+            "piper.gripper_reset":          lambda angle_mm=None, effort_mNm=None, **_:
+                c.m_piper_gripper_reset(angle_mm, effort_mNm),
             "piper.move_cartesian":         lambda **kw: c.m_piper_move_cartesian(**_filter_kw(kw, ("X_mm","Y_mm","Z_mm","RX_deg","RY_deg","RZ_deg","mode"))),
         }
 
