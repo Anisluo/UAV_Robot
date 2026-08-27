@@ -128,12 +128,17 @@ std::string handle_request(const char *line) {
 //   0=A 1=B 2=X 3=Y 4=LB 5=RB 6=BACK 7=START 8=GUIDE 9=LSTICK 10=RSTICK
 //
 // Safety model:
-//   * dead-man's switch — motion only while the configured button is held;
-//     release => immediate zero command via slew.
+//   * dead-man's switch — motion only while the direction stick is deflected;
+//     release => target zero, reached over the soft-stop (decel) ramp.
+//   * Y button — hard e-stop, bypasses the ramp and commands zero on the very
+//     next tick. This is the control to use when something is about to be hit;
+//     stick release alone is a comfort stop, not an emergency one.
 //   * disconnect / no data — POLLHUP/POLLERR or read failure closes the fd
-//     and zeros the last sent velocity. Reopen is attempted periodically.
+//     and zeros the last sent velocity immediately (no ramp: with the pad gone
+//     there is nobody left to steer). Reopen is attempted periodically.
 //   * slew-rate limit — change in commanded velocity per send tick is capped
-//     to honour the chassis spec's "no step inputs" guidance.
+//     to honour the chassis spec's "no step inputs" guidance. Accel and decel
+//     have separate budgets; decel is the slower of the two.
 // ---------------------------------------------------------------------------
 
 constexpr int kJoyAxisMax = 32767;
@@ -167,10 +172,14 @@ constexpr int kTriggerThreshold = 16000;   // ~75% press = "held"
 // Two speed caps. Normal applies always; Unlocked applies only when both
 // triggers (L2 AND R2) are held simultaneously. Throttle stick still scales
 // below whichever cap is active.
-constexpr int kMaxLinearMmS_Normal     = 40000;    // 40 m/s commanded
-constexpr int kMaxAngularMdegS_Normal  = 3000000;  // 3000°/s
-constexpr int kMaxLinearMmS_Unlocked   = 80000;    // 80 m/s commanded = 4000 RPM = protocol cap
-constexpr int kMaxAngularMdegS_Unlocked= 6000000;  // 6000°/s
+//
+// Halved on 2026-08-12 at the operator's request — the pad felt too fast.
+// Normal peak is now 1000 RPM (was 2000), unlocked 2000 RPM (was 4000, the
+// RoboModule protocol cap). Both are env-overridable, see JoyConfig.
+constexpr int kMaxLinearMmS_Normal     = 20000;    // 20 m/s commanded = 1000 RPM
+constexpr int kMaxAngularMdegS_Normal  = 1500000;  // 1500°/s
+constexpr int kMaxLinearMmS_Unlocked   = 40000;    // 40 m/s commanded = 2000 RPM
+constexpr int kMaxAngularMdegS_Unlocked= 3000000;  // 3000°/s
 
 // Throttle breakpoints.
 constexpr double kThrottleMin = 0.10;
@@ -182,8 +191,21 @@ struct JoyConfig {
     int deadzone_raw = 3000;          // ~9% of full scale on the direction stick
     int throttle_deadzone_raw = 2500; // throttle stick rest-band → mid
     int send_interval_ms = 50;        // ~20 Hz send cadence
-    int slew_linear_mm_s = 4000;      // ~1s 0→full at the 80000 mm/s protocol cap
-    int slew_angular_mdeg_s = 800000; // max angular change per send tick
+
+    // Ramp rates are asymmetric: speeding up is brisk, slowing down is soft.
+    // At 20 Hz, delta-per-tick × 20 = the mm/s² (resp. mdeg/s²) the chassis
+    // sees, so 0 → Normal cap (20000) takes 20000/2000/20 = 0.5 s, and
+    // Normal cap → 0 takes 20000/800/20 = 1.25 s.
+    int slew_linear_mm_s = 2000;         // accel: max linear delta per tick
+    int slew_angular_mdeg_s = 150000;    // accel: max angular delta per tick
+    int decel_linear_mm_s = 800;         // brake: gentler, gives the "缓停" feel
+    int decel_angular_mdeg_s = 60000;    // brake: angular counterpart
+
+    int max_linear_mm_s = kMaxLinearMmS_Normal;
+    int max_angular_mdeg_s = kMaxAngularMdegS_Normal;
+    int max_linear_unlocked_mm_s = kMaxLinearMmS_Unlocked;
+    int max_angular_unlocked_mdeg_s = kMaxAngularMdegS_Unlocked;
+
     int reopen_interval_ms = 2000;    // retry open every 2 s when disconnected
 };
 
@@ -232,8 +254,23 @@ void joy_load_config_from_env(JoyConfig *cfg) {
     cfg->send_interval_ms    = env_int("UAV_CAR_JOY_SEND_MS",         cfg->send_interval_ms);
     cfg->slew_linear_mm_s    = env_int("UAV_CAR_JOY_SLEW_LIN",        cfg->slew_linear_mm_s);
     cfg->slew_angular_mdeg_s = env_int("UAV_CAR_JOY_SLEW_ANG",        cfg->slew_angular_mdeg_s);
+    cfg->decel_linear_mm_s   = env_int("UAV_CAR_JOY_DECEL_LIN",       cfg->decel_linear_mm_s);
+    cfg->decel_angular_mdeg_s= env_int("UAV_CAR_JOY_DECEL_ANG",       cfg->decel_angular_mdeg_s);
+    cfg->max_linear_mm_s     = env_int("UAV_CAR_JOY_MAX_LIN",         cfg->max_linear_mm_s);
+    cfg->max_angular_mdeg_s  = env_int("UAV_CAR_JOY_MAX_ANG",         cfg->max_angular_mdeg_s);
+    cfg->max_linear_unlocked_mm_s =
+        env_int("UAV_CAR_JOY_MAX_LIN_UNLOCK", cfg->max_linear_unlocked_mm_s);
+    cfg->max_angular_unlocked_mdeg_s =
+        env_int("UAV_CAR_JOY_MAX_ANG_UNLOCK", cfg->max_angular_unlocked_mdeg_s);
     cfg->reopen_interval_ms  = env_int("UAV_CAR_JOY_REOPEN_MS",       cfg->reopen_interval_ms);
     cfg->throttle_deadzone_raw = env_int("UAV_CAR_JOY_THROTTLE_DZ",   cfg->throttle_deadzone_raw);
+
+    // A zero/negative rate would freeze the ramp (slew() would never reach the
+    // target); clamp to something that still moves.
+    if (cfg->slew_linear_mm_s     < 1) cfg->slew_linear_mm_s     = 1;
+    if (cfg->slew_angular_mdeg_s  < 1) cfg->slew_angular_mdeg_s  = 1;
+    if (cfg->decel_linear_mm_s    < 1) cfg->decel_linear_mm_s    = 1;
+    if (cfg->decel_angular_mdeg_s < 1) cfg->decel_angular_mdeg_s = 1;
 }
 
 void joy_reset_state(JoyState *s) {
@@ -300,7 +337,24 @@ int apply_deadzone_and_scale(int axis_raw, int deadzone, int max_out) {
     return axis_raw < 0 ? -static_cast<int>(scaled) : static_cast<int>(scaled);
 }
 
-int slew(int target, int current, int max_delta) {
+// Rate-limited approach to `target`, with separate accel / decel budgets so a
+// released stick coasts down instead of slamming to zero.
+//
+// "Decelerating" means the magnitude is shrinking — and also a sign flip, where
+// we brake all the way down to zero at the gentle rate first and only then pick
+// the accel rate back up on the far side of zero. Without that case a full
+// forward → full reverse flick would step through zero at the accel rate.
+int slew(int target, int current, int accel_delta, int decel_delta) {
+    const int abs_target = target < 0 ? -target : target;
+    const int abs_current = current < 0 ? -current : current;
+    bool decelerating;
+    if (current != 0 && ((target < 0) != (current < 0))) {
+        decelerating = true;
+    } else {
+        decelerating = abs_target < abs_current;
+    }
+    const int max_delta = decelerating ? decel_delta : accel_delta;
+
     int diff = target - current;
     if (diff > max_delta) {
         return current + max_delta;
@@ -347,16 +401,16 @@ void joy_tick(JoyState *s, const JoyConfig *cfg) {
     bool panic = false;
     double throttle = kThrottleMid;
     bool unlocked = false;
-    int lin_cap = kMaxLinearMmS_Normal;
-    int ang_cap = kMaxAngularMdegS_Normal;
+    int lin_cap = cfg->max_linear_mm_s;
+    int ang_cap = cfg->max_angular_mdeg_s;
 
     if (s->fd >= 0) {
         // L2 + R2 both held → unlock full speed cap. Either alone → no effect.
         const bool l2_held = s->axes[kAxisLT] > kTriggerThreshold;
         const bool r2_held = s->axes[kAxisRT] > kTriggerThreshold;
         unlocked = l2_held && r2_held;
-        lin_cap = unlocked ? kMaxLinearMmS_Unlocked   : kMaxLinearMmS_Normal;
-        ang_cap = unlocked ? kMaxAngularMdegS_Unlocked: kMaxAngularMdegS_Normal;
+        lin_cap = unlocked ? cfg->max_linear_unlocked_mm_s    : cfg->max_linear_mm_s;
+        ang_cap = unlocked ? cfg->max_angular_unlocked_mdeg_s : cfg->max_angular_mdeg_s;
 
         if (s->buttons[kBtnY]) {
             // Y panic-stop overrides everything — zero command regardless of sticks.
@@ -402,14 +456,26 @@ void joy_tick(JoyState *s, const JoyConfig *cfg) {
                      static_cast<int>(lin_cap * throttle),
                      static_cast<int>(ang_cap * throttle));
         } else if (!panic) {
-            log_info(kTag, "joy: stick centered (slewing to zero)");
+            log_info(kTag, "joy: stick centered (soft-stop ramp, %dmm/s per %dms tick)",
+                     cfg->decel_linear_mm_s, cfg->send_interval_ms);
         }
     }
 
     int current_lin = s->last_sent_valid ? s->last_sent_linear_mm_s : 0;
     int current_ang = s->last_sent_valid ? s->last_sent_angular_mdeg_s : 0;
-    int new_lin = slew(linear_target, current_lin, cfg->slew_linear_mm_s);
-    int new_ang = slew(angular_target, current_ang, cfg->slew_angular_mdeg_s);
+    int new_lin;
+    int new_ang;
+    if (panic) {
+        // Y stays a true e-stop: releasing the stick now coasts down over ~1 s,
+        // so the operator still needs one control that cuts velocity outright.
+        new_lin = 0;
+        new_ang = 0;
+    } else {
+        new_lin = slew(linear_target, current_lin,
+                       cfg->slew_linear_mm_s, cfg->decel_linear_mm_s);
+        new_ang = slew(angular_target, current_ang,
+                       cfg->slew_angular_mdeg_s, cfg->decel_angular_mdeg_s);
+    }
 
     if (s->last_sent_valid && new_lin == current_lin && new_ang == current_ang) {
         s->last_send_ms = now;
@@ -499,15 +565,18 @@ int main() {
              "[LStick=direction (LY fwd/back, LX turn) | "
              "RStick-Y=throttle (up=%.0f%% mid=%.0f%% down=%.0f%%) | "
              "normal peak %dmm/s, L2+R2 unlock to %dmm/s | "
-             "Y=panic-stop, release LStick=stop]",
+             "accel %dmm/s per tick, soft-stop %dmm/s per tick | "
+             "Y=hard e-stop, release LStick=soft stop]",
              kSockPath,
              iface != nullptr && iface[0] != '\0' ? iface : "can3",
              joy_cfg.dev_path,
              kThrottleMax * 100.0,
              kThrottleMid * 100.0,
              kThrottleMin * 100.0,
-             kMaxLinearMmS_Normal,
-             kMaxLinearMmS_Unlocked);
+             joy_cfg.max_linear_mm_s,
+             joy_cfg.max_linear_unlocked_mm_s,
+             joy_cfg.slew_linear_mm_s,
+             joy_cfg.decel_linear_mm_s);
 
     while (g_running) {
         int nfds = 0;

@@ -5,6 +5,7 @@
 #include <math.h>
 #include <stdbool.h>
 #include <stdint.h>
+#include <stdlib.h>
 #include <string.h>
 #include <time.h>
 
@@ -17,7 +18,23 @@
 #endif
 
 #define CAR_CAN_GROUP 0U
-#define CAR_DEFAULT_LIMIT_PWM 5000
+
+/* Per-motor output limit sent with every velocity frame. Protocol range is
+ * [0, 5000] and the chassis spec says to start low and raise gradually — we
+ * had it pinned at the 5000 ceiling, which lets all six closed-loop drivers
+ * slam full PWM at once. A spin-in-place (both sides scrubbing in opposite
+ * directions) then pulls enough current to sag the 24 V bus and brown out the
+ * RK3588, which reads to the operator as "the whole robot cut power mid-turn".
+ *
+ * Lowered to 1800 on 2026-08-12 — that is this robot's own known-good number,
+ * the UAV_CAR_TURN_LIMIT_PWM the old proc_gateway chassis path used for the
+ * highest-torque manoeuvre (straight driving used 800). It is a ceiling, not a
+ * setpoint: the closed loop only draws what it needs to hold the commanded
+ * speed, so straight running never reaches it. Override with UAV_CAR_LIMIT_PWM
+ * — lower toward 800 if it still browns out, raise if it cannot break static
+ * friction or climb. */
+#define CAR_DEFAULT_LIMIT_PWM 1800
+#define CAR_MAX_LIMIT_PWM 5000
 #define CAR_MAX_RPM 4000
 #define CAR_MM_PER_SEC_PER_RPM 20.0
 #define CAR_TRACK_WIDTH_MM 600.0
@@ -43,6 +60,28 @@ static void car_sleep_ms(long ms) {
     ts.tv_nsec = (ms % 1000L) * 1000000L;
     while (nanosleep(&ts, &ts) != 0) {
     }
+}
+
+static int car_limit_pwm(void) {
+    static int cached = -1;
+    const char *s;
+    char *end;
+    long v;
+
+    if (cached >= 0) {
+        return cached;
+    }
+    cached = CAR_DEFAULT_LIMIT_PWM;
+    s = getenv("UAV_CAR_LIMIT_PWM");
+    if (s != NULL && s[0] != '\0') {
+        end = NULL;
+        v = strtol(s, &end, 10);
+        if (end != s && v > 0 && v <= CAR_MAX_LIMIT_PWM) {
+            cached = (int)v;
+        }
+    }
+    log_info("core.dev.car", "per-motor limit_pwm=%d (max %d)", cached, CAR_MAX_LIMIT_PWM);
+    return cached;
 }
 
 static int car_clamp_int(int value, int min_value, int max_value) {
@@ -209,7 +248,7 @@ bool car_set_velocity(int linear_mm_s, int angular_mdeg_s) {
         return true;
     }
 
-    if (!car_set_lr_rpm(left_rpm, right_rpm, CAR_DEFAULT_LIMIT_PWM)) {
+    if (!car_set_lr_rpm(left_rpm, right_rpm, car_limit_pwm())) {
         return false;
     }
 
